@@ -1,0 +1,40 @@
+# Boris Configuration File
+#
+# Copy this file to boris.ini and adjust settings for your environment.
+# Settings can also be overridden via environment variables and CLI flags.
+
+[model]
+endpoint = http://localhost:8080
+name = llama3
+api_key = your-api-key-here
+temperature = 0.7
+max_tokens = 4096
+context_window = 4096
+timeout_seconds = 120
+stream = true
+verify_ssl = true
+
+[agent]
+max_iterations = 16
+max_retries = 2
+retry_backoff_ms = 1000
+text_tool_fallback = false
+
+[tools]
+enabled = read,write,list_dir,memory,run
+sandbox_root = ~/.boris/sandbox
+memory_persist = true
+
+[behaviour]
+confirm_writes = false
+
+[logging]
+level = info
+format = text
+
+[output]
+json = false
+show_metrics = true
+
+[prompt]
+system_prompt_file = ~/.boris/system_prompt.txt
