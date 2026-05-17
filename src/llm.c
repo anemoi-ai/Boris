@@ -64,7 +64,7 @@ static char *strip_thinking(const char *content, char **thinking_out)
 
 	const char *end = strstr(start + strlen(open), close);
 	if (!end)
-		return strdup(content); /* unclosed tag — pass through */
+		return strdup(content); /* unclosed tag - pass through */
 
 	/* Capture thinking, trimming a single leading newline */
 	const char *think_start = start + strlen(open);
@@ -101,7 +101,7 @@ static char *strip_thinking(const char *content, char **thinking_out)
 }
 
 /* -------------------------------------------------------------------------
- * Internal helpers — LLM response constructors
+ * Internal helpers - LLM response constructors
  * ---------------------------------------------------------------------- */
 
 static void normalise_finish_reason(struct llm_response *r)
@@ -208,7 +208,7 @@ static char *build_request_body(const struct conversation_history *conv,
 	}
 	cJSON_AddItemToObject(root, "messages", messages);
 
-	/* tools — only include enabled tools */
+	/* tools - only include enabled tools */
 	int tool_count = 0;
 	if (num_tools > 0 && tools) {
 		struct cJSON *tools_arr = cJSON_CreateArray();
@@ -486,7 +486,7 @@ static void parse_non_streaming(struct llm_response *r, const char *body)
 	struct cJSON *message = cJSON_GetObjectItemCaseSensitive(choice,
 								 "message");
 	if (message) {
-		/* content — strip thinking traces before storing */
+		/* content - strip thinking traces before storing */
 		struct cJSON *content_item = cJSON_GetObjectItemCaseSensitive(
 			message, "content");
 		if (content_item && !cJSON_IsNull(content_item)) {
@@ -867,7 +867,7 @@ struct llm_response *llm_complete(const struct conversation_history *conv,
 		return NULL;
 	}
 
-	/* Parse — auto-detect SSE vs JSON format */
+	/* Parse - auto-detect SSE vs JSON format */
 	if (config->stream_responses ||
 	    (http_resp.body && http_resp.body_length > 0 &&
 	     strncmp(http_resp.body, "data:", 5) == 0)) {

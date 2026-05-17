@@ -19,7 +19,7 @@
 #include <unistd.h>
 #include <limits.h>
 
-/* Forward declarations — tool implementations are not exposed in tools.h */
+/* Forward declarations - tool implementations are not exposed in tools.h */
 struct tool_result tool_read_fn(const char *arguments_json,
 				const struct agent_configuration *cfg,
 				struct memory_arena *scratch);
@@ -39,7 +39,7 @@ struct tool_result tool_run_fn(const char *arguments_json,
 static int tests_passed = 0;
 static int tests_failed = 0;
 
-/* Shared per-suite scratch arena — matches what tools_dispatch provides */
+/* Shared per-suite scratch arena - matches what tools_dispatch provides */
 static struct memory_arena *g_scratch;
 
 #define ASSERT(condition)                                                               \
@@ -755,7 +755,7 @@ static void test_run_output_truncation(void)
 	ASSERT(f != NULL);
 	if (!f)
 		return;
-	/* awk outputs 70000 'A' chars — exceeds the 65536-byte cap */
+	/* awk outputs 70000 'A' chars - exceeds the 65536-byte cap */
 	fputs("#!/bin/sh\n"
 	      "awk 'BEGIN{for(i=0;i<70000;i++) printf \"A\"; print \"\"}'\n",
 	      f);

@@ -1,14 +1,14 @@
 /*
- * agent.c - ReAct (Reason → Act → Observe) agent loop.
+ * agent.c - ReAct (Reason --> Act --> Observe) agent loop.
  *
  *   1. Build an LLM request from the current conversation
  *   2. Call the model; parse its response
- *   3. finish_reason == "stop"       → return the final text
- *   4. finish_reason == "tool_calls" → dispatch each requested tool,
+ *   3. finish_reason == "stop"       --> return the final text
+ *   4. finish_reason == "tool_calls" --> dispatch each requested tool,
  *      append results, go to step 1
- *   5. finish_reason == "length"     → truncate and retry
- *   6. iteration count >= max_iterations → FINISHED_MAX_ITER
- *   7. HTTP or parse error           → FINISHED_ERROR
+ *   5. finish_reason == "length"     --> truncate and retry
+ *   6. iteration count >= max_iterations --> FINISHED_MAX_ITER
+ *   7. HTTP or parse error           --> FINISHED_ERROR
  */
 #define _POSIX_C_SOURCE 200809L
 
@@ -76,7 +76,7 @@ static int extract_tool_call_json(const char *json, size_t json_len,
 	if (json_len == 0)
 		return 0;
 
-	/* buf is temporary — lives in the scratch arena for this iteration */
+	/* buf is temporary - lives in the scratch arena for this iteration */
 	char *buf = arena_duplicate_string_length(scratch, json, json_len);
 	if (!buf)
 		return 0;

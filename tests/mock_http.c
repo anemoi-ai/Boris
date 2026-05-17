@@ -84,7 +84,7 @@ const char *mock_http_request_body(int call_index)
 }
 
 /* -------------------------------------------------------------------------
- * http_client.h interface — replaces the real curl implementation
+ * http_client.h interface - replaces the real curl implementation
  * ---------------------------------------------------------------------- */
 
 int http_global_init(void)

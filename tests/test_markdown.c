@@ -3,7 +3,7 @@
  *
  * Tests run with non-TTY stdout (piped through make), so term_supports_color()
  * returns false and markdown_render() takes the plain-text path throughout.
- * We capture output via tmpfile() — always non-TTY — and verify the structural
+ * We capture output via tmpfile() - always non-TTY - and verify the structural
  * transformations: heading detection, list markers, code fences, inline
  * element stripping.  The ANSI-colour path is exercised by running boris
  * interactively in a terminal.
@@ -31,7 +31,7 @@ static int tests_failed = 0;
 	} while (0)
 
 /* -------------------------------------------------------------------------
- * Capture helper — render to a tmpfile and return the result as a heap
+ * Capture helper - render to a tmpfile and return the result as a heap
  * string.  The caller must free() the result.
  * ---------------------------------------------------------------------- */
 

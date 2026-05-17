@@ -14,15 +14,11 @@
 
 struct cJSON;
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-#define REQUIRE_SANDBOX(cfg)                                                      \
-	do {                                                                      \
-		if (!(cfg)->sandbox_root || !(cfg)->sandbox_root[0])              \
-			return tool_result_errorf("sandbox",                      \
-						  "Sandbox root not configured"); \
+#define REQUIRE_SANDBOX(cfg)                                                      	\
+	do {                                                                      		\
+		if (!(cfg)->sandbox_root || !(cfg)->sandbox_root[0])              			\
+			return tool_result_errorf("sandbox",                      				\
+						  "Sandbox root not configured"); 							\
 	} while (0)
 
 /* -------------------------------------------------------------------------
@@ -82,7 +78,7 @@ void tool_call_list_free(struct tool_call_list *list);
 /*
  * Build a success tool_result from a heap-allocated string.
  *
- * Takes ownership of content_heap — do not free it after calling this.
+ * Takes ownership of content_heap - do not free it after calling this.
  * The tool_call_id is stamped by tools_dispatch(), not by the tool itself.
  */
 struct tool_result tool_result_ok(const char *tool_name, char *content_heap);
@@ -121,9 +117,5 @@ void tools_mask_to_string(unsigned int mask, char *buf, size_t size);
 int tools_sandbox_resolve(const struct agent_configuration *cfg,
 			  const char *path, char *resolved, size_t size,
 			  struct tool_result *err_out);
-
-#ifdef __cplusplus
-}
-#endif
 
 #endif /* TOOLS_H */

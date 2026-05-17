@@ -299,7 +299,7 @@ int sandbox_resolve(const char *root, const char *path,
 		 * relative path cannot escape the sandbox.
 		 */
 		if (path_was_relative && strcmp(abs_candidate, abs_root) == 0) {
-			/* Allow — fall through to success */
+			/* Allow - fall through to success */
 		} else {
 			log_warning("sandbox_resolve: ESCAPE DETECTED: root='%s' resolved='%s'",
 				    abs_root, abs_candidate);

@@ -6,7 +6,7 @@
  * aligned.
  *
  * arena_reset() reclaims all memory in O(1) by rewinding the first block and
- * freeing any overflow blocks — no per-allocation bookkeeping required.
+ * freeing any overflow blocks - no per-allocation bookkeeping required.
  * Used in the agent loop to reclaim per-iteration temporaries in one call.
  */
 

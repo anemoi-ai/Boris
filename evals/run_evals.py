@@ -13,7 +13,7 @@ Usage:
                 Without this flag only rule-based checks run (no LLM calls
                 for grading, faster and free).
     --filter    Only run test cases whose id matches PATTERN (substring).
-    --boris     Path to the boris binary (default: ./build/boris)
+    --boris     Path to the boris binary (default: ./boris)
     --timeout   Per-turn timeout in seconds (default: 60)
     --verbose   Print full Boris output for each case
 """
@@ -804,7 +804,7 @@ def main():
                         help="Enable LLM-as-judge for open-ended checks")
     parser.add_argument("--filter",  default="",
                         help="Only run cases whose id contains this string")
-    parser.add_argument("--boris",   default="./build/boris",
+    parser.add_argument("--boris",   default="./boris",
                         help="Path to boris binary")
     parser.add_argument("--timeout", type=int, default=90,
                         help="Per-case timeout in seconds")

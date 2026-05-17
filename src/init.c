@@ -104,7 +104,7 @@ static size_t discard_write_cb(void *ptr, size_t size, size_t nmemb,
 
 /*
  * Try to reach the configured endpoint and report the result.
- * Always returns — a failed probe does not abort setup.
+ * Always returns - a failed probe does not abort setup.
  */
 static void probe_endpoint(const char *url)
 {

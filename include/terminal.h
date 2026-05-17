@@ -15,7 +15,7 @@
 
 /* 4-bit SGR foreground colours */
 #define TERM_FG_BLACK	"\033[30m"
-#define TERM_FG_RED	"\033[31m"
+#define TERM_FG_RED	    "\033[31m"
 #define TERM_FG_GREEN	"\033[32m"
 #define TERM_FG_YELLOW	"\033[33m"
 #define TERM_FG_BLUE	"\033[34m"

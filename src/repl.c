@@ -42,7 +42,7 @@ static void sigint_handler(int sig)
 }
 
 /* -------------------------------------------------------------------------
- * Spinner — animated braille dots while the agent is thinking
+ * Spinner - animated braille dots while the agent is thinking
  * ---------------------------------------------------------------------- */
 
 static volatile sig_atomic_t g_spinner_active = 0;
@@ -136,7 +136,7 @@ static bool confirm_action(const char *message)
 }
 
 /* -------------------------------------------------------------------------
- * Levenshtein distance — for "did you mean?" suggestions
+ * Levenshtein distance - for "did you mean?" suggestions
  * ---------------------------------------------------------------------- */
 
 static int levenshtein(const char *a, const char *b)
@@ -600,7 +600,7 @@ static char *history_path(void)
 }
 
 /* -------------------------------------------------------------------------
- * repl_run — the main interactive loop
+ * repl_run - the main interactive loop
  * ---------------------------------------------------------------------- */
 
 void repl_run(struct conversation_history *conv,
@@ -706,7 +706,7 @@ void repl_run(struct conversation_history *conv,
 				goto next_turn;
 			}
 
-			/* Empty line — skip or submit */
+			/* Empty line - skip or submit */
 			if (text[0] == '\0') {
 				free(text);
 				editor_free(&ed);

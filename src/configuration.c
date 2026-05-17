@@ -27,27 +27,27 @@
 #include <limits.h>
 
 #define FREE_AND_NULL(p)    \
-	do {                \
-		free(p);    \
-		(p) = NULL; \
+	do {                	\
+		free(p);    		\
+		(p) = NULL; 		\
 	} while (0)
 
-#define SET_STRING_FIELD(field, value)                    \
-	do {                                              \
+#define SET_STRING_FIELD(field, value)            \
+	do {                                          \
 		char *_tmp = strdup(value);               \
 		if (!_tmp)                                \
-			return BORIS_ERROR_OUT_OF_MEMORY; \
+			return BORIS_ERROR_OUT_OF_MEMORY; 	  \
 		free(config->field);                      \
 		config->field = _tmp;                     \
 	} while (0)
 
-#define ENV_SET_STRING(field, value)          \
-	do {                                  \
-		char *_tmp = strdup(value);   \
-		if (_tmp) {                   \
-			free(config->field);  \
-			config->field = _tmp; \
-		}                             \
+#define ENV_SET_STRING(field, value)          	  \
+	do {                                  		  \
+		char *_tmp = strdup(value);   			  \
+		if (_tmp) {                   	          \
+			free(config->field);  				  \
+			config->field = _tmp; 				  \
+		}                             			  \
 	} while (0)
 
 static char *expand_tilde(const char *path)

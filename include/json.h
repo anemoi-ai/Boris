@@ -10,10 +10,6 @@
 
 #include "cJSON.h"
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
 /*
  * Parse a NUL-terminated JSON string.
  *
@@ -34,7 +30,7 @@ cJSON *json_parse_with_len(const char *str, size_t len);
 /*
  * Return the string value of key in obj, or NULL.
  *
- * The returned pointer is owned by obj — do not free it.
+ * The returned pointer is owned by obj - do not free it.
  */
 const char *json_get_str(const cJSON *obj, const char *key);
 
@@ -77,9 +73,5 @@ char *json_to_str_pretty(const cJSON *obj);
  * Files larger than max_bytes are rejected.
  */
 char *file_read_all(const char *path, size_t max_bytes, size_t *out_len);
-
-#ifdef __cplusplus
-}
-#endif
 
 #endif /* JSON_H */

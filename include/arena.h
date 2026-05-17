@@ -3,7 +3,7 @@
  *
  * Allocations are served bump-pointer style from fixed-size blocks.
  * arena_reset() reclaims all memory in O(1). Individual allocations
- * cannot be freed — the arena is released as a whole.
+ * cannot be freed - the arena is released as a whole.
  *
  * Useful for temporary per-turn scratch allocations: allocate freely,
  * then reset in one call when the turn is done.

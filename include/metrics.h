@@ -13,10 +13,6 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
 /*
  * Global metrics counters.
  *
@@ -56,8 +52,5 @@ void metrics_record_retry(void);
 /* Print a human-readable metrics summary */
 void metrics_print_summary(void);
 
-#ifdef __cplusplus
-}
-#endif
 
 #endif /* METRICS_H */

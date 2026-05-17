@@ -891,7 +891,7 @@ static void test_stream_no_finish_reason(void)
 	mock_http_reset();
 	mock_http_enable();
 
-	/* No "finish_reason" field in the delta — default "stop" should apply. */
+	/* No "finish_reason" field in the delta - default "stop" should apply. */
 	mock_http_queue_response(
 		"data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n"
 		"data: [DONE]\n",

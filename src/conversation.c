@@ -345,7 +345,7 @@ struct cJSON *conversation_to_json(const struct conversation_history *conv)
 		cJSON_AddStringToObject(msg_obj, "role",
 					role_to_string(msg->role));
 
-		/* content — may be NULL for tool-call-only assistant msgs */
+		/* content - may be NULL for tool-call-only assistant msgs */
 		if (msg->content) {
 			cJSON_AddStringToObject(msg_obj, "content",
 						msg->content);
@@ -614,7 +614,7 @@ int conversation_count_role(const struct conversation_history *conv,
 }
 
 /* -------------------------------------------------------------------------
- * Persistence — save and load conversations between sessions
+ * Persistence - save and load conversations between sessions
  * ---------------------------------------------------------------------- */
 
 /*
@@ -916,7 +916,7 @@ char *conversation_load_saved_at(const char *file_path)
 	fclose(f);
 	peek[n] = '\0';
 
-	/* Extract value with a string search — avoids JSON parse errors from
+	/* Extract value with a string search - avoids JSON parse errors from
 	 * the truncated buffer being structurally invalid JSON */
 	const char *key = "\"saved_at\":\"";
 	char *start = strstr(peek, key);

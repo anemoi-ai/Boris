@@ -25,7 +25,7 @@
 #include <stdarg.h>
 
 /* -------------------------------------------------------------------------
- * Forward declarations — implemented in tools/read.c, write.c, etc.
+ * Forward declarations - implemented in tools/read.c, write.c, etc.
  * ---------------------------------------------------------------------- */
 
 struct tool_result tool_read_fn(const char *arguments_json,
@@ -272,7 +272,7 @@ void tool_call_list_free(struct tool_call_list *list)
  * ---------------------------------------------------------------------- */
 
 /*
- * register_one — internal helper used by tools_register_builtins().
+ * register_one - internal helper used by tools_register_builtins().
  * Copies the tool_definition struct and duplicates the schema string.
  */
 static void register_one(const char *name,

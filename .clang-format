@@ -1,6 +1,6 @@
 BasedOnStyle: LLVM
 
-# Indentation — tabs, width 8 (Linux kernel style)
+# Indentation - tabs, width 8 (Linux kernel style)
 IndentWidth: 8
 TabWidth: 8
 UseTab: Always
@@ -10,10 +10,10 @@ ContinuationIndentWidth: 8
 # Linux style: Allman for function definitions, K&R for control structures
 BreakBeforeBraces: Linux
 
-# Column limit — not enforced; the codebase has long lines
+# Column limit - not enforced; the codebase has long lines
 ColumnLimit: 0
 
-# Pointer alignment — * goes with the variable, not the type
+# Pointer alignment - * goes with the variable, not the type
 # char *p, not char* p
 PointerAlignment: Right
 
@@ -26,7 +26,7 @@ SpaceInEmptyParentheses: false
 SpacesInParentheses: false
 SpaceAfterCStyleCast: false
 
-# Short constructs — allow empty functions on one line; nothing else
+# Short constructs - allow empty functions on one line; nothing else
 AllowShortFunctionsOnASingleLine: Empty
 AllowShortBlocksOnASingleLine: Empty
 AllowShortIfStatementsOnASingleLine: Never

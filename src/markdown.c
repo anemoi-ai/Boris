@@ -33,15 +33,15 @@
  * terminal.h.
  * ---------------------------------------------------------------------- */
 
-#define MD_H1	   "\033[1;97m"	    /* bold bright-white — H1 and H2     */
-#define MD_H3	   "\033[1m"	    /* bold               — H3 through H6 */
-#define MD_CODE_FG "\033[38;5;180m" /* warm yellow  — inline code and blocks */
-#define MD_CODE_BG "\033[48;5;236m" /* dark-grey bg — inline code            */
-#define MD_QUOTE   "\033[2;36m"	    /* dim cyan — blockquote text            */
-#define MD_FENCE   "\033[2m"	    /* dim — fence lines and rules           */
+#define MD_H1	   "\033[1;97m"	    /* bold bright-white - H1 and H2     */
+#define MD_H3	   "\033[1m"	    /* bold               - H3 through H6 */
+#define MD_CODE_FG "\033[38;5;180m" /* warm yellow  - inline code and blocks */
+#define MD_CODE_BG "\033[48;5;236m" /* dark-grey bg - inline code            */
+#define MD_QUOTE   "\033[2;36m"	    /* dim cyan - blockquote text            */
+#define MD_FENCE   "\033[2m"	    /* dim - fence lines and rules           */
 
 /* -------------------------------------------------------------------------
- * Inline state — tracks open formatting markers within one line.
+ * Inline state - tracks open formatting markers within one line.
  * ---------------------------------------------------------------------- */
 
 struct istate {
@@ -66,7 +66,7 @@ static void istate_apply(const struct istate *st, FILE *out)
 }
 
 /* -------------------------------------------------------------------------
- * render_inline — character scanner for inline markdown.
+ * render_inline - character scanner for inline markdown.
  *
  * Processes one logical line, emitting formatted output.  ANSI codes are
  * omitted when color is false, but structural transformations (marker
@@ -112,7 +112,7 @@ static void render_inline(const char *s, size_t len, FILE *out, bool color)
 			continue;
 		}
 
-		/* **bold** — must be checked before single-star italic */
+		/* **bold** - must be checked before single-star italic */
 		if (i + 1 < len && s[i] == '*' && s[i + 1] == '*') {
 			if (color) {
 				if (st.bold) {
@@ -200,7 +200,7 @@ static void render_inline(const char *s, size_t len, FILE *out, bool color)
 					}
 				}
 			}
-			/* No complete link pattern — '[' is a literal. */
+			/* No complete link pattern - '[' is a literal. */
 		}
 
 		fputc(s[i++], out);
@@ -249,7 +249,7 @@ static bool is_hrule(const char *line, size_t len)
 }
 
 /* -------------------------------------------------------------------------
- * markdown_render — main entry point
+ * markdown_render - main entry point
  * ---------------------------------------------------------------------- */
 
 void markdown_render(const char *text, FILE *out)

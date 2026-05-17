@@ -14,10 +14,6 @@
 #include "conversation.h"
 #include "tools.h"
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
 /* Finish reason string constants shared between llm.c and agent.c. */
 #define LLM_FINISH_STOP   "stop"
 #define LLM_FINISH_TOOL   "tool_calls"
@@ -29,7 +25,7 @@ extern "C" {
  *
  * Only tools enabled in cfg->tools_enabled are included in the request.
  * Returns a heap-allocated llm_response; the caller must call
- * llm_response_free(). Returns NULL only on catastrophic OOM — all other
+ * llm_response_free(). Returns NULL only on catastrophic OOM - all other
  * errors are reported via llm_response.error = true.
  */
 struct llm_response *llm_complete(const struct conversation_history *conv,
@@ -43,8 +39,5 @@ struct llm_response *llm_complete(const struct conversation_history *conv,
  */
 void llm_response_free(struct llm_response *reply);
 
-#ifdef __cplusplus
-}
-#endif
 
 #endif /* LLM_H */

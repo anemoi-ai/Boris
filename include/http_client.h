@@ -13,10 +13,6 @@
 #include <stddef.h>
 #include <stdbool.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
 /* Result of an HTTP request. Caller must call http_response_free(). */
 struct http_response {
 	char *body;	    /* The response body (heap-allocated, null-terminated) */
@@ -50,8 +46,5 @@ struct http_response http_post(const char *url,
 /* Free body and error strings inside the response. */
 void http_response_free(struct http_response *response);
 
-#ifdef __cplusplus
-}
-#endif
 
 #endif /* HTTP_CLIENT_H */

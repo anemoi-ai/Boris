@@ -272,7 +272,7 @@ static void test_configuration_comments_and_blanks(void)
 }
 
 /*
- * Test: Layer priority — env var beats INI file for the same key.
+ * Test: Layer priority - env var beats INI file for the same key.
  */
 static void test_layer_priority_env_beats_ini(void)
 {

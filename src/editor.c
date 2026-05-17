@@ -403,7 +403,7 @@ static enum editor_action process_raw(struct editor_state *ed)
 			return EDITOR_MORE;
 
 		switch (s2) {
-		case 'A': /* Up — history prev */
+		case 'A': /* Up - history prev */
 			if (g_history_count == 0)
 				return EDITOR_MORE;
 			if (g_hist_nav < 0) {
@@ -414,7 +414,7 @@ static enum editor_action process_raw(struct editor_state *ed)
 			}
 			history_apply(ed, g_hist_nav);
 			return EDITOR_MORE;
-		case 'B': /* Down — history next */
+		case 'B': /* Down - history next */
 			if (g_hist_nav < 0)
 				return EDITOR_MORE;
 			g_hist_nav++;
@@ -462,32 +462,32 @@ static enum editor_action process_raw(struct editor_state *ed)
 		}
 	}
 
-	/* Ctrl+A — Home */
+	/* Ctrl+A - Home */
 	if (c == 1) {
 		ed->cursor = 0;
 		render_line(ed);
 		return EDITOR_MORE;
 	}
-	/* Ctrl+E — End */
+	/* Ctrl+E - End */
 	if (c == 5) {
 		ed->cursor = ed->len;
 		render_line(ed);
 		return EDITOR_MORE;
 	}
-	/* Ctrl+U — Kill line */
+	/* Ctrl+U - Kill line */
 	if (c == 0x15) {
 		buf_delete(ed, 0, ed->cursor);
 		ed->cursor = 0;
 		render_line(ed);
 		return EDITOR_MORE;
 	}
-	/* Ctrl+K — Kill to end */
+	/* Ctrl+K - Kill to end */
 	if (c == 0x0B) {
 		buf_delete(ed, ed->cursor, ed->len - ed->cursor);
 		render_line(ed);
 		return EDITOR_MORE;
 	}
-	/* Ctrl+W — Delete word backwards */
+	/* Ctrl+W - Delete word backwards */
 	if (c == 0x17) {
 		if (ed->cursor > 0) {
 			size_t p = ed->cursor;
@@ -501,7 +501,7 @@ static enum editor_action process_raw(struct editor_state *ed)
 		}
 		return EDITOR_MORE;
 	}
-	/* Ctrl+L — Clear screen */
+	/* Ctrl+L - Clear screen */
 	if (c == 0x0C) {
 		if (term_is_tty()) {
 			printf("\033[2J\033[H");
@@ -512,7 +512,7 @@ static enum editor_action process_raw(struct editor_state *ed)
 		return EDITOR_MORE;
 	}
 
-	/* Tab — autocomplete */
+	/* Tab - autocomplete */
 	if (c == '\t') {
 		handle_tab(ed);
 		return EDITOR_MORE;

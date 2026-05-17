@@ -15,10 +15,6 @@
 
 struct cJSON;
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
 /*
  * Create a new, empty conversation.
  *
@@ -199,8 +195,5 @@ char *conversation_session_path(void);
  */
 char *conversation_load_saved_at(const char *file_path);
 
-#ifdef __cplusplus
-}
-#endif
 
 #endif /* CONVERSATION_H */

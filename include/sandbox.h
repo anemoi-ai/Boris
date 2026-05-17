@@ -15,10 +15,6 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
 /*
  * sandbox_resolve - canonicalise path and verify it falls within root.
  *
@@ -45,8 +41,5 @@ int sandbox_mkdirp(const char *dir_path, mode_t mode);
  */
 int sandbox_contains(const char *root, const char *resolved_path);
 
-#ifdef __cplusplus
-}
-#endif
 
 #endif /* SANDBOX_H */

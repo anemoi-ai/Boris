@@ -13,10 +13,10 @@
 #include <stddef.h>
 
 enum editor_action {
-	EDITOR_DONE,	  /* Enter pressed — line is ready           */
+	EDITOR_DONE,	  /* Enter pressed - line is ready           */
 	EDITOR_MORE,	  /* Need more input (character processed)   */
 	EDITOR_EOF,	  /* Ctrl+D on empty line                    */
-	EDITOR_INTERRUPT, /* Ctrl+C — input cancelled                */
+	EDITOR_INTERRUPT, /* Ctrl+C - input cancelled                */
 };
 
 struct editor_state {
@@ -30,13 +30,13 @@ struct editor_state {
 /*
  * Completion callback.
  *
- * input        — the current editor buffer
- * completion   — filled with the single-match completion (if count == 1)
- * comp_size    — size of the completion buffer
- * ctx          — opaque pointer set via editor_set_completion()
+ * input        - the current editor buffer
+ * completion   - filled with the single-match completion (if count == 1)
+ * comp_size    - size of the completion buffer
+ * ctx          - opaque pointer set via editor_set_completion()
  *
- * Returns 0 (no match), 1 (single match — completion filled), or >1
- * (multiple matches — callback should print them to stdout itself).
+ * Returns 0 (no match), 1 (single match - completion filled), or >1
+ * (multiple matches - callback should print them to stdout itself).
  */
 typedef int (*editor_completion_fn)(const char *input,
 				    char *completion,

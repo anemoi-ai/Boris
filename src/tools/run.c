@@ -7,7 +7,7 @@
  *
  * Security properties:
  *   - Script path is validated by sandbox_resolve() before any exec
- *   - Execution uses fork/execvp — never system() or popen()
+ *   - Execution uses fork/execvp - never system() or popen()
  *   - Shebang interpreter must be an absolute path
  *   - Extension-based fallback uses a fixed allowlist; no arbitrary commands
  *   - Combined output is capped at RUN_MAX_OUTPUT bytes
@@ -73,7 +73,7 @@ static const char *interp_from_extension(const char *path)
 }
 
 /*
- * build_argv_shebang — read the first line of the script, parse the #!
+ * build_argv_shebang - read the first line of the script, parse the #!
  * interpreter, and populate argv_out ready for execvp.
  *
  * token_buf must be at least 512 bytes; tokens point into it.
@@ -212,7 +212,7 @@ static long elapsed_ms(const struct timespec *start)
 }
 
 /*
- * exec_child — fork/exec argv, capture combined stdout+stderr with a timeout.
+ * exec_child - fork/exec argv, capture combined stdout+stderr with a timeout.
  *
  * cwd is the working directory for the child (may be NULL to inherit).
  * Returns a heap-allocated result string, or NULL on internal failure.
@@ -446,7 +446,7 @@ struct tool_result tool_run_fn(const char *arguments_json,
 					  "Path is a directory: %s", args.path);
 	}
 
-	/* Build argv — shebang takes priority over extension */
+	/* Build argv - shebang takes priority over extension */
 	char *user_argv[USER_ARGS_MAX + 1];
 	for (int i = 0; i < args.user_argc; i++)
 		user_argv[i] = args.user_args[i];
