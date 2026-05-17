@@ -3,6 +3,7 @@
 
 build/
 boris
+evals/__pycache__/
 
 # Object files
 *.o
