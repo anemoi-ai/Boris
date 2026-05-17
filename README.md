@@ -1,6 +1,5 @@
 # Boris
 
-![boris hero](./assets/boris-hero.svg)
 
 **A working AI agent, built in C from scratch. No frameworks. No SDK. Every line yours.**
 
@@ -24,8 +23,6 @@ The codebase is ~10,000 lines across 21 source files. It compiles clean under `-
 ---
 
 ## The Core Loop
-
-![boris react loop](./assets/boris-react-loop.svg)
 
 Every AI agent framework — LangChain, CrewAI, AutoGen, the OpenAI Assistants API — runs this loop underneath. Here it is without the abstraction:
 
@@ -257,8 +254,7 @@ Boris sends standard OpenAI chat completions requests. Any provider that speaks 
 - **Ollama** — local models, no API key
 - **LM Studio** — local models with GUI
 - **vLLM** — high-throughput local serving
-- **Anthropic** — via the OpenAI compatibility endpoint
-- **Mistral, Together AI, Groq** — any hosted provider
+- **llama.cpp** - local GGUF format models
 
 Change `model_endpoint` in `~/.boris/config.ini` or set `BORIS_MODEL_ENDPOINT`. That's it.
 
@@ -282,7 +278,7 @@ make clean        # removes build/
 ./boris status    # show active configuration
 ```
 
-Boris stores config in `~/.boris/config.ini`, sessions in `~/.boris/sessions/`, memory in `~/.boris/memory.json`, and input history in `~/.boris/history.txt`.
+Boris stores config in `~/.boris/config.ini`, sessions in `~/.boris/sessions/`, memory in `~/.boris/memory/memory.json`, and input history in `~/.boris/history.txt`.
 
 ---
 
