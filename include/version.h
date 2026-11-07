@@ -6,6 +6,6 @@
 #ifndef BORIS_VERSION_H
 #define BORIS_VERSION_H
 
-#define BORIS_VERSION "1.1.0"
+#define BORIS_VERSION "1.2.0"
 
 #endif /* BORIS_VERSION_H */
