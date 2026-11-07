@@ -25,6 +25,7 @@
 #include "fs.h"
 #include "version.h"
 #include "exec.h"
+#include "trace.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -81,6 +82,7 @@ static void print_usage(void)
 	printf("    --stream            Enable streaming responses\n");
 	printf("    --log-level LVL     Set log level (debug/info/warn/error)\n");
 	printf("    --log-file FILE     Write logs to FILE\n");
+	printf("    --trace FILE        Append every model request/response to FILE (JSONL)\n");
 	printf("    --show-metrics      Print metrics at exit\n");
 	printf("    --insecure          Skip SSL certificate verification\n");
 	printf("    --set KEY=VALUE     Override a config setting\n");
@@ -196,6 +198,7 @@ static void parse_options(int argc, char *argv[], struct cli_settings *cli,
 		{"stream", no_argument, 0, 'S'},
 		{"log-level", required_argument, 0, 'l'},
 		{"log-file", required_argument, 0, 'f'},
+		{"trace", required_argument, 0, 'T'},
 		{"show-metrics", no_argument, 0, 'm'},
 		{"insecure", no_argument, 0, 'I'},
 		{"set", required_argument, 0, 'e'},
@@ -207,8 +210,8 @@ static void parse_options(int argc, char *argv[], struct cli_settings *cli,
 
 	/* chat stops at the first operand ("+"); exec accepts options after the
 	 * task too (boris exec "task" --json), with "--" ending them. */
-	const char *optstring = exec_mode ? "c:t:s:i:r:Sl:f:mhe:IjqV"
-					  : "+c:t:s:i:r:Sl:f:mhe:IjqV";
+	const char *optstring = exec_mode ? "c:t:s:i:r:Sl:f:T:mhe:IjqV"
+					  : "+c:t:s:i:r:Sl:f:T:mhe:IjqV";
 	flags->json = false;
 	flags->exit_code = -1;
 	int opt;
@@ -237,6 +240,9 @@ static void parse_options(int argc, char *argv[], struct cli_settings *cli,
 			break;
 		case 'f':
 			cli_add(cli, "logging.file", optarg);
+			break;
+		case 'T':
+			cli_add(cli, "logging.trace_file", optarg);
 			break;
 		case 'm':
 			cli_add(cli, "output.show_metrics", "true");
@@ -351,9 +357,11 @@ static int cmd_chat(int argc, char *argv[])
 
 	tools_register_builtins();
 	metrics_reset();
+	trace_open(config.trace_file);
 
 	/* Run the interactive chat loop */
 	repl_run(conv, &config);
+	trace_close();
 
 	if (config.show_metrics)
 		metrics_print_summary();
@@ -471,6 +479,7 @@ static int cmd_exec(int argc, char *argv[])
 		fprintf(stderr, "boris exec: warning: HTTP initialisation failed\n");
 	tools_register_builtins();
 	metrics_reset();
+	trace_open(config.trace_file);
 
 	struct exec_options opts = {
 		.json = flags.json,
@@ -480,6 +489,7 @@ static int cmd_exec(int argc, char *argv[])
 	};
 	status = exec_run(conv, &config, &opts);
 
+	trace_close();
 	if (config.show_metrics)
 		metrics_print_summary();
 	http_global_cleanup();
@@ -552,6 +562,8 @@ static int cmd_status(int argc, char *argv[])
 	printf("  Log level       : %d\n", config.log_level);
 	printf("  Log file        : %s\n",
 	       config.log_file ? config.log_file : "(stderr)");
+	if (config.trace_file)
+		printf("  Trace file      : %s\n", config.trace_file);
 	printf("  Show metrics    : %s\n", config.show_metrics ? "yes" : "no");
 
 	if (config.system_prompt_file)

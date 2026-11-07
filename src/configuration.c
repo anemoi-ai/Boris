@@ -282,6 +282,8 @@ enum boris_error configuration_set_key(struct agent_configuration *config,
 	}
 	if (strcmp(key, "logging.file") == 0)
 		return set_string(&config->log_file, value, true);
+	if (strcmp(key, "logging.trace_file") == 0)
+		return set_string(&config->trace_file, value, true);
 
 	/* [output] */
 	if (strcmp(key, "output.show_metrics") == 0)
@@ -405,6 +407,7 @@ static const struct {
 	{"BORIS_MODEL_VERIFY_SSL", "model.verify_ssl"},
 	{"BORIS_LOG_LEVEL", "logging.level"},
 	{"BORIS_LOG_FILE", "logging.file"},
+	{"BORIS_TRACE_FILE", "logging.trace_file"},
 	{"BORIS_SANDBOX_ROOT", "tools.sandbox_root"},
 	{"BORIS_TOOLS", "tools.enabled"},
 	{"BORIS_MEMORY_PERSIST", "tools.memory_persist"},
@@ -439,4 +442,5 @@ void configuration_destroy(struct agent_configuration *config)
 	FREE_AND_NULL(config->sandbox_root);
 	FREE_AND_NULL(config->run_env);
 	FREE_AND_NULL(config->log_file);
+	FREE_AND_NULL(config->trace_file);
 }

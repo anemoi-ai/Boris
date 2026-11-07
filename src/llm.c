@@ -13,6 +13,7 @@
 
 #include "llm.h"
 #include "http_client.h"
+#include "trace.h"
 #include "conversation.h"
 #include "json.h"
 #include "logger.h"
@@ -711,6 +712,7 @@ struct llm_response *llm_complete(const struct conversation_history *conv,
 	log_debug("llm: POST %s (%zu bytes)", url, strlen(body));
 
 	/* Send HTTP request (with timing) */
+	int trace_seq = trace_request(url, body);
 	struct timespec t_start, t_end;
 	clock_gettime(CLOCK_MONOTONIC, &t_start);
 
@@ -724,6 +726,8 @@ struct llm_response *llm_complete(const struct conversation_history *conv,
 	double latency_ms = (t_end.tv_sec - t_start.tv_sec) * 1000.0 +
 			    (t_end.tv_nsec - t_start.tv_nsec) / 1000000.0;
 	free(body);
+	trace_response(trace_seq, http_resp.status_code, http_resp.body,
+		       http_resp.body_length, http_resp.error, latency_ms);
 
 	struct llm_response *r = NULL;
 

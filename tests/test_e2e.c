@@ -19,6 +19,7 @@
 #include "cJSON.h"
 #include "exec.h"
 #include "json.h"
+#include "trace.h"
 
 
 #include <stdio.h>
@@ -1438,6 +1439,54 @@ static void test_exec_error_status(void)
 	configuration_destroy(&cfg);
 }
 
+static void test_trace_file(void)
+{
+	printf("  Test: --trace records request and response, never the API key\n");
+	char path[128];
+	snprintf(path, sizeof(path), "/tmp/boris_trace_test_%d.jsonl", (int)getpid());
+	unlink(path);
+
+	mock_http_reset();
+	char *stop = make_stop_response("traced");
+	mock_http_queue_response(stop, 200);
+	free(stop);
+
+	struct agent_configuration cfg = make_test_config();
+	cfg.api_key = strdup("sk-test-secret-key");
+	ASSERT(trace_open(path) == 0 && trace_enabled(), "trace file opened");
+	struct agent_result r = agent_run("Hello trace", &cfg);
+	trace_close();
+	agent_result_free(&r);
+
+	size_t len = 0;
+	char *text = file_read_all(path, 1 << 20, &len);
+	ASSERT(text != NULL, "trace file written");
+	char *nl = text ? strchr(text, '\n') : NULL;
+	if (nl)
+		*nl = '\0';
+	cJSON *req = text ? cJSON_Parse(text) : NULL;
+	cJSON *resp = nl ? cJSON_Parse(nl + 1) : NULL;
+	const cJSON *body = cJSON_GetObjectItemCaseSensitive(req, "body");
+
+	ASSERT(req && strcmp(json_get_str(req, "kind"), "request") == 0, "first line is the request");
+	ASSERT(cJSON_IsArray(cJSON_GetObjectItemCaseSensitive(body, "messages")),
+	       "request body embedded as JSON");
+	ASSERT(resp && strcmp(json_get_str(resp, "kind"), "response") == 0 &&
+		       json_get_int(resp, "status", 0) == 200 && json_get_int(resp, "seq", 0) == 1,
+	       "second line is the matching response");
+	if (nl)
+		*nl = '\n';
+	ASSERT(text && strstr(text, "sk-test-secret-key") == NULL, "API key never written");
+	struct stat st;
+	ASSERT(stat(path, &st) == 0 && (st.st_mode & 0777) == 0600, "trace file is mode 0600");
+
+	cJSON_Delete(req);
+	cJSON_Delete(resp);
+	free(text);
+	unlink(path);
+	configuration_destroy(&cfg);
+}
+
 int main(void)
 {
 	printf("\n=== End-to-End Tests ===\n\n");
@@ -1476,6 +1525,7 @@ int main(void)
 	test_exec_json_report();
 	test_exec_refuses_confirmation();
 	test_exec_error_status();
+	test_trace_file();
 
 	printf("\n--- E2E Results ---\n");
 	if (failures == 0)

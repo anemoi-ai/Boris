@@ -77,6 +77,7 @@ struct agent_configuration {
 
 	int log_level;
 	char *log_file;
+	char *trace_file; /* JSONL record of every model request/response */
 
 	bool show_metrics;
 	bool show_tool_calls; /* print each tool call and a result preview in the REPL */

@@ -119,6 +119,10 @@ Path handling for tools: `tools_sandbox_resolve()` resolves a path (following sy
 
 `boris exec` builds a fresh conversation, runs `agent_run_conv()` once with a tool observer that records each call and refuses confirmations, and prints the answer or a JSON report (`response`, `finish_reason`, `iterations`, `usage`, `tool_calls`, `error`). The eval harness uses the report to check which tools a run called.
 
+### `trace.c` — Request traces
+
+When `--trace FILE` is set, `llm.c` records each request body and each response (status, body, elapsed time, transport error) as JSON lines. Headers are not recorded. `evals/trace_prefix.py` reads the file to check that each request extends the previous one.
+
 ### `sandbox.c` — Path validation
 
 Called by every tool that accesses the filesystem before any `open()`, `stat()`, or `exec`. Uses `realpath()` to resolve symlinks and `..` sequences, then checks that the resolved path has `sandbox_root` as a prefix. Naive string prefix checks are not used — `realpath()` is called first.

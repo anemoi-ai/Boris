@@ -11,7 +11,7 @@
 
 ## What This Is
 
-Boris is a complete AI agent in ~10,000 lines of C across 23 source files. It compiles clean under `-Wall -Wextra -Werror`, passes 400+ tests, and runs leak-free under Valgrind. It connects to any OpenAI-compatible API — OpenAI, Ollama, LM Studio, vLLM, llama.cpp — maintains conversation history, calls tools, manages its own context window, and persists sessions to disk.
+Boris is a complete AI agent in ~13,000 lines of C across 31 source files. It compiles clean under `-Wall -Wextra -Werror`, passes 800+ tests, and runs leak-free under Valgrind. It connects to any OpenAI-compatible API — OpenAI, Ollama, LM Studio, vLLM, llama.cpp — maintains conversation history, calls tools, manages its own context window, and persists sessions to disk.
 
 It is built around two ideas:
 
@@ -133,6 +133,7 @@ src/
 ├── llm.c             HTTP to the LLM API, response parsing, streaming
 ├── conversation.c    Message history, serialisation, truncation
 ├── http_client.c     libcurl wrapper: POST, GET (fetch), cancellation, size cap
+├── trace.c           JSONL record of every model request/response (--trace)
 ├── tools.c           Registry, dispatch, confirmation, result cap
 ├── sandbox.c         Path validation via realpath()
 ├── fs.c              mkdir -p, atomic file replacement, ~/.boris paths
@@ -201,7 +202,7 @@ make memcheck   # all tests under Valgrind
 --- test_configuration --- INI, env vars, validation, defaults
 --- test_logger ---        levels, file output, rotation
 --- test_markdown ---      headings, lists, inline stripping, fences
---- test_e2e ---           full agent loop, exec reports (mock HTTP)
+--- test_e2e ---           full agent loop, exec reports, tracing (mock HTTP)
 
 Results: 8 passed, 0 failed
 ```
@@ -239,6 +240,7 @@ Common knobs:
 ./boris chat --stream                      # request SSE (reply shown when complete)
 ./boris chat --show-metrics                # token + timing summary on exit
 ./boris chat --set model.temperature=0.3   # override any config key
+./boris chat --trace requests.jsonl        # record every model request/response
 ```
 
 ### Non-interactive use
@@ -260,6 +262,10 @@ The answer goes to stdout and problems to stderr. With `--json` stdout is a sing
 ```
 
 Exit status: 0 finished, 1 error, 2 stopped at `max_iterations`, 130 interrupted. Tools that need confirmation are refused in `exec` (there is nobody to ask), with a message on stderr.
+
+### Request traces
+
+`--trace FILE` (or `logging.trace_file`, or `BORIS_TRACE_FILE`) appends each model request and response to `FILE` as JSON lines. Headers are never recorded, so the API key never reaches the file; the file is created with mode 0600 because it holds the whole conversation. `python3 evals/trace_prefix.py FILE` reports whether each request extends the previous one, which is what prompt caching depends on.
 
 `./boris help` lists every flag and env var. Boris stores config in `~/.boris/config.ini`, sessions in `~/.boris/sessions/`, memory in `~/.boris/memory/memory.json`, and input history in `~/.boris/history.txt`.
 

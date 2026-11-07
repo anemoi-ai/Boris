@@ -49,6 +49,8 @@ confirm_fetch = true
 
 [logging]
 level = info
+# Append every model request/response to this file as JSON lines (mode 0600)
+# trace_file = ~/.boris/trace.jsonl
 
 [output]
 # Print each tool call and a short result preview (off with --quiet)
