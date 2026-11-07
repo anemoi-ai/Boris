@@ -32,6 +32,8 @@ memory_persist = true
 # Scripts get only PATH, HOME, USER, LOGNAME, LANG, LC_*, TERM, TMPDIR, TZ
 # otherwise; BORIS_* variables are never passed.
 # run_env = VIRTUAL_ENV
+# Longest tool result returned to the model, in bytes (default 135168)
+# max_result_bytes = 135168
 
 [behaviour]
 # Ask before each write / script run (needs an interactive terminal)

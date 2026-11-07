@@ -179,6 +179,7 @@ void configuration_set_defaults(struct agent_configuration *config)
 	config->request_timeout_seconds = 120;
 
 	config->run_timeout_seconds = 30;
+	config->max_result_bytes = TOOL_RESULT_MAX_DEFAULT;
 
 	config->max_iterations = 16;
 	config->text_tool_fallback = true; /* parse JSON tool calls embedded in plain text,
@@ -254,6 +255,8 @@ enum boris_error configuration_set_key(struct agent_configuration *config,
 		return set_int(&config->run_timeout_seconds, key, value);
 	if (strcmp(key, "tools.run_env") == 0)
 		return set_string(&config->run_env, value, false);
+	if (strcmp(key, "tools.max_result_bytes") == 0)
+		return set_int(&config->max_result_bytes, key, value);
 	if (strcmp(key, "tools.memory_persist") == 0)
 		return set_bool(&config->memory_persist, key, value);
 

@@ -54,6 +54,7 @@ struct agent_configuration {
 	char *sandbox_root;
 	int run_timeout_seconds;
 	char *run_env; /* extra environment variable names passed to run scripts */
+	int max_result_bytes; /* cap on any tool result; <= 0 means the default */
 
 	bool verify_ssl;
 
@@ -122,6 +123,10 @@ struct conversation_history {
 
 /* Maximum number of tools that can be registered. */
 #define TOOLS_REGISTRY_MAX 64
+
+/* Default cap on a tool result: read's 128 KB maximum plus room for its
+ * own paging note, so read is never cut by the generic cap. */
+#define TOOL_RESULT_MAX_DEFAULT (131072 + 4096)
 
 /*
  * Result returned by agent_run() / agent_run_conv().

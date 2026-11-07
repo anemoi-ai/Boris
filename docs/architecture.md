@@ -111,7 +111,7 @@ Thin libcurl wrapper. Sends a single POST request and returns the response body 
 
 ### `tools.c` — Tool registry
 
-Each built-in tool lives in `src/tools/<name>.c` and exports one `const struct tool_definition` (name, description, schema, function, formatter, flag, confirmation class). `BUILTIN_TOOLS` in `tools.c` lists them, and everything else derives from that list: name ↔ flag lookup for `--tools`, registration, and the order tools are offered to the model. `tools_dispatch()` looks up a tool by name, checks the `tools_enabled` bitmask, asks the installed observer for confirmation when the tool's class requires it, allocates a scratch arena and calls the tool. See [extending.md](extending.md) for adding a tool.
+Each built-in tool lives in `src/tools/<name>.c` and exports one `const struct tool_definition` (name, description, schema, function, formatter, flag, confirmation class). `BUILTIN_TOOLS` in `tools.c` lists them, and everything else derives from that list: name ↔ flag lookup for `--tools`, registration, and the order tools are offered to the model. `tools_dispatch()` looks up a tool by name, checks the `tools_enabled` bitmask, asks the installed observer for confirmation when the tool's class requires it, allocates a scratch arena and calls the tool. It then caps the result at `tools.max_result_bytes`, cutting at a UTF-8 boundary and appending a note, so no tool can flood the context window. See [extending.md](extending.md) for adding a tool.
 
 ### `sandbox.c` — Path validation
 

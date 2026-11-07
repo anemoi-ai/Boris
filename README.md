@@ -132,7 +132,7 @@ src/
 ├── llm.c             HTTP to the LLM API, response parsing, streaming
 ├── conversation.c    Message history, serialisation, truncation
 ├── http_client.c     libcurl wrapper: POST, cancellation, size cap
-├── tools.c           Registry, dispatch, confirmation
+├── tools.c           Registry, dispatch, confirmation, result cap
 ├── sandbox.c         Path validation via realpath()
 ├── fs.c              mkdir -p, atomic file replacement, ~/.boris paths
 ├── configuration.c   INI + env + flags, layered overrides
@@ -166,6 +166,8 @@ Dependency direction is strict: `main` → `repl/init` → `agent` → `llm/tool
 | `list_dir` | List directory contents | Names, types, sizes; hidden files excluded by default |
 | `memory` | Persistent key-value store | JSON on disk, file-locked; get / set / delete / list |
 | `run` | Execute a script in the sandbox | Shebang or extension; fork/exec, never `system()`; SIGKILL timeout; allowlisted environment |
+
+Every result is capped at `tools.max_result_bytes` (132 KB by default) with a note saying how much was cut.
 
 Scripts started by `run` see only an allowlisted environment (`PATH`, `HOME`, locale and a few others), never `BORIS_API_KEY`. They still run with your permissions, so `behaviour.confirm_run = true` is the safeguard if you need one.
 

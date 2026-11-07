@@ -319,6 +319,44 @@ static struct tool_result run_tool(const struct tool_definition *t,
 	return result;
 }
 
+/* Shortest cap honoured, so the note always has some output before it. */
+#define TOOL_RESULT_MIN_CAP 256
+
+/*
+ * Cut r->content to at most limit bytes (on a UTF-8 character boundary)
+ * and append a note saying so. Every tool result passes through here, so
+ * no tool can flood the context window, whatever it forgets to limit.
+ */
+static void cap_result(struct tool_result *r, size_t limit)
+{
+	if (!r->content)
+		return;
+	size_t len = strlen(r->content);
+	if (len <= limit)
+		return;
+
+	size_t cut = limit;
+	while (cut > 0 && ((unsigned char)r->content[cut] & 0xC0) == 0x80)
+		cut--; /* do not split a multi-byte character */
+
+	char note[192];
+	int n = snprintf(note, sizeof(note),
+			 "\n[Output truncated: showing %zu of %zu bytes. Request "
+			 "a smaller range or narrow the query.]",
+			 cut, len);
+	if (n < 0)
+		n = 0;
+	char *capped = realloc(r->content, cut + (size_t)n + 1);
+	if (!capped) {
+		r->content[cut] = '\0'; /* still bounded, just without the note */
+		return;
+	}
+	memcpy(capped + cut, note, (size_t)n + 1);
+	r->content = capped;
+	log_debug("tools: '%s' result capped at %zu of %zu bytes",
+		  r->tool_name, cut, len);
+}
+
 struct tool_result tools_dispatch(const struct tool_call *call,
 				  const struct agent_configuration *cfg)
 {
@@ -359,6 +397,10 @@ struct tool_result tools_dispatch(const struct tool_call *call,
 	snprintf(result.tool_call_id, sizeof(result.tool_call_id), "%s", call->id);
 	snprintf(result.tool_name, sizeof(result.tool_name), "%.*s",
 		 (int)sizeof(result.tool_name) - 1, call->name);
+
+	size_t limit = cfg->max_result_bytes > 0 ? (size_t)cfg->max_result_bytes
+						 : TOOL_RESULT_MAX_DEFAULT;
+	cap_result(&result, limit < TOOL_RESULT_MIN_CAP ? TOOL_RESULT_MIN_CAP : limit);
 
 	if (g_observer.on_result)
 		g_observer.on_result(call, summary, &result, g_observer.ctx);

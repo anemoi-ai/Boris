@@ -1132,6 +1132,73 @@ static void test_memory_set_missing_key(void)
  * tools_mask_to_string
  * ---------------------------------------------------------------------- */
 
+/* A test tool whose output is its "text" argument repeated "times" times. */
+static struct tool_result repeat_tool_fn(const char *arguments_json,
+					 const struct agent_configuration *cfg,
+					 struct memory_arena *scratch)
+{
+	(void)cfg;
+	(void)scratch;
+	cJSON *root = cJSON_Parse(arguments_json);
+	const cJSON *text = cJSON_GetObjectItemCaseSensitive(root, "text");
+	const cJSON *times = cJSON_GetObjectItemCaseSensitive(root, "times");
+	size_t unit = strlen(text->valuestring);
+	size_t n = (size_t)times->valuedouble;
+	char *out = malloc(unit * n + 1);
+	for (size_t i = 0; i < n; i++)
+		memcpy(out + i * unit, text->valuestring, unit);
+	out[unit * n] = '\0';
+	cJSON_Delete(root);
+	return tool_result_ok("repeat", out);
+}
+
+#define TOOL_TEST_REPEAT (1u << 30)
+
+static void test_dispatch_caps_results(void)
+{
+	printf("  Test: dispatch caps every result at max_result_bytes\n");
+
+	struct tool_definition def;
+	memset(&def, 0, sizeof(def));
+	snprintf(def.name, sizeof(def.name), "repeat");
+	def.parameters_schema = "{\"type\":\"object\",\"properties\":{}}";
+	def.fn = repeat_tool_fn;
+	def.flag = TOOL_TEST_REPEAT;
+	tools_register(def); /* a second registration is refused; that's fine */
+
+	struct agent_configuration cfg = make_cfg();
+	cfg.tools_enabled = TOOL_TEST_REPEAT;
+	cfg.max_result_bytes = 1000;
+
+	struct tool_call call;
+	memset(&call, 0, sizeof(call));
+	snprintf(call.id, sizeof(call.id), "c1");
+	snprintf(call.name, sizeof(call.name), "repeat");
+
+	/* Under the cap: untouched */
+	call.argument_json = "{\"text\":\"a\",\"times\":1000}";
+	struct tool_result r = tools_dispatch(&call, &cfg);
+	ASSERT(r.content && strlen(r.content) == 1000);
+	ASSERT(r.content && !strstr(r.content, "truncated"));
+	tool_result_free(&r);
+
+	/* Over the cap: cut, with a note giving both sizes */
+	call.argument_json = "{\"text\":\"a\",\"times\":5000}";
+	r = tools_dispatch(&call, &cfg);
+	ASSERT(r.content && strncmp(r.content, "aaaa", 4) == 0);
+	ASSERT(r.content && strstr(r.content, "[Output truncated: showing 1000 of 5000 bytes."));
+	ASSERT(r.content && strlen(r.content) < 1200);
+	tool_result_free(&r);
+
+	/* A 3-byte character straddling the cap is dropped whole */
+	call.argument_json = "{\"text\":\"\u20ac\",\"times\":1000}"; /* euro sign */
+	r = tools_dispatch(&call, &cfg);
+	ASSERT(r.content && strstr(r.content, "showing 999 of 3000 bytes"));
+	tool_result_free(&r);
+
+	configuration_destroy(&cfg);
+}
+
 static void test_builtin_definitions(void)
 {
 	printf("  Test: built-in definitions - unique names and flags, TOOL_ALL complete\n");
@@ -1302,6 +1369,7 @@ int main(void)
 
 	printf("\n--- Tools Mask ---\n");
 	test_builtin_definitions();
+	test_dispatch_caps_results();
 	test_mask_to_string_none();
 	test_mask_to_string_all();
 	test_mask_to_string_subset();
