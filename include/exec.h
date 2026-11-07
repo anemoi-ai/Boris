@@ -30,6 +30,18 @@ struct exec_options {
 };
 
 /*
+ * Build the conversation for one exec run and append task as the user's
+ * message. With session_path naming an existing file, that conversation
+ * is restored and its system prompt replaced by system_prompt (as the REPL
+ * does on start); otherwise a new conversation starts with system_prompt.
+ * Returns NULL (with a message on err) if a session file exists but cannot
+ * be loaded, so a corrupt session is never silently overwritten.
+ */
+struct conversation_history *exec_conversation(const char *session_path,
+					       const char *system_prompt,
+					       const char *task, FILE *err);
+
+/*
  * Run the agent on conv, which must end with the user's task, and report
  * the outcome on opts->out. Tools that need confirmation are refused,
  * since there is nobody to ask. Returns one of the EXEC_EXIT_* statuses.

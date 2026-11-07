@@ -415,6 +415,52 @@ static void cap_result(struct tool_result *r, size_t limit)
 		  r->tool_name, cut, len);
 }
 
+/* Keys shorter than this are placeholders ("none", "ollama"), not secrets;
+ * redacting them would only mangle ordinary output. */
+#define SECRET_MIN_LEN 8
+#define SECRET_MASK    "[REDACTED: API key]"
+
+/*
+ * Replace every occurrence of Boris's own API key in a tool result. A run
+ * script is not confined to the sandbox and can read ~/.boris/config.ini
+ * (or anything else holding the key); whatever it prints must not reach
+ * the model, the session file or a trace.
+ */
+static void redact_api_key(struct tool_result *r, const char *key)
+{
+	if (!r->content || !key)
+		return;
+	size_t klen = strlen(key);
+	if (klen < SECRET_MIN_LEN || !strstr(r->content, key))
+		return;
+
+	size_t mlen = strlen(SECRET_MASK), count = 0;
+	for (const char *p = strstr(r->content, key); p; p = strstr(p + klen, key))
+		count++;
+	size_t len = strlen(r->content);
+	char *out = malloc(len - count * klen + count * mlen + 1);
+	if (!out) {
+		/* Cannot build the redacted copy: drop the output entirely. */
+		free(r->content);
+		r->content = strdup("[output withheld: it contained the API key]");
+		return;
+	}
+	const char *src = r->content;
+	char *dst = out;
+	for (const char *hit = strstr(src, key); hit; hit = strstr(src, key)) {
+		memcpy(dst, src, (size_t)(hit - src));
+		dst += hit - src;
+		memcpy(dst, SECRET_MASK, mlen);
+		dst += mlen;
+		src = hit + klen;
+	}
+	strcpy(dst, src);
+	free(r->content);
+	r->content = out;
+	log_warning("tools: '%s' output contained the API key; redacted %zu time%s",
+		    r->tool_name, count, count == 1 ? "" : "s");
+}
+
 struct tool_result tools_dispatch(const struct tool_call *call,
 				  const struct agent_configuration *cfg)
 {
@@ -455,6 +501,8 @@ struct tool_result tools_dispatch(const struct tool_call *call,
 	snprintf(result.tool_call_id, sizeof(result.tool_call_id), "%s", call->id);
 	snprintf(result.tool_name, sizeof(result.tool_name), "%.*s",
 		 (int)sizeof(result.tool_name) - 1, call->name);
+
+	redact_api_key(&result, cfg->api_key);
 
 	size_t limit = cfg->max_result_bytes > 0 ? (size_t)cfg->max_result_bytes
 						 : TOOL_RESULT_MAX_DEFAULT;

@@ -1208,6 +1208,35 @@ static void test_dispatch_caps_results(void)
 	configuration_destroy(&cfg);
 }
 
+static void test_dispatch_redacts_api_key(void)
+{
+	printf("  Test: dispatch redacts Boris's own API key from tool output\n");
+
+	struct agent_configuration cfg = make_cfg();
+	cfg.tools_enabled = TOOL_TEST_REPEAT;
+	cfg.api_key = strdup("sk-test-abcdef123456");
+
+	struct tool_call call;
+	memset(&call, 0, sizeof(call));
+	snprintf(call.id, sizeof(call.id), "c1");
+	snprintf(call.name, sizeof(call.name), "repeat");
+	call.argument_json = "{\"text\":\"key=sk-test-abcdef123456;\",\"times\":2}";
+
+	struct tool_result r = tools_dispatch(&call, &cfg);
+	ASSERT(r.content && !strstr(r.content, "sk-test-abcdef123456"));
+	ASSERT(r.content && strcmp(r.content, "key=[REDACTED: API key];key=[REDACTED: API key];") == 0);
+	tool_result_free(&r);
+
+	/* Placeholder-length keys are not treated as secrets */
+	free(cfg.api_key);
+	cfg.api_key = strdup("ollama");
+	call.argument_json = "{\"text\":\"ollama \",\"times\":1}";
+	r = tools_dispatch(&call, &cfg);
+	ASSERT(r.content && strcmp(r.content, "ollama ") == 0);
+	tool_result_free(&r);
+	configuration_destroy(&cfg);
+}
+
 static void test_builtin_definitions(void)
 {
 	printf("  Test: built-in definitions - unique names and flags, TOOL_ALL complete\n");
@@ -1952,6 +1981,7 @@ int main(void)
 	printf("\n--- Tools Mask ---\n");
 	test_builtin_definitions();
 	test_dispatch_caps_results();
+	test_dispatch_redacts_api_key();
 	test_mask_to_string_none();
 	test_mask_to_string_all();
 	test_mask_to_string_subset();

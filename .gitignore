@@ -3,7 +3,8 @@
 
 build/
 boris
-evals/__pycache__/*
+evals/**/__pycache__/
+!evals/fixtures/**/__pycache__/
 
 # Object files
 *.o
@@ -57,3 +58,10 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# Eval runs (results, judge cache) stay local; fixtures are committed whole,
+# including the build/ and __pycache__/ directories the tidy test deletes.
+evals/results/
+!evals/fixtures/**/build/
+!evals/fixtures/**/__pycache__/
+!evals/fixtures/**

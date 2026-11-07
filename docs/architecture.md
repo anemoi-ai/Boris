@@ -117,7 +117,7 @@ Path handling for tools: `tools_sandbox_resolve()` resolves a path (following sy
 
 ### `exec.c` — Non-interactive mode
 
-`boris exec` builds a fresh conversation, runs `agent_run_conv()` once with a tool observer that records each call and refuses confirmations, and prints the answer or a JSON report (`response`, `finish_reason`, `iterations`, `usage`, `tool_calls`, `error`). The eval harness uses the report to check which tools a run called.
+`boris exec` builds a fresh conversation (or, with `--session FILE`, continues the one saved in `FILE` and saves it back), runs `agent_run_conv()` once with a tool observer that records each call and refuses confirmations, and prints the answer or a JSON report (`response`, `finish_reason`, `iterations`, `usage`, `tool_calls`, `error`). The eval harness (see [evals.md](evals.md)) runs every turn this way and grades the report.
 
 ### `trace.c` — Request traces
 

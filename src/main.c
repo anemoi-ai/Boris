@@ -87,6 +87,7 @@ static void print_usage(void)
 	printf("    --insecure          Skip SSL certificate verification\n");
 	printf("    --set KEY=VALUE     Override a config setting\n");
 	printf("    --json              exec: print a JSON report (answer, tools, usage)\n");
+	printf("    --session FILE      exec: continue the conversation in FILE, then save it\n");
 	printf("    --version           Show version\n");
 	printf("\n");
 	printf("  Settings are layered: defaults, ~/.boris/config.ini, --config FILE,\n");
@@ -176,9 +177,13 @@ static void load_system_prompt_file(struct agent_configuration *config)
 	}
 }
 
+/* Long-only option codes (no short form). */
+#define OPT_SESSION 1001
+
 /* Options that are not configuration keys. */
 struct cli_flags {
 	bool json;	/* exec: print a JSON report */
+	const char *session; /* exec: conversation file to continue and save */
 	int exit_code;	/* >= 0: stop now and return this (help, --version, error) */
 };
 
@@ -203,6 +208,7 @@ static void parse_options(int argc, char *argv[], struct cli_settings *cli,
 		{"insecure", no_argument, 0, 'I'},
 		{"set", required_argument, 0, 'e'},
 		{"json", no_argument, 0, 'j'},
+		{"session", required_argument, 0, OPT_SESSION},
 		{"quiet", no_argument, 0, 'q'},
 		{"version", no_argument, 0, 'V'},
 		{"help", no_argument, 0, 'h'},
@@ -213,6 +219,7 @@ static void parse_options(int argc, char *argv[], struct cli_settings *cli,
 	const char *optstring = exec_mode ? "c:t:s:i:r:Sl:f:T:mhe:IjqV"
 					  : "+c:t:s:i:r:Sl:f:T:mhe:IjqV";
 	flags->json = false;
+	flags->session = NULL;
 	flags->exit_code = -1;
 	int opt;
 	while ((opt = getopt_long(argc, argv, optstring, long_opts, NULL)) != -1) {
@@ -270,6 +277,14 @@ static void parse_options(int argc, char *argv[], struct cli_settings *cli,
 				return;
 			}
 			flags->json = true;
+			break;
+		case OPT_SESSION:
+			if (!exec_mode) {
+				fprintf(stderr, "  --session is only available with 'boris exec'\n");
+				flags->exit_code = 1;
+				return;
+			}
+			flags->session = optarg;
 			break;
 		case 'q':
 			g_quiet = true;
@@ -465,14 +480,12 @@ static int cmd_exec(int argc, char *argv[])
 		goto done;
 	}
 
-	conv = conversation_create();
-	if (!conv ||
-	    conversation_add_system(conv, config.system_prompt ? config.system_prompt
-							       : BORIS_DEFAULT_SYSTEM_PROMPT) != BORIS_OK ||
-	    conversation_add_user(conv, task) != BORIS_OK) {
-		fprintf(stderr, "boris exec: out of memory\n");
+	conv = exec_conversation(flags.session,
+				 config.system_prompt ? config.system_prompt
+						      : BORIS_DEFAULT_SYSTEM_PROMPT,
+				 task, stderr);
+	if (!conv)
 		goto done;
-	}
 
 	signal(SIGPIPE, SIG_IGN);
 	if (http_global_init() != 0)
@@ -488,6 +501,9 @@ static int cmd_exec(int argc, char *argv[])
 		.err = stderr,
 	};
 	status = exec_run(conv, &config, &opts);
+	if (flags.session && conversation_save(conv, flags.session) != BORIS_OK)
+		fprintf(stderr, "boris exec: warning: could not save session %s\n",
+			flags.session);
 
 	trace_close();
 	if (config.show_metrics)

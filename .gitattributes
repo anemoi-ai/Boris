@@ -1,0 +1,2 @@
+# Eval fixtures are test data: keep them byte-for-byte on every platform.
+evals/fixtures/** -text

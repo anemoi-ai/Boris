@@ -57,6 +57,8 @@ const struct tool_definition *tools_get_all(size_t *out_count);
  * tool_result with is_error = 1 and an explanatory message.
  *
  * The returned tool_result.tool_call_id is populated from call->id.
+ * Every occurrence of cfg->api_key (8+ characters) is replaced with
+ * "[REDACTED: API key]", so no tool can show the model Boris's own key.
  * Content longer than cfg->max_result_bytes is cut at a UTF-8 boundary and
  * ends with a note saying how much was dropped.
  * The caller must call tool_result_free() on the result.

@@ -1439,6 +1439,71 @@ static void test_exec_error_status(void)
 	configuration_destroy(&cfg);
 }
 
+static void test_garbled_response_is_retried(void)
+{
+	printf("  Test: a 200 response that does not parse is retried\n");
+	mock_http_reset();
+	char *stop = make_stop_response("recovered");
+	mock_http_queue_response("<html>502 Bad Gateway</html>", 200);   /* proxy error page */
+	mock_http_queue_response("{\"choices\":[{\"message\":", 200);    /* cut off */
+	mock_http_queue_response(stop, 200);
+	free(stop);
+
+	struct agent_configuration cfg = make_test_config();
+	cfg.max_retries = 2;
+	cfg.retry_backoff_ms = 1;
+	struct agent_result r = agent_run("Hello", &cfg);
+
+	ASSERT(r.finish_reason == FINISHED_NATURALLY, "recovers after two garbled bodies");
+	ASSERT(r.final_response && strcmp(r.final_response, "recovered") == 0, "answer from the third try");
+	ASSERT(mock_http_call_count() == 3, "three requests made");
+	agent_result_free(&r);
+
+	/* A well-formed API error inside a 200 is still not retried */
+	mock_http_reset();
+	mock_http_queue_response("{\"error\":{\"message\":\"model not found\"}}", 200);
+	r = agent_run("Hello", &cfg);
+	ASSERT(r.finish_reason == FINISHED_ERROR && mock_http_call_count() == 1,
+	       "API error object is final");
+	agent_result_free(&r);
+	configuration_destroy(&cfg);
+}
+
+static void test_exec_session_round_trip(void)
+{
+	printf("  Test: exec --session restores a conversation and replaces its system prompt\n");
+	char path[128];
+	snprintf(path, sizeof(path), "/tmp/boris_session_test_%d.json", (int)getpid());
+	unlink(path);
+	FILE *err = tmpfile();
+
+	struct conversation_history *conv = exec_conversation(path, "Prompt A", "first task", err);
+	ASSERT(conv && conv->count == 2, "new session: system + task");
+	conversation_add_assistant(conv, "first answer");
+	ASSERT(conversation_save(conv, path) == BORIS_OK, "saved");
+	conversation_destroy(conv);
+
+	conv = exec_conversation(path, "Prompt B", "second task", err);
+	ASSERT(conv && conv->count == 4, "restored: system, task, answer, new task");
+	ASSERT(conv && strcmp(conv->messages[0].content, "Prompt B") == 0,
+	       "system prompt replaced by the configured one");
+	ASSERT(conv && strcmp(conv->messages[2].content, "first answer") == 0, "history kept");
+	ASSERT(conv && strcmp(conv->messages[3].content, "second task") == 0, "task appended");
+	conversation_destroy(conv);
+
+	/* A corrupt session is reported, never replaced */
+	FILE *f = fopen(path, "w");
+	if (f) {
+		fputs("{not json", f);
+		fclose(f);
+	}
+	conv = exec_conversation(path, "Prompt", "task", err);
+	ASSERT(conv == NULL, "corrupt session refused");
+	conversation_destroy(conv);
+	fclose(err);
+	unlink(path);
+}
+
 static void test_trace_file(void)
 {
 	printf("  Test: --trace records request and response, never the API key\n");
@@ -1525,6 +1590,8 @@ int main(void)
 	test_exec_json_report();
 	test_exec_refuses_confirmation();
 	test_exec_error_status();
+	test_exec_session_round_trip();
+	test_garbled_response_is_retried();
 	test_trace_file();
 
 	printf("\n--- E2E Results ---\n");

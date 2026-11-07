@@ -14,6 +14,7 @@
 #include "conversation.h"
 #include "tools.h"
 #include <string.h>
+#include <unistd.h>
 
 struct exec_state {
 	const struct exec_options *opts;
@@ -110,6 +111,35 @@ static void print_json(const struct exec_options *opts, const struct agent_resul
 		cJSON_free(text);
 	}
 	cJSON_Delete(root);
+}
+
+struct conversation_history *exec_conversation(const char *session_path,
+					       const char *system_prompt,
+					       const char *task, FILE *err)
+{
+	struct conversation_history *conv = NULL;
+	if (session_path && session_path[0] && access(session_path, F_OK) == 0) {
+		conv = conversation_load(session_path);
+		if (!conv) {
+			fprintf(err, "boris exec: cannot load session %s\n", session_path);
+			return NULL;
+		}
+		if (conv->count > 0 && conv->messages[0].role == MESSAGE_ROLE_SYSTEM)
+			conversation_replace_system_prompt(conv, system_prompt);
+	} else {
+		conv = conversation_create();
+		if (!conv || conversation_add_system(conv, system_prompt) != BORIS_OK) {
+			conversation_destroy(conv);
+			fprintf(err, "boris exec: out of memory\n");
+			return NULL;
+		}
+	}
+	if (conversation_add_user(conv, task) != BORIS_OK) {
+		conversation_destroy(conv);
+		fprintf(err, "boris exec: out of memory\n");
+		return NULL;
+	}
+	return conv;
 }
 
 int exec_run(struct conversation_history *conv, const struct agent_configuration *cfg,

@@ -422,9 +422,12 @@ static void parse_tool_calls_array(const struct cJSON *tc_arr,
 
 static void parse_non_streaming(struct llm_response *r, const char *body)
 {
+	/* A 200 whose body does not parse, or has no choices, is almost always
+	 * a transfer cut short or a proxy's error page: worth retrying. A
+	 * well-formed API error object (below) is not. */
 	struct cJSON *root = json_parse(body);
 	if (!root) {
-		set_error(r, BORIS_ERROR_PARSE, false,
+		set_error(r, BORIS_ERROR_PARSE, true,
 			  "failed to parse response JSON");
 		return;
 	}
@@ -445,7 +448,7 @@ static void parse_non_streaming(struct llm_response *r, const char *body)
 				       ? cJSON_GetArrayItem(choices, 0)
 				       : NULL;
 	if (!choice) {
-		set_error(r, BORIS_ERROR_PARSE, false,
+		set_error(r, BORIS_ERROR_PARSE, true,
 			  "response missing 'choices' array");
 		cJSON_Delete(root);
 		return;

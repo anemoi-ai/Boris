@@ -183,7 +183,7 @@ Dependency direction is strict: `main` → `repl/init` → `agent` → `llm/tool
 
 `tools.enabled = default` turns on everything except `fetch`; `all` includes it. Every result is capped at `tools.max_result_bytes` (132 KB by default) with a note saying how much was cut.
 
-Scripts started by `run` see only an allowlisted environment (`PATH`, `HOME`, locale and a few others), never `BORIS_API_KEY`. They still run with your permissions, so `behaviour.confirm_run = true` is the safeguard if you need one.
+Scripts started by `run` see only an allowlisted environment (`PATH`, `HOME`, locale and a few others), never `BORIS_API_KEY`. They still run with your permissions and can read files such as `~/.boris/config.ini`, so Boris also redacts its own API key from every tool result before the model sees it. `behaviour.confirm_run = true` is the safeguard if you need more.
 
 ---
 
@@ -208,6 +208,17 @@ Results: 8 passed, 0 failed
 ```
 
 The end-to-end tests run without a real LLM. `tests/mock_http.c` provides a link-level substitute for `src/http_client.c` that returns pre-queued responses, so the complete agent loop — tool calls, self-correction nudges, retry, context overflow — can be exercised without an API key.
+
+### Evals
+
+`make test` uses a mock model; `evals/` measures Boris against a real one. Every trial runs in a throwaway `HOME` with a secret canary, is graded on what actually happened (files, hidden tests, tools called, the request trace), and fails if anything outside the sandbox changed or the canary reached the model. 58 cases cover tools, real project tasks, sessions and limits, long contexts, injected network faults and attacks; results come with confidence intervals, efficiency metrics and run-to-run comparison.
+
+```bash
+python3 evals/run_evals.py --endpoint http://localhost:11434 --model qwen3:8b --repeat 3
+python3 evals/run_evals.py selftest     # checks the harness itself, no model needed
+```
+
+See [docs/evals.md](docs/evals.md).
 
 ---
 
@@ -261,7 +272,7 @@ The answer goes to stdout and problems to stderr. With `--json` stdout is a sing
  "error":null}
 ```
 
-Exit status: 0 finished, 1 error, 2 stopped at `max_iterations`, 130 interrupted. Tools that need confirmation are refused in `exec` (there is nobody to ask), with a message on stderr.
+Exit status: 0 finished, 1 error, 2 stopped at `max_iterations`, 130 interrupted. `--session FILE` continues the conversation saved in `FILE` (if it exists) and saves it back, so a sequence of `exec` calls can hold one conversation. Tools that need confirmation are refused in `exec` (there is nobody to ask), with a message on stderr.
 
 ### Request traces
 
