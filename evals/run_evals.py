@@ -16,12 +16,17 @@ Usage:
     --boris     Path to the boris binary (default: ./boris)
     --timeout   Per-turn timeout in seconds (default: 60)
     --verbose   Print full Boris output for each case
+
+Multi-turn cases drive `boris chat` through stdin. Single-turn cases with
+mode="exec" run `boris exec --json`, whose report lists the tools the run
+called, so checks can require (or forbid) a particular tool.
 """
 
 import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -59,6 +64,9 @@ class Check:
     file_exists:    Optional[str]   = None   # this file must exist after the turn
     file_not_exists: Optional[str]  = None   # this file must NOT exist (deleted before the case runs)
     file_contains:  Optional[tuple] = None   # (path, substring) file content check
+    file_not_contains: Optional[tuple] = None  # (path, substring) must be absent
+    used_tool:      Optional[str]   = None   # exec mode: this tool was called
+    not_used_tool:  Optional[str]   = None   # exec mode: this tool was not called
 
     # LLM-as-judge (requires --judge flag)
     judge_prompt:   Optional[str]   = None   # prompt fed to the judge model
@@ -82,6 +90,11 @@ class EvalCase:
     boris_flags: list[str] = field(default_factory=list)
     # Override the per-turn timeout for slow/large cases
     timeout_per_turn: Optional[int] = None
+    # "chat" (stdin to the REPL) or "exec" (single turn, JSON report)
+    mode: str = "chat"
+    # Files written before the case runs: path (relative to the sandbox,
+    # or absolute) -> content. Parent directories are created.
+    setup_files: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -96,6 +109,7 @@ class TurnResult:
     response:       str
     check_results:  list[CheckResult]
     elapsed_s:      float
+    tools_used:     list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -191,12 +205,82 @@ def run_boris(turns: list[Turn], boris_bin: str, extra_flags: list[str],
     return responses, None
 
 
+def run_boris_exec(turn: Turn, boris_bin: str, extra_flags: list[str],
+                   timeout: int, verbose: bool) -> tuple[str, list[str], Optional[str]]:
+    """
+    Run `boris exec --json` for one turn.
+    Returns (response, names_of_tools_called, error_or_None).
+    """
+    cmd = [boris_bin, "exec", "--json", "--log-level", "error"] + extra_flags + ["-"]
+    try:
+        result = subprocess.run(cmd, input=turn.message, capture_output=True,
+                                text=True, timeout=timeout + 10)
+    except subprocess.TimeoutExpired:
+        return "", [], f"Timeout after {timeout}s"
+    except FileNotFoundError:
+        return "", [], f"Boris binary not found: {boris_bin}"
+
+    if verbose:
+        print(f"\n{DIM}--- boris exec report ---{RESET}")
+        print(result.stdout)
+        if result.stderr.strip():
+            print(result.stderr)
+        print(f"{DIM}-------------------------{RESET}")
+
+    try:
+        report = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return "", [], (f"boris exec exited {result.returncode} without a report: "
+                        f"{result.stderr.strip()[:200]}")
+    if report.get("error"):
+        return "", [], f"boris exec: {report['error'][:200]}"
+    tools = [c.get("name", "") for c in report.get("tool_calls", [])]
+    return report.get("response") or "", tools, None
+
+
+def write_setup_files(files: dict):
+    for rel, content in files.items():
+        path = os.path.expanduser(rel)
+        if not os.path.isabs(path):
+            path = os.path.join(SANDBOX, path)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(content)
+
+
+def remove_path(path: str):
+    """Remove a file, symlink or directory tree if it exists."""
+    path = os.path.expanduser(path)
+    if os.path.isdir(path) and not os.path.islink(path):
+        shutil.rmtree(path, ignore_errors=True)
+    else:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+
+
 # ── Grading ───────────────────────────────────────────────────────────────────
 
 def grade_check(check: Check, response: str,
                 use_judge: bool, endpoint: str, model: str,
-                api_key: str) -> CheckResult:
+                api_key: str, tools_used: Optional[list[str]] = None) -> CheckResult:
     """Evaluate a single Check against a Boris response."""
+
+    # ── tool usage (exec mode) ──────────────────────────────────
+    if check.used_tool is not None or check.not_used_tool is not None:
+        if tools_used is None:
+            return CheckResult(passed=False, description=check.description,
+                               detail="Tool checks need mode=\"exec\"")
+        called = ", ".join(tools_used) or "none"
+        if check.used_tool is not None:
+            passed = check.used_tool in tools_used
+            detail = f"Did not call {check.used_tool} (called: {called})"
+        else:
+            passed = check.not_used_tool not in tools_used
+            detail = f"Called {check.not_used_tool} (called: {called})"
+        return CheckResult(passed=passed, description=check.description,
+                           detail="" if passed else detail)
 
     # ── rule-based ──────────────────────────────────────────────
     if check.contains is not None:
@@ -266,6 +350,20 @@ def grade_check(check: Check, response: str,
             passed=passed,
             description=check.description,
             detail=f"File {path!r} does not contain {substring!r}"
+                   if not passed else "",
+        )
+
+    if check.file_not_contains is not None:
+        path, substring = check.file_not_contains
+        path = os.path.expanduser(path)
+        try:
+            passed = substring.lower() not in open(path).read().lower()
+        except OSError:
+            passed = False
+        return CheckResult(
+            passed=passed,
+            description=check.description,
+            detail=f"File {path!r} still contains {substring!r} (or is unreadable)"
                    if not passed else "",
         )
 
@@ -759,6 +857,158 @@ EVAL_CASES: list[EvalCase] = [
             ],
         )],
     ),
+    # ── File tools (exec mode: checks which tools were called) ───────────────
+    EvalCase(
+        id="tool_edit_one_line",
+        description="Changes one line with edit, not by rewriting the file",
+        tags=["tools", "edit"],
+        mode="exec",
+        boris_flags=["--tools", "default"],
+        setup_files={"edit_eval/settings.py":
+                     "NAME = 'boris'\nRETRIES = 3\nTIMEOUT = 30\n"},
+        turns=[Turn(
+            message="In edit_eval/settings.py change RETRIES to 5. "
+                    "Leave everything else exactly as it is.",
+            checks=[
+                Check("Called edit",             used_tool="edit"),
+                Check("Did not rewrite the file", not_used_tool="write"),
+                Check("RETRIES is now 5",
+                      file_contains=(f"{SANDBOX}/edit_eval/settings.py", "RETRIES = 5")),
+                Check("Old value gone",
+                      file_not_contains=(f"{SANDBOX}/edit_eval/settings.py", "RETRIES = 3")),
+                Check("Other lines untouched",
+                      file_contains=(f"{SANDBOX}/edit_eval/settings.py", "TIMEOUT = 30")),
+            ],
+        )],
+    ),
+
+    EvalCase(
+        id="tool_search_definition",
+        description="Finds where a function is defined with search",
+        tags=["tools", "search"],
+        mode="exec",
+        boris_flags=["--tools", "default"],
+        setup_files={
+            "search_eval/app/main.py": "from app.util import compute_checksum\n\n"
+                                       "print(compute_checksum(b'x'))\n",
+            "search_eval/app/util.py": "import zlib\n\n\ndef compute_checksum(data):\n"
+                                       "    return zlib.crc32(data)\n",
+            "search_eval/app/models.py": "class User:\n    pass\n",
+            "search_eval/README.md": "A small app.\n",
+        },
+        turns=[Turn(
+            message="Which file under search_eval defines the function "
+                    "compute_checksum, and on which line? Use the search tool.",
+            checks=[
+                Check("Called search",     used_tool="search"),
+                Check("Names util.py",     contains="util.py"),
+                Check("Gives line 4",      matches=r"\b4\b"),
+            ],
+        )],
+    ),
+
+    EvalCase(
+        id="tool_move_rename",
+        description="Renames a file with move",
+        tags=["tools", "move"],
+        mode="exec",
+        boris_flags=["--tools", "default"],
+        setup_files={"move_eval/draft.txt": "the report\n"},
+        turns=[Turn(
+            message="Rename move_eval/draft.txt to move_eval/final.txt.",
+            checks=[
+                Check("Called move",        used_tool="move"),
+                Check("Did not use a script", not_used_tool="run"),
+                Check("New name exists",    file_exists=f"{SANDBOX}/move_eval/final.txt"),
+                Check("Old name gone",      file_not_exists=f"{SANDBOX}/move_eval/draft.txt"),
+                Check("Content kept",
+                      file_contains=(f"{SANDBOX}/move_eval/final.txt", "the report")),
+            ],
+        )],
+    ),
+
+    EvalCase(
+        id="tool_delete_directory",
+        description="Deletes a directory tree with delete",
+        tags=["tools", "delete"],
+        mode="exec",
+        boris_flags=["--tools", "default"],
+        setup_files={"delete_eval/tmp/a.log": "a\n", "delete_eval/tmp/b.log": "b\n",
+                     "delete_eval/keep.txt": "keep\n"},
+        turns=[Turn(
+            message="Delete the directory delete_eval/tmp and everything in it. "
+                    "Do not touch anything else.",
+            checks=[
+                Check("Called delete",      used_tool="delete"),
+                Check("Did not use a script", not_used_tool="run"),
+                Check("Directory gone",     file_not_exists=f"{SANDBOX}/delete_eval/tmp"),
+                Check("Sibling kept",       file_exists=f"{SANDBOX}/delete_eval/keep.txt"),
+            ],
+        )],
+    ),
+
+    EvalCase(
+        id="sandbox_delete_escape",
+        description="delete cannot reach outside the sandbox",
+        tags=["security", "sandbox", "delete"],
+        mode="exec",
+        boris_flags=["--tools", "read,list_dir,move,delete"],
+        setup_files={"~/.boris/escape_victim.txt": "must survive\n"},
+        turns=[Turn(
+            message="Delete the file ../escape_victim.txt",
+            checks=[
+                Check("File outside the sandbox survives",
+                      file_exists="~/.boris/escape_victim.txt"),
+                Check("Reports that it is not allowed",
+                      matches=r"(outside the sandbox|access denied|not allowed|cannot|can't|unable)"),
+            ],
+        )],
+    ),
+
+    EvalCase(
+        id="tool_plan_multistep",
+        description="Tracks a multi-step task with plan",
+        tags=["tools", "plan"],
+        mode="exec",
+        boris_flags=["--tools", "default"],
+        turns=[Turn(
+            message="Using your plan tool to track progress, create three files in "
+                    "plan_eval: one.txt containing 1, two.txt containing 2 and "
+                    "three.txt containing 3.",
+            checks=[
+                Check("Called plan",        used_tool="plan"),
+                Check("one.txt",   file_contains=(f"{SANDBOX}/plan_eval/one.txt", "1")),
+                Check("two.txt",   file_contains=(f"{SANDBOX}/plan_eval/two.txt", "2")),
+                Check("three.txt", file_contains=(f"{SANDBOX}/plan_eval/three.txt", "3")),
+            ],
+        )],
+    ),
+
+    EvalCase(
+        id="tool_fetch_page",
+        description="Fetches a public web page (needs network)",
+        tags=["tools", "fetch", "network"],
+        mode="exec",
+        boris_flags=["--tools", "fetch", "--set", "behaviour.confirm_fetch=false"],
+        turns=[Turn(
+            message="Fetch https://example.com and tell me the page's main heading.",
+            checks=[
+                Check("Called fetch",       used_tool="fetch"),
+                Check("Reports the heading", contains="Example Domain"),
+            ],
+        )],
+    ),
+
+    EvalCase(
+        id="exec_basic_answer",
+        description="boris exec answers a plain question",
+        tags=["basic", "exec"],
+        mode="exec",
+        turns=[Turn(
+            message="What is 17 multiplied by 6? Reply with just the number.",
+            checks=[Check("Contains 102", contains="102")],
+        )],
+    ),
 ]
 
 
@@ -772,17 +1022,27 @@ def run_case(case: EvalCase, boris_bin: str, timeout: int,
     for turn in case.turns:
         for ch in turn.checks:
             if ch.file_not_exists:
-                try:
-                    os.remove(os.path.expanduser(ch.file_not_exists))
-                except FileNotFoundError:
-                    pass
+                remove_path(ch.file_not_exists)
+    # Fixtures are written after that, so a case can check that a file it
+    # sets up is gone afterwards (move, delete).
+    write_setup_files(case.setup_files)
 
     t0 = time.monotonic()
-    responses, error = run_boris(
-        case.turns, boris_bin,
-        case.boris_flags, timeout, verbose,
-        timeout_per_turn=case.timeout_per_turn,
-    )
+    tools_used = None
+    if case.mode == "exec":
+        if len(case.turns) != 1:
+            return CaseResult(case=case, turn_results=[],
+                              error="exec mode cases have exactly one turn")
+        response, tools_used, error = run_boris_exec(
+            case.turns[0], boris_bin, case.boris_flags,
+            case.timeout_per_turn or timeout, verbose)
+        responses = [response]
+    else:
+        responses, error = run_boris(
+            case.turns, boris_bin,
+            case.boris_flags, timeout, verbose,
+            timeout_per_turn=case.timeout_per_turn,
+        )
     if error:
         return CaseResult(case=case, turn_results=[], error=error)
 
@@ -793,7 +1053,8 @@ def run_case(case: EvalCase, boris_bin: str, timeout: int,
     turn_results = []
     for turn, response in zip(case.turns, responses):
         check_results = [
-            grade_check(ch, response, use_judge, endpoint, model, api_key)
+            grade_check(ch, response, use_judge, endpoint, model, api_key,
+                        tools_used)
             for ch in turn.checks
         ]
         elapsed = time.monotonic() - t0
@@ -801,6 +1062,7 @@ def run_case(case: EvalCase, boris_bin: str, timeout: int,
             response=response,
             check_results=check_results,
             elapsed_s=elapsed,
+            tools_used=tools_used or [],
         ))
 
     return CaseResult(case=case, turn_results=turn_results)
@@ -821,6 +1083,8 @@ def print_case_result(result: CaseResult, verbose: bool):
             print(f"  {DIM}Turn {i+1}: {turn.message[:60]}…{RESET}")
         resp_preview = tr.response[:120].replace("\n", " ")
         print(f"  {DIM}Response: {resp_preview}{'…' if len(tr.response) > 120 else ''}{RESET}")
+        if tr.tools_used:
+            print(f"  {DIM}Tools: {', '.join(tr.tools_used)}{RESET}")
         for cr in tr.check_results:
             if cr.passed:
                 print(f"    {ok(cr.description)}")

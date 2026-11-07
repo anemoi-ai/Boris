@@ -17,6 +17,8 @@
 #include "boris_types.h"
 #include "boris_errors.h"
 #include "cJSON.h"
+#include "exec.h"
+#include "json.h"
 
 
 #include <stdio.h>
@@ -1286,6 +1288,156 @@ static void test_repeat_detection_duplicate_calls(void)
 	configuration_destroy(&cfg);
 }
 
+/* -------------------------------------------------------------------------
+ * boris exec and request tracing
+ * ---------------------------------------------------------------------- */
+
+/* Read a whole stream written by the code under test. Caller frees. */
+static char *slurp_stream(FILE *f)
+{
+	fflush(f);
+	long len = ftell(f);
+	rewind(f);
+	char *buf = calloc(1, (size_t)(len > 0 ? len : 0) + 1);
+	if (buf && len > 0 && fread(buf, 1, (size_t)len, f) != (size_t)len)
+		buf[0] = '\0';
+	return buf;
+}
+
+static struct conversation_history *task_conversation(const char *task)
+{
+	struct conversation_history *conv = conversation_create();
+	conversation_add_system(conv, "You are a test.");
+	conversation_add_user(conv, task);
+	return conv;
+}
+
+static void test_exec_json_report(void)
+{
+	printf("  Test: exec --json reports answer, tool calls and usage\n");
+	mock_http_reset();
+	char *tc = make_tool_response(NULL, "call_1", "plan",
+				      "{\"action\":\"update\",\"steps\":[{\"step\":\"a\","
+				      "\"status\":\"done\"}]}");
+	char *stop = make_stop_response("All done.");
+	mock_http_queue_response(tc, 200);
+	mock_http_queue_response(stop, 200);
+	free(tc);
+	free(stop);
+
+	struct agent_configuration cfg = make_test_config();
+	cfg.tools_enabled = TOOL_PLAN;
+	tools_register_builtins();
+	struct conversation_history *conv = task_conversation("Make a plan");
+
+	FILE *out = tmpfile(), *err = tmpfile();
+	struct exec_options opts = {.json = true, .show_tools = false, .out = out, .err = err};
+	int status = exec_run(conv, &cfg, &opts);
+	char *text = slurp_stream(out);
+
+	ASSERT(status == EXEC_EXIT_OK, "exit status 0");
+	cJSON *report = text ? cJSON_Parse(text) : NULL;
+	ASSERT(report != NULL, "stdout is one JSON object");
+	const cJSON *calls = cJSON_GetObjectItemCaseSensitive(report, "tool_calls");
+	const cJSON *first = cJSON_GetArrayItem(calls, 0);
+	const cJSON *usage = cJSON_GetObjectItemCaseSensitive(report, "usage");
+	ASSERT(report && strcmp(json_get_str(report, "response"), "All done.") == 0,
+	       "response is the final answer");
+	ASSERT(report && strcmp(json_get_str(report, "finish_reason"), "natural") == 0,
+	       "finish_reason natural");
+	ASSERT(json_get_int(report, "iterations", 0) == 2, "two iterations");
+	ASSERT(json_get_int(usage, "prompt_tokens", 0) == 30, "prompt tokens summed (20+10)");
+	ASSERT(cJSON_GetArraySize(calls) == 1 && strcmp(json_get_str(first, "name"), "plan") == 0,
+	       "the plan call is listed");
+	ASSERT(first && strstr(json_get_str(first, "summary"), "1 steps") != NULL,
+	       "the call has its summary");
+	ASSERT(cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(first, "is_error")),
+	       "the call succeeded");
+	ASSERT(cJSON_IsNull(cJSON_GetObjectItemCaseSensitive(report, "error")), "error is null");
+
+	cJSON_Delete(report);
+	free(text);
+	fclose(out);
+	fclose(err);
+	conversation_destroy(conv);
+	configuration_destroy(&cfg);
+	tool_plan_reset();
+}
+
+static void test_exec_refuses_confirmation(void)
+{
+	printf("  Test: exec refuses calls that need confirmation, and says why\n");
+	mock_http_reset();
+	char *tc = make_tool_response(NULL, "call_1", "write",
+				      "{\"path\":\"x.txt\",\"content\":\"hi\"}");
+	char *stop = make_stop_response("I could not write it.");
+	mock_http_queue_response(tc, 200);
+	mock_http_queue_response(stop, 200);
+	free(tc);
+	free(stop);
+
+	struct agent_configuration cfg = make_test_config();
+	cfg.tools_enabled = TOOL_WRITE;
+	cfg.confirm_writes = true;
+	cfg.sandbox_root = strdup("/tmp");
+	tools_register_builtins();
+	struct conversation_history *conv = task_conversation("Write x.txt");
+
+	FILE *out = tmpfile(), *err = tmpfile();
+	struct exec_options opts = {.json = false, .show_tools = true, .out = out, .err = err};
+	int status = exec_run(conv, &cfg, &opts);
+	char *answer = slurp_stream(out);
+	char *errors = slurp_stream(err);
+
+	ASSERT(status == EXEC_EXIT_OK, "the run itself finished");
+	ASSERT(answer && strcmp(answer, "I could not write it.\n") == 0,
+	       "plain mode prints just the answer");
+	ASSERT(errors && strstr(errors, "refused 'write'") != NULL, "stderr explains the refusal");
+	ASSERT(errors && strstr(errors, "[write] x.txt") != NULL &&
+		       strstr(errors, "(error)") != NULL,
+	       "tool activity line on stderr");
+
+	free(answer);
+	free(errors);
+	fclose(out);
+	fclose(err);
+	conversation_destroy(conv);
+	configuration_destroy(&cfg);
+}
+
+static void test_exec_error_status(void)
+{
+	printf("  Test: exec reports errors with status 1 and a JSON error\n");
+	mock_http_reset();
+	char *api_err = make_api_error_response("invalid api key");
+	mock_http_queue_response(api_err, 401);
+	free(api_err);
+
+	struct agent_configuration cfg = make_test_config();
+	struct conversation_history *conv = task_conversation("Hello");
+	FILE *out = tmpfile(), *err = tmpfile();
+	struct exec_options opts = {.json = true, .out = out, .err = err};
+	int status = exec_run(conv, &cfg, &opts);
+	char *text = slurp_stream(out);
+	cJSON *report = text ? cJSON_Parse(text) : NULL;
+
+	ASSERT(status == EXEC_EXIT_ERROR, "exit status 1");
+	ASSERT(report && strcmp(json_get_str(report, "finish_reason"), "error") == 0,
+	       "finish_reason error");
+	ASSERT(report && cJSON_IsNull(cJSON_GetObjectItemCaseSensitive(report, "response")),
+	       "no response");
+	ASSERT(report && json_get_str(report, "error") &&
+		       strstr(json_get_str(report, "error"), "401") != NULL,
+	       "error names the HTTP status");
+
+	cJSON_Delete(report);
+	free(text);
+	fclose(out);
+	fclose(err);
+	conversation_destroy(conv);
+	configuration_destroy(&cfg);
+}
+
 int main(void)
 {
 	printf("\n=== End-to-End Tests ===\n\n");
@@ -1321,6 +1473,9 @@ int main(void)
 	test_repeat_detection_duplicate_calls();
 	test_native_tool_reminder_setting();
 	test_request_stream_flag();
+	test_exec_json_report();
+	test_exec_refuses_confirmation();
+	test_exec_error_status();
 
 	printf("\n--- E2E Results ---\n");
 	if (failures == 0)

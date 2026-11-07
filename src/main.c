@@ -24,6 +24,7 @@
 #include "terminal.h"
 #include "fs.h"
 #include "version.h"
+#include "exec.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,12 +32,16 @@
 #include <getopt.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <ctype.h>
+#include <unistd.h>
 
 static bool g_quiet = false;
 
-
 /* Upper bound on configuration-changing flags in one invocation. */
 #define MAX_CLI_SETTINGS 64
+
+/* Largest task accepted on stdin by `boris exec`. */
+#define EXEC_MAX_TASK_BYTES (1024 * 1024)
 
 static void print_banner(void)
 {
@@ -61,13 +66,15 @@ static void print_usage(void)
 	printf("  Commands:\n");
 	printf("    init     Set up your first Boris companion\n");
 	printf("    chat     Start an interactive conversation\n");
+	printf("    exec     Run one task without the REPL and print the answer\n");
 	printf("    status   Show your current configuration\n");
 	printf("    help     Show this help message\n");
 	printf("\n");
-	printf("  Options (for chat):\n");
+	printf("  Options (for chat and exec):\n");
 	printf("    --config FILE       Load configuration from FILE\n");
 	printf("    --tools LIST        Comma-separated tools to enable\n");
-	printf("                        (read,write,list_dir,memory,run,all,none)\n");
+	printf("                        (read,write,edit,list_dir,search,move,delete,\n");
+	printf("                         memory,run,plan,fetch; or default, all, none)\n");
 	printf("    --sandbox DIR       Set sandbox root directory\n");
 	printf("    --max-iterations N  Max ReAct loop iterations (default: 16)\n");
 	printf("    --max-retries N     Max retries on LLM errors (default: 2)\n");
@@ -77,6 +84,7 @@ static void print_usage(void)
 	printf("    --show-metrics      Print metrics at exit\n");
 	printf("    --insecure          Skip SSL certificate verification\n");
 	printf("    --set KEY=VALUE     Override a config setting\n");
+	printf("    --json              exec: print a JSON report (answer, tools, usage)\n");
 	printf("    --version           Show version\n");
 	printf("\n");
 	printf("  Settings are layered: defaults, ~/.boris/config.ini, --config FILE,\n");
@@ -91,6 +99,10 @@ static void print_usage(void)
 	printf("    boris chat --tools read,write,list_dir,memory\n");
 	printf("    boris chat --sandbox ./workspace --max-iterations 8\n");
 	printf("    boris chat --set model.temperature=0.3\n");
+	printf("    boris exec \"Summarise notes.md in three bullet points\"\n");
+	printf("    echo \"Fix the failing test\" | boris exec --json\n");
+	printf("\n");
+	printf("  exec exit status: 0 done, 1 error, 2 hit max-iterations, 130 interrupted\n");
 	printf("\n");
 }
 
@@ -162,13 +174,19 @@ static void load_system_prompt_file(struct agent_configuration *config)
 	}
 }
 
-static int cmd_chat(int argc, char *argv[])
-{
-	struct agent_configuration config;
-	struct cli_settings cli;
-	memset(&cli, 0, sizeof(cli));
+/* Options that are not configuration keys. */
+struct cli_flags {
+	bool json;	/* exec: print a JSON report */
+	int exit_code;	/* >= 0: stop now and return this (help, --version, error) */
+};
 
-	/* Parse CLI options with getopt_long */
+/*
+ * Parse the options shared by chat and exec into cli (configuration keys,
+ * applied later in order) and flags. Leaves optind at the first operand.
+ */
+static void parse_options(int argc, char *argv[], struct cli_settings *cli,
+			  struct cli_flags *flags, bool exec_mode)
+{
 	static struct option long_opts[] = {
 		{"config", required_argument, 0, 'c'},
 		{"tools", required_argument, 0, 't'},
@@ -181,50 +199,56 @@ static int cmd_chat(int argc, char *argv[])
 		{"show-metrics", no_argument, 0, 'm'},
 		{"insecure", no_argument, 0, 'I'},
 		{"set", required_argument, 0, 'e'},
+		{"json", no_argument, 0, 'j'},
 		{"quiet", no_argument, 0, 'q'},
 		{"version", no_argument, 0, 'V'},
 		{"help", no_argument, 0, 'h'},
 		{0, 0, 0, 0}};
 
+	/* chat stops at the first operand ("+"); exec accepts options after the
+	 * task too (boris exec "task" --json), with "--" ending them. */
+	const char *optstring = exec_mode ? "c:t:s:i:r:Sl:f:mhe:IjqV"
+					  : "+c:t:s:i:r:Sl:f:mhe:IjqV";
+	flags->json = false;
+	flags->exit_code = -1;
 	int opt;
-	while ((opt = getopt_long(argc, argv, "+c:t:s:i:r:Sl:f:mhe:IqV",
-				  long_opts, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, optstring, long_opts, NULL)) != -1) {
 		switch (opt) {
 		case 'c':
-			cli.config_file = optarg;
+			cli->config_file = optarg;
 			break;
 		case 't':
-			cli_add(&cli, "tools.enabled", optarg);
+			cli_add(cli, "tools.enabled", optarg);
 			break;
 		case 's':
-			cli_add(&cli, "tools.sandbox_root", optarg);
+			cli_add(cli, "tools.sandbox_root", optarg);
 			break;
 		case 'i':
-			cli_add(&cli, "agent.max_iterations", optarg);
+			cli_add(cli, "agent.max_iterations", optarg);
 			break;
 		case 'r':
-			cli_add(&cli, "agent.max_retries", optarg);
+			cli_add(cli, "agent.max_retries", optarg);
 			break;
 		case 'S':
-			cli_add(&cli, "model.stream", "true");
+			cli_add(cli, "model.stream", "true");
 			break;
 		case 'l':
-			cli_add(&cli, "logging.level", optarg);
+			cli_add(cli, "logging.level", optarg);
 			break;
 		case 'f':
-			cli_add(&cli, "logging.file", optarg);
+			cli_add(cli, "logging.file", optarg);
 			break;
 		case 'm':
-			cli_add(&cli, "output.show_metrics", "true");
+			cli_add(cli, "output.show_metrics", "true");
 			break;
 		case 'I':
-			cli_add(&cli, "model.verify_ssl", "false");
+			cli_add(cli, "model.verify_ssl", "false");
 			break;
 		case 'e': { /* --set KEY=VALUE */
 			char *eq = strchr(optarg, '=');
 			if (eq) {
 				*eq = '\0';
-				cli_add(&cli, optarg, eq + 1);
+				cli_add(cli, optarg, eq + 1);
 			} else {
 				fprintf(stderr,
 					"  Invalid --set format: %s "
@@ -233,20 +257,43 @@ static int cmd_chat(int argc, char *argv[])
 			}
 			break;
 		}
+		case 'j':
+			if (!exec_mode) {
+				fprintf(stderr, "  --json is only available with 'boris exec'\n");
+				flags->exit_code = 1;
+				return;
+			}
+			flags->json = true;
+			break;
 		case 'q':
 			g_quiet = true;
 			break;
 		case 'V':
 			print_version();
-			return 0;
+			flags->exit_code = 0;
+			return;
 		case 'h':
 			print_usage();
-			return 0;
+			flags->exit_code = 0;
+			return;
 		default:
 			print_usage();
-			return 1;
+			flags->exit_code = exec_mode ? EXEC_EXIT_USAGE : 1;
+			return;
 		}
 	}
+}
+
+static int cmd_chat(int argc, char *argv[])
+{
+	struct agent_configuration config;
+	struct cli_settings cli;
+	struct cli_flags flags;
+	memset(&cli, 0, sizeof(cli));
+
+	parse_options(argc, argv, &cli, &flags, false);
+	if (flags.exit_code >= 0)
+		return flags.exit_code;
 
 	/* --quiet also hides the per-tool activity lines (applied last, so it
 	 * wins over the config file) */
@@ -317,6 +364,131 @@ static int cmd_chat(int argc, char *argv[])
 	logger_close();
 
 	return 0;
+}
+
+/* Read all of stdin (the task for `boris exec -`). Returns a heap string. */
+static char *read_stdin_task(void)
+{
+	size_t cap = 4096, len = 0;
+	char *buf = malloc(cap);
+	while (buf) {
+		if (len + 1 >= cap) {
+			if (cap >= EXEC_MAX_TASK_BYTES) {
+				free(buf);
+				return NULL;
+			}
+			char *grown = realloc(buf, cap * 2);
+			if (!grown) {
+				free(buf);
+				return NULL;
+			}
+			buf = grown;
+			cap *= 2;
+		}
+		size_t n = fread(buf + len, 1, cap - len - 1, stdin);
+		len += n;
+		if (n == 0)
+			break;
+	}
+	if (buf)
+		buf[len] = '\0';
+	return buf;
+}
+
+/* The task: the operands joined with spaces, or stdin for none or "-". */
+static char *exec_task_text(int argc, char *argv[])
+{
+	if (optind >= argc || (optind == argc - 1 && strcmp(argv[optind], "-") == 0))
+		return isatty(STDIN_FILENO) ? NULL : read_stdin_task();
+
+	size_t total = 1;
+	for (int i = optind; i < argc; i++)
+		total += strlen(argv[i]) + 1;
+	char *task = malloc(total);
+	if (!task)
+		return NULL;
+	task[0] = '\0';
+	for (int i = optind; i < argc; i++) {
+		if (i > optind)
+			strcat(task, " ");
+		strcat(task, argv[i]);
+	}
+	return task;
+}
+
+static bool blank(const char *s)
+{
+	while (s && *s && isspace((unsigned char)*s))
+		s++;
+	return !s || !*s;
+}
+
+static int cmd_exec(int argc, char *argv[])
+{
+	struct agent_configuration config;
+	struct cli_settings cli;
+	struct cli_flags flags;
+	memset(&cli, 0, sizeof(cli));
+
+	/* Quiet by default: stdout is the answer, stderr only for problems.
+	 * Added first, so --log-level and --set still override it. */
+	cli_add(&cli, "logging.level", "warn");
+	parse_options(argc, argv, &cli, &flags, true);
+	if (flags.exit_code >= 0)
+		return flags.exit_code;
+
+	char *task = exec_task_text(argc, argv);
+	if (blank(task)) {
+		fprintf(stderr, "  Usage: boris exec [options] \"task\"   (or the task on stdin)\n");
+		free(task);
+		return EXEC_EXIT_USAGE;
+	}
+
+	logger_initialize(LOG_LEVEL_WARNING, NULL);
+	configuration_load_layers(&config, &cli);
+	logger_initialize((enum log_level)config.log_level, config.log_file);
+	load_system_prompt_file(&config);
+
+	int status = EXEC_EXIT_ERROR;
+	struct conversation_history *conv = NULL;
+	if (!config.model_endpoint) {
+		fprintf(stderr, "boris exec: no model endpoint configured "
+				"(run 'boris init' or set BORIS_MODEL_ENDPOINT)\n");
+		goto done;
+	}
+
+	conv = conversation_create();
+	if (!conv ||
+	    conversation_add_system(conv, config.system_prompt ? config.system_prompt
+							       : BORIS_DEFAULT_SYSTEM_PROMPT) != BORIS_OK ||
+	    conversation_add_user(conv, task) != BORIS_OK) {
+		fprintf(stderr, "boris exec: out of memory\n");
+		goto done;
+	}
+
+	signal(SIGPIPE, SIG_IGN);
+	if (http_global_init() != 0)
+		fprintf(stderr, "boris exec: warning: HTTP initialisation failed\n");
+	tools_register_builtins();
+	metrics_reset();
+
+	struct exec_options opts = {
+		.json = flags.json,
+		.show_tools = config.show_tool_calls && !flags.json && !g_quiet,
+		.out = stdout,
+		.err = stderr,
+	};
+	status = exec_run(conv, &config, &opts);
+
+	if (config.show_metrics)
+		metrics_print_summary();
+	http_global_cleanup();
+done:
+	conversation_destroy(conv);
+	configuration_destroy(&config);
+	free(task);
+	logger_close();
+	return status;
 }
 
 static int cmd_status(int argc, char *argv[])
@@ -423,6 +595,10 @@ int main(int argc, char *argv[])
 
 	if (strcmp(argv[1], "chat") == 0) {
 		return cmd_chat(argc - 1, argv + 1);
+	}
+
+	if (strcmp(argv[1], "exec") == 0) {
+		return cmd_exec(argc - 1, argv + 1);
 	}
 
 	if (strcmp(argv[1], "status") == 0) {

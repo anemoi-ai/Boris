@@ -197,6 +197,8 @@ static void test_mytool_basic(void)
 
 and call it from `main()`. Cover the happy path, missing arguments, and every sandbox or permission check the tool makes. `put_file()`, `get_file()` and `exists_in_sandbox()` help with file fixtures.
 
+For behaviour with a real model, add a case to `evals/run_evals.py` with `mode="exec"`: the `boris exec --json` report lists the tools a run called, so a check like `Check("Called mytool", used_tool="mytool")` verifies the model actually picks your tool.
+
 ---
 
 ## Step 5 — Configuration (optional)
@@ -212,4 +214,5 @@ If the tool needs settings, add fields to `struct agent_configuration`, defaults
 - [ ] `DECLARE_BUILTIN_TOOL(mytool)` in `tool_builtins.h`
 - [ ] Entry in `BUILTIN_TOOLS` in `src/tools.c`
 - [ ] Tests in `tests/test_tools.c`, passing under `make test`
+- [ ] An eval case in `evals/run_evals.py`
 - [ ] `boris.ini.example` updated if the tool has settings

@@ -128,6 +128,7 @@ That's the entire dependency list.
 ```
 src/
 ├── main.c            Entry, CLI dispatch
+├── exec.c            Non-interactive mode: one task, answer or JSON report
 ├── agent.c           The ReAct loop, self-correction, retry
 ├── llm.c             HTTP to the LLM API, response parsing, streaming
 ├── conversation.c    Message history, serialisation, truncation
@@ -200,7 +201,7 @@ make memcheck   # all tests under Valgrind
 --- test_configuration --- INI, env vars, validation, defaults
 --- test_logger ---        levels, file output, rotation
 --- test_markdown ---      headings, lists, inline stripping, fences
---- test_e2e ---           full agent loop with mock HTTP
+--- test_e2e ---           full agent loop, exec reports (mock HTTP)
 
 Results: 8 passed, 0 failed
 ```
@@ -239,6 +240,26 @@ Common knobs:
 ./boris chat --show-metrics                # token + timing summary on exit
 ./boris chat --set model.temperature=0.3   # override any config key
 ```
+
+### Non-interactive use
+
+`boris exec` runs one task and exits, without the REPL or the saved session:
+
+```bash
+./boris exec "Summarise notes.md in three bullet points"
+echo "Fix the failing test in calc.py" | ./boris exec --json
+```
+
+The answer goes to stdout and problems to stderr. With `--json` stdout is a single report:
+
+```json
+{"response":"...","finish_reason":"natural","iterations":3,
+ "usage":{"prompt_tokens":5120,"completion_tokens":310},
+ "tool_calls":[{"name":"edit","summary":"calc.py (12 -> 14 bytes)","is_error":false}],
+ "error":null}
+```
+
+Exit status: 0 finished, 1 error, 2 stopped at `max_iterations`, 130 interrupted. Tools that need confirmation are refused in `exec` (there is nobody to ask), with a message on stderr.
 
 `./boris help` lists every flag and env var. Boris stores config in `~/.boris/config.ini`, sessions in `~/.boris/sessions/`, memory in `~/.boris/memory/memory.json`, and input history in `~/.boris/history.txt`.
 
