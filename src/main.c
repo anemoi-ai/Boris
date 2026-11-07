@@ -23,6 +23,7 @@
 #include "json.h"
 #include "terminal.h"
 #include "fs.h"
+#include "version.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,7 +34,6 @@
 
 static bool g_quiet = false;
 
-#define BORIS_VERSION "1.1.0"
 
 /* Upper bound on configuration-changing flags in one invocation. */
 #define MAX_CLI_SETTINGS 64
@@ -373,6 +373,8 @@ static int cmd_status(int argc, char *argv[])
 	printf("  Tools enabled   : %s\n", tools_buf);
 	printf("  Confirm writes  : %s\n", config.confirm_writes ? "yes" : "no");
 	printf("  Confirm run     : %s\n", config.confirm_bash ? "yes" : "no");
+	if (config.tools_enabled & TOOL_FETCH)
+		printf("  Confirm fetch   : %s\n", config.confirm_fetch ? "yes" : "no");
 	printf("  Memory persist  : %s\n", config.memory_persist ? "yes" : "no");
 	printf("\n");
 	printf("  Log level       : %d\n", config.log_level);

@@ -14,6 +14,7 @@
 #include "http_client.h"
 #include "mock_http.h"
 #include <signal.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -156,14 +157,34 @@ struct http_response http_post(const char *url,
 	return resp;
 }
 
+/* GET (the fetch tool) takes the next queued response too; the recorded
+ * "request body" is "GET <url>". Content-Type is always text/plain. */
+struct http_response http_get(const char *url, const struct http_get_options *opts)
+{
+	(void)opts;
+	char line[2048];
+	snprintf(line, sizeof(line), "GET %s", url ? url : "");
+	struct http_response resp = http_post(url, line, NULL, NULL, 0, true);
+	if (!resp.error) {
+		resp.content_type = strdup("text/plain");
+		resp.effective_url = strdup(url ? url : "");
+	}
+	return resp;
+}
+
+bool http_address_is_private(const struct sockaddr *addr)
+{
+	(void)addr;
+	return true;
+}
+
 void http_response_free(struct http_response *response)
 {
 	if (!response)
 		return;
 	free(response->body);
 	free(response->error);
-	response->body = NULL;
-	response->error = NULL;
-	response->body_length = 0;
-	response->status_code = 0;
+	free(response->content_type);
+	free(response->effective_url);
+	memset(response, 0, sizeof(*response));
 }

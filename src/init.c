@@ -193,7 +193,8 @@ static int format_config(char *buf, size_t size, const char *companion_name,
 			 "confirm_run = false\n"
 			 "\n"
 			 "[tools]\n"
-			 "enabled = read,write,list_dir,memory,run\n"
+			 "# default = every tool except fetch; see boris.ini.example\n"
+			 "enabled = default\n"
 			 "sandbox_root = %s/sandbox\n"
 			 "memory_persist = true\n"
 			 "run_timeout = 30\n",

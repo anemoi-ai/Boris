@@ -71,6 +71,8 @@ struct agent_configuration {
 	bool stream_responses;
 	bool confirm_writes;
 	bool confirm_bash;
+	bool confirm_fetch;	  /* ask before each fetch (default on) */
+	bool fetch_allow_private; /* let fetch reach loopback/private addresses */
 	bool memory_persist;
 
 	int log_level;
@@ -110,13 +112,23 @@ struct conversation_history {
 };
 
 /* Tool enable/disable bitmask constants. */
-#define TOOL_READ     (1 << 0)
-#define TOOL_WRITE    (1 << 1)
-#define TOOL_LIST_DIR (1 << 4)
-#define TOOL_MEMORY   (1 << 5)
-#define TOOL_RUN      (1 << 6)
-#define TOOL_ALL      (TOOL_READ | TOOL_WRITE | TOOL_LIST_DIR | TOOL_MEMORY | TOOL_RUN)
-#define TOOL_NONE     (0)
+#define TOOL_READ     (1u << 0)
+#define TOOL_WRITE    (1u << 1)
+#define TOOL_EDIT     (1u << 2)
+#define TOOL_SEARCH   (1u << 3)
+#define TOOL_LIST_DIR (1u << 4)
+#define TOOL_MEMORY   (1u << 5)
+#define TOOL_RUN      (1u << 6)
+#define TOOL_MOVE     (1u << 7)
+#define TOOL_DELETE   (1u << 8)
+#define TOOL_PLAN     (1u << 9)
+#define TOOL_FETCH    (1u << 10)
+#define TOOL_ALL                                                                  \
+	(TOOL_READ | TOOL_WRITE | TOOL_EDIT | TOOL_SEARCH | TOOL_LIST_DIR |       \
+	 TOOL_MEMORY | TOOL_RUN | TOOL_MOVE | TOOL_DELETE | TOOL_PLAN | TOOL_FETCH)
+/* What "default" enables in tools.enabled: everything except fetch. */
+#define TOOL_DEFAULT  (TOOL_ALL & ~TOOL_FETCH)
+#define TOOL_NONE     (0u)
 
 /* Maximum tool calls the model may request in one turn. */
 #define TOOL_CALL_LIST_MAX 32
@@ -233,6 +245,7 @@ enum tool_confirm {
 	TOOL_CONFIRM_NEVER = 0, /* never asks */
 	TOOL_CONFIRM_WRITES,	/* behaviour.confirm_writes */
 	TOOL_CONFIRM_RUN,	/* behaviour.confirm_run */
+	TOOL_CONFIRM_FETCH,	/* behaviour.confirm_fetch */
 };
 
 /*

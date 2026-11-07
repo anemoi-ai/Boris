@@ -25,7 +25,10 @@ text_tool_fallback = false
 native_tool_reminder = true
 
 [tools]
-enabled = read,write,list_dir,memory,run
+# Comma list of tools, or: default (everything except fetch), all, none.
+# Tools: read, write, edit, list_dir, search, move, delete, memory, run,
+#        plan, fetch
+enabled = default
 sandbox_root = ~/.boris/sandbox
 memory_persist = true
 # Extra environment variables passed to scripts started by run (comma list).
@@ -34,11 +37,15 @@ memory_persist = true
 # run_env = VIRTUAL_ENV
 # Longest tool result returned to the model, in bytes (default 135168)
 # max_result_bytes = 135168
+# Let fetch reach loopback, private and link-local addresses (default false)
+# fetch_allow_private = false
 
 [behaviour]
 # Ask before each write / script run (needs an interactive terminal)
 confirm_writes = false
 confirm_run = false
+# Ask before each fetch (only applies when fetch is enabled)
+confirm_fetch = true
 
 [logging]
 level = info

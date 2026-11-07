@@ -12,6 +12,7 @@
 #include "agent.h"
 #include "markdown.h"
 #include "tools.h"
+#include "tool_builtins.h"
 #include "logger.h"
 #include "terminal.h"
 #include "editor.h"
@@ -366,6 +367,7 @@ static void cmd_clear(struct repl_state *st, const char *arg)
 		return;
 	}
 	conversation_clear(st->conv);
+	tool_plan_reset();
 	st->changed = true;
 	term_print_color(TERM_FG_BRIGHT_GREEN, "  Conversation cleared. System prompt preserved.\n\n");
 }
@@ -382,6 +384,7 @@ static void cmd_reset(struct repl_state *st, const char *arg)
 		return;
 	}
 	conversation_clear(conv);
+	tool_plan_reset();
 	const char *np = (cfg->system_prompt && cfg->system_prompt[0])
 				 ? cfg->system_prompt
 				 : BORIS_DEFAULT_SYSTEM_PROMPT;
@@ -402,7 +405,11 @@ static void cmd_tools(struct repl_state *st, const char *arg)
 		const char *status =
 			(st->cfg->tools_enabled & tools[i].flag) ? "enabled" : "disabled";
 		term_printf_color(TERM_FG_BRIGHT_GREEN, "    %-8s", status);
-		printf(" %-12s %s\n", tools[i].name, tools[i].description);
+		/* first sentence of the description: the rest is for the model */
+		const char *desc = tools[i].description;
+		const char *stop = strstr(desc, ". ");
+		int len = stop ? (int)(stop - desc) + 1 : (int)strlen(desc);
+		printf(" %-9s %.*s\n", tools[i].name, len, desc);
 	}
 	printf("\n");
 }

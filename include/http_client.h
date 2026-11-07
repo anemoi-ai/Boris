@@ -1,7 +1,8 @@
 /*
  * http_client.h - libcurl wrapper for HTTP requests.
  *
- * Handles synchronous POST requests and SSE streaming responses.
+ * Handles synchronous POST requests (the model API) and GET requests (the
+ * fetch tool), including SSE streaming responses.
  * Transport errors are reported via http_response.error; HTTP-level
  * errors (non-2xx) set status_code but leave error NULL so callers
  * can extract a message from the body.
@@ -14,6 +15,8 @@
 #include <stdbool.h>
 #include <signal.h>
 
+struct sockaddr;
+
 /* Responses larger than this are aborted with an error. */
 #define HTTP_MAX_RESPONSE_BYTES (32 * 1024 * 1024)
 
@@ -23,6 +26,20 @@ struct http_response {
 	size_t body_length; /* Length of the body in bytes */
 	long status_code;   /* HTTP status code (200, 404, 500, etc.) */
 	char *error;	    /* Error message if something went wrong (heap-allocated) */
+
+	/* Set by http_get() only (NULL / false otherwise). */
+	char *content_type;  /* Content-Type header, heap-allocated */
+	char *effective_url; /* final URL after redirects, heap-allocated */
+	bool truncated;	     /* body cut at http_get_options.max_bytes */
+};
+
+/* Options for http_get(). Zero values select the defaults noted. */
+struct http_get_options {
+	int timeout_secs;	/* default 30 */
+	bool verify_ssl;
+	size_t max_bytes;	/* keep at most this much body; default 4 MB */
+	bool allow_private;	/* permit loopback, private and link-local hosts */
+	const char *user_agent; /* default "Boris" */
 };
 
 /* -------------------------------------------------------------------------
@@ -46,6 +63,21 @@ struct http_response http_post(const char *url,
 			       const char *api_key,
 			       int timeout_secs,
 			       bool verify_ssl);
+
+/*
+ * Send a GET request for the fetch tool.
+ *
+ * Only http and https are allowed, including across redirects (at most 5).
+ * Unless opts->allow_private is set, connections to loopback, private,
+ * link-local and other non-public addresses are refused at connect time,
+ * after DNS resolution, so redirects and DNS tricks cannot reach them;
+ * proxies from the environment are not used, so they cannot bypass that
+ * check. A body longer than max_bytes is cut and sets truncated.
+ */
+struct http_response http_get(const char *url, const struct http_get_options *opts);
+
+/* True if addr (AF_INET or AF_INET6) is not a public internet address. */
+bool http_address_is_private(const struct sockaddr *addr);
 
 /*
  * Register a flag that aborts in-flight requests when it becomes non-zero

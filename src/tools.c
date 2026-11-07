@@ -36,9 +36,15 @@
 static const struct tool_definition *const BUILTIN_TOOLS[] = {
 	&tool_read_definition,
 	&tool_write_definition,
+	&tool_edit_definition,
 	&tool_list_dir_definition,
+	&tool_search_definition,
+	&tool_move_definition,
+	&tool_delete_definition,
 	&tool_memory_definition,
 	&tool_run_definition,
+	&tool_plan_definition,
+	&tool_fetch_definition,
 };
 
 #define BUILTIN_TOOLS_COUNT (sizeof(BUILTIN_TOOLS) / sizeof(BUILTIN_TOOLS[0]))
@@ -103,6 +109,56 @@ int tools_sandbox_resolve(const struct agent_configuration *cfg,
 		*err_out = tool_result_errorf("sandbox",
 					      "Access denied: '%s' is outside the sandbox",
 					      path);
+		return -1;
+	}
+	return 0;
+}
+
+int tools_sandbox_resolve_entry(const struct agent_configuration *cfg,
+				const char *path, char *resolved, size_t size,
+				struct tool_result *err_out)
+{
+	char buf[PATH_MAX];
+	if (!path || !path[0] || strlen(path) >= sizeof(buf)) {
+		*err_out = tool_result_errorf("sandbox", "Invalid path");
+		return -1;
+	}
+	snprintf(buf, sizeof(buf), "%s", path);
+	size_t len = strlen(buf);
+	while (len > 1 && buf[len - 1] == '/')
+		buf[--len] = '\0';
+
+	const char *dir = ".";
+	const char *base = buf;
+	char *slash = strrchr(buf, '/');
+	if (slash == buf) {
+		dir = "/";
+		base = buf + 1;
+	} else if (slash) {
+		*slash = '\0';
+		dir = buf;
+		base = slash + 1;
+	}
+	if (!base[0] || strcmp(base, ".") == 0 || strcmp(base, "..") == 0) {
+		*err_out = tool_result_errorf("sandbox",
+					      "'%s' does not name a file or directory "
+					      "inside the sandbox",
+					      path);
+		return -1;
+	}
+
+	char parent[PATH_MAX];
+	if (tools_sandbox_resolve(cfg, dir, parent, sizeof(parent), err_out) != 0) {
+		tool_result_free(err_out);
+		*err_out = tool_result_errorf("sandbox",
+					      "Access denied: '%s' is outside the sandbox",
+					      path);
+		return -1;
+	}
+	int n = snprintf(resolved, size, "%s/%s",
+			 strcmp(parent, "/") == 0 ? "" : parent, base);
+	if (n < 0 || (size_t)n >= size) {
+		*err_out = tool_result_errorf("sandbox", "Path too long: %s", path);
 		return -1;
 	}
 	return 0;
@@ -280,6 +336,8 @@ static bool needs_confirmation(const struct tool_definition *t,
 		return cfg->confirm_writes;
 	case TOOL_CONFIRM_RUN:
 		return cfg->confirm_bash;
+	case TOOL_CONFIRM_FETCH:
+		return cfg->confirm_fetch;
 	case TOOL_CONFIRM_NEVER:
 	default:
 		return false;

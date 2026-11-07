@@ -131,7 +131,7 @@ src/
 ├── agent.c           The ReAct loop, self-correction, retry
 ├── llm.c             HTTP to the LLM API, response parsing, streaming
 ├── conversation.c    Message history, serialisation, truncation
-├── http_client.c     libcurl wrapper: POST, cancellation, size cap
+├── http_client.c     libcurl wrapper: POST, GET (fetch), cancellation, size cap
 ├── tools.c           Registry, dispatch, confirmation, result cap
 ├── sandbox.c         Path validation via realpath()
 ├── fs.c              mkdir -p, atomic file replacement, ~/.boris paths
@@ -148,9 +148,15 @@ src/
 └── tools/            One file per tool: function, schema, definition
     ├── read.c        Paged file read
     ├── write.c       Atomic write (temp + rename)
+    ├── edit.c        Exact-string replacement, atomic
     ├── list_dir.c    Directory listing
+    ├── search.c      Recursive regex / name search
+    ├── move.c        Rename or move within the sandbox
+    ├── delete.c      Delete files and trees, never through symlinks
     ├── memory.c      Key-value store with file locking
-    └── run.c         Script execution via fork/exec with timeout
+    ├── run.c         Script execution via fork/exec with timeout
+    ├── plan.c        The model's own checklist
+    └── fetch.c       HTTP(S) GET, HTML to text (off by default)
 ```
 
 Dependency direction is strict: `main` → `repl/init` → `agent` → `llm/tools` → `http_client/conversation/sandbox` → `arena/logger`. No cycles.
@@ -163,11 +169,17 @@ Dependency direction is strict: `main` → `repl/init` → `agent` → `llm/tool
 |---|---|---|
 | `read` | Read files within the sandbox | Supports `offset` + `length` for paging |
 | `write` | Write files safely | Atomic: temp + `rename()`; overwrite / append / create_new |
+| `edit` | Replace exact text in a file | `old_string` must be unique (or `replace_all`); atomic; keeps the file mode |
 | `list_dir` | List directory contents | Names, types, sizes; hidden files excluded by default |
+| `search` | Find text or files recursively | POSIX regex or literal, `glob` filter; skips hidden dirs, binaries, symlinks |
+| `move` | Rename or move | Refuses to overwrite unless asked; moves a symlink, not its target |
+| `delete` | Delete files or trees | Directories need `recursive`; never follows symlinks; never the sandbox root |
 | `memory` | Persistent key-value store | JSON on disk, file-locked; get / set / delete / list |
 | `run` | Execute a script in the sandbox | Shebang or extension; fork/exec, never `system()`; SIGKILL timeout; allowlisted environment |
+| `plan` | The model's checklist | Kept outside the history, so it survives truncation |
+| `fetch` | Fetch a web page as text | **Off by default**; asks first; http(s) only; private and loopback addresses refused |
 
-Every result is capped at `tools.max_result_bytes` (132 KB by default) with a note saying how much was cut.
+`tools.enabled = default` turns on everything except `fetch`; `all` includes it. Every result is capped at `tools.max_result_bytes` (132 KB by default) with a note saying how much was cut.
 
 Scripts started by `run` see only an allowlisted environment (`PATH`, `HOME`, locale and a few others), never `BORIS_API_KEY`. They still run with your permissions, so `behaviour.confirm_run = true` is the safeguard if you need one.
 
@@ -184,7 +196,7 @@ make memcheck   # all tests under Valgrind
 --- test_arena ---         allocation, reset, OOM
 --- test_conversation ---  history, serialisation, token estimation
 --- test_sandbox ---       path traversal, symlink attacks
---- test_tools ---         read, write, list_dir, memory, run, error paths
+--- test_tools ---         every tool, sandbox escapes, result cap, registry
 --- test_configuration --- INI, env vars, validation, defaults
 --- test_logger ---        levels, file output, rotation
 --- test_markdown ---      headings, lists, inline stripping, fences
@@ -220,7 +232,7 @@ Config layers, in priority order: compiled defaults → `~/.boris/config.ini` �
 Common knobs:
 
 ```bash
-./boris chat --tools read,write,list_dir   # comma list, or 'all' / 'none'
+./boris chat --tools read,write,edit       # comma list, or 'default' / 'all' / 'none'
 ./boris chat --sandbox ./project           # restrict filesystem access
 ./boris chat --max-iterations 16           # ReAct loop budget
 ./boris chat --stream                      # request SSE (reply shown when complete)

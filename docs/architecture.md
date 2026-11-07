@@ -107,11 +107,13 @@ Serialises the full conversation history and tool schemas into the OpenAI chat c
 
 ### `http_client.c` — HTTP transport
 
-Thin libcurl wrapper. Sends a single POST request and returns the response body as a heap-allocated string. Handles SSL verification, request timeout, a response size cap (`HTTP_MAX_RESPONSE_BYTES`), and cancellation: `http_set_cancel_flag()` registers a flag (the agent's SIGINT flag) that a curl progress callback checks to abort the transfer. Each request uses a fresh curl handle. Has no retry logic — retries are the caller's (`agent.c`) responsibility.
+Thin libcurl wrapper. `http_post()` sends a model request and returns the response body as a heap-allocated string. `http_get()` serves the `fetch` tool: http/https only, at most 5 redirects, no proxies, a download cap, and an open-socket callback that refuses loopback, private and link-local addresses after DNS resolution (so redirects and DNS rebinding cannot reach them). Handles SSL verification, request timeout, a response size cap (`HTTP_MAX_RESPONSE_BYTES`), and cancellation: `http_set_cancel_flag()` registers a flag (the agent's SIGINT flag) that a curl progress callback checks to abort the transfer. Each request uses a fresh curl handle. Has no retry logic — retries are the caller's (`agent.c`) responsibility.
 
 ### `tools.c` — Tool registry
 
 Each built-in tool lives in `src/tools/<name>.c` and exports one `const struct tool_definition` (name, description, schema, function, formatter, flag, confirmation class). `BUILTIN_TOOLS` in `tools.c` lists them, and everything else derives from that list: name ↔ flag lookup for `--tools`, registration, and the order tools are offered to the model. `tools_dispatch()` looks up a tool by name, checks the `tools_enabled` bitmask, asks the installed observer for confirmation when the tool's class requires it, allocates a scratch arena and calls the tool. It then caps the result at `tools.max_result_bytes`, cutting at a UTF-8 boundary and appending a note, so no tool can flood the context window. See [extending.md](extending.md) for adding a tool.
+
+Path handling for tools: `tools_sandbox_resolve()` resolves a path (following symlinks) and checks it is inside the sandbox. `tools_sandbox_resolve_entry()` is for operations on the directory entry itself (`move`, `delete`): it resolves the parent and appends the final name, so a symlink is acted on rather than followed.
 
 ### `sandbox.c` — Path validation
 
@@ -209,7 +211,8 @@ main
            ├── llm
            │    └── http_client
            ├── tools
-           │    └── sandbox
+           │    ├── sandbox, fs
+           │    └── http_client (fetch)
            └── conversation
                 └── arena, logger
 ```

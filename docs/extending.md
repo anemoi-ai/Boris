@@ -8,56 +8,39 @@ For context on how tools fit into the overall system, see [architecture.md](arch
 
 ## Overview
 
-Each tool is:
+Each built-in tool lives in one file, `src/tools/<name>.c`, which holds:
 
-1. A C function with a fixed signature in `src/tools/`
-2. A JSON Schema string describing its parameters
-3. A registration call in `tools_register_builtins()`
-4. A bitmask flag in `include/boris_types.h`
-5. A set of tests in `tests/test_tools.c`
+1. the tool function (fixed signature),
+2. a formatter that summarises a call in one line,
+3. a JSON Schema string for its parameters,
+4. one `const struct tool_definition` tying them together with a description, a flag and a confirmation class.
 
-The model sees the name, description, and schema. When it calls the tool, `tools_dispatch()` validates the bitmask, calls your function with the raw argument JSON, and returns your `tool_result` back into the conversation.
+Outside that file you touch three lines: a flag in `include/boris_types.h`, a declaration in `include/tool_builtins.h`, and an entry in the `BUILTIN_TOOLS` list in `src/tools.c`. Everything else is derived from that list: `--tools` / `tools.enabled` parsing, `boris status`, `/tools`, confirmation prompts and registration.
+
+The model sees the name, description and schema. When it calls the tool, `tools_dispatch()` checks the flag is enabled, asks for confirmation if the tool's class requires it, calls your function with the raw argument JSON, caps the result at `tools.max_result_bytes`, and returns it to the conversation.
 
 ---
 
-## Step 1 — Add a bitmask flag
+## Step 1 — Add a flag
 
-Open `include/boris_types.h` and add a flag for your tool. The existing flags are:
-
-```c
-#define TOOL_READ        (1 << 0)
-#define TOOL_WRITE       (1 << 1)
-#define TOOL_BASH        (1 << 2)   /* reserved */
-#define TOOL_WEB         (1 << 3)   /* reserved */
-#define TOOL_LIST_DIR    (1 << 4)
-#define TOOL_MEMORY      (1 << 5)
-#define TOOL_RUN         (1 << 6)
-#define TOOL_ALL         (0x7F)
-```
-
-Add yours at the next available bit:
+Open `include/boris_types.h`. Add a flag at the next free bit and include it in `TOOL_ALL`:
 
 ```c
-#define TOOL_MYTOOL      (1 << 7)
-#define TOOL_ALL         (0xFF)     /* update this too */
+#define TOOL_FETCH    (1u << 10)
+#define TOOL_MYTOOL   (1u << 11)   /* new */
+#define TOOL_ALL                                                     \
+	(TOOL_READ | TOOL_WRITE | ... | TOOL_FETCH | TOOL_MYTOOL)
 ```
 
-Also add your tool name to the `TOOL_FLAG_NAMES` table in `src/tools.c`. That one table is used both to parse `--tools` / `tools.enabled` and to display the tool in `/tools` and `boris status`:
+`TOOL_DEFAULT` (what `tools.enabled = default` means) is `TOOL_ALL` without `fetch`. If your tool should be off unless asked for, remove it from `TOOL_DEFAULT` too.
 
-```c
-static const struct { unsigned int flag; const char *name; } TOOL_FLAG_NAMES[] = {
-    { TOOL_READ,     "read"     },
-    /* ... */
-    { TOOL_RUN,      "run"      },
-    { TOOL_MYTOOL,   "mytool"   },  /* add here */
-};
-```
+A unit test (`test_builtin_definitions`) fails if two tools share a flag or if `TOOL_ALL` misses one.
 
 ---
 
 ## Step 2 — Create `src/tools/mytool.c`
 
-Every tool file follows the same pattern. Here is a minimal working example:
+A minimal working example:
 
 ```c
 /*
@@ -66,10 +49,9 @@ Every tool file follows the same pattern. Here is a minimal working example:
 #define _POSIX_C_SOURCE 200809L
 
 #include "tools.h"
-#include "arena.h"
-#include "configuration.h"
+#include "tool_builtins.h"
 #include "json.h"
-#include "logger.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -77,91 +59,22 @@ struct tool_result tool_mytool_fn(const char *arguments_json,
 				  const struct agent_configuration *cfg,
 				  struct memory_arena *scratch)
 {
-	(void)scratch;  /* remove if you use the arena */
+	(void)cfg;
+	(void)scratch;
 
-	if (!arguments_json)
-		return tool_result_errorf("mytool", "Missing arguments");
-
-	/* Parse arguments */
-	cJSON *root = json_parse(arguments_json);
-	if (!root)
-		return tool_result_errorf("mytool", "Invalid JSON arguments");
-
+	cJSON *root = json_parse(arguments_json ? arguments_json : "");
 	const char *input = json_get_str(root, "input");
-	if (!input) {
-		cJSON_Delete(root);
-		return tool_result_errorf("mytool", "Missing required argument: input");
-	}
-
-	/* Do the work */
-	char *result = /* ... heap-allocated result string ... */;
-
+	struct tool_result r;
+	if (!root)
+		r = tool_result_errorf("mytool", "Could not parse arguments as JSON");
+	else if (!input)
+		r = tool_result_errorf("mytool", "\"input\" is required");
+	else
+		r = tool_result_ok_copy("mytool", input); /* do the real work here */
 	cJSON_Delete(root);
-
-	/* tool_result_ok() takes ownership of result — do not free it */
-	return tool_result_ok("mytool", result);
+	return r;
 }
-```
 
-**Function signature rules:**
-- Name: `tool_<name>_fn`
-- Parameters: always `(const char *arguments_json, const struct agent_configuration *cfg, struct memory_arena *scratch)`
-- Return: always `struct tool_result`
-- On success: return `tool_result_ok("mytool", heap_string)` — transfers ownership
-- On error: return `tool_result_errorf("mytool", "message %s", ...)` — formats and copies
-
-**If your tool accesses the filesystem**, validate the path through the sandbox first:
-
-```c
-#include "sandbox.h"
-#include <limits.h>
-
-REQUIRE_SANDBOX(cfg);    /* returns an error result if sandbox_root is unset */
-
-char resolved[PATH_MAX];
-if (sandbox_resolve(cfg->sandbox_root, user_path,
-                    resolved, sizeof(resolved)) != 0)
-    return tool_result_errorf("mytool",
-        "Access denied: '%s' is outside the sandbox", user_path);
-
-/* Now use resolved, not user_path */
-```
-
----
-
-## Step 3 — Write the JSON Schema
-
-The schema is a JSON Schema object string that describes your tool's parameters. The model uses this to know what arguments to provide.
-
-```c
-/* In src/tools.c, alongside the other SCHEMA_* constants */
-static const char SCHEMA_MYTOOL[] =
-    "{"
-    "\"type\":\"object\","
-    "\"properties\":{"
-      "\"input\":{"
-        "\"type\":\"string\","
-        "\"description\":\"The input to process.\""
-      "},"
-      "\"count\":{"
-        "\"type\":\"integer\","
-        "\"description\":\"How many results to return.\","
-        "\"default\":1"
-      "}"
-    "},"
-    "\"required\":[\"input\"]"
-    "}";
-```
-
-Keep descriptions precise — they are part of every LLM request.
-
----
-
-## Step 4 — Register the tool
-
-First, give the tool a **formatter**: a one-line summary of a call's arguments. The REPL prints it for every call (`> mytool hello`) and uses it in confirmation prompts. Add it to `src/tools/mytool.c`:
-
-```c
 /* "hello". Display only; never fails. */
 void tool_mytool_format(const char *argument_json, char *buf, size_t size)
 {
@@ -170,138 +83,133 @@ void tool_mytool_format(const char *argument_json, char *buf, size_t size)
 	snprintf(buf, size, "%s", input ? input : "(invalid arguments)");
 	cJSON_Delete(root);
 }
-```
 
-Rules for formatters:
-- One short line; the tool name is printed separately, so leave it out.
-- Read argument strings in place. Never copy large values (file content) just to describe them; report a length instead, like the `write` formatter does.
-- You don't need to escape anything: the registry runs the result through `term_sanitize()`, which strips control characters before anything reaches the terminal.
-- A formatter is optional. Pass `NULL` and displays fall back to the raw argument JSON.
-
-Open `src/tools.c`. Add forward declarations at the top alongside the others:
-
-```c
-struct tool_result tool_mytool_fn(const char *arguments_json,
-				  const struct agent_configuration *cfg,
-				  struct memory_arena *scratch);
-void tool_mytool_format(const char *argument_json, char *buf, size_t size);
-```
-
-Then add a `register_one()` call inside `tools_register_builtins()`:
-
-```c
-void tools_register_builtins(void)
-{
-    register_one("read", "...", SCHEMA_READ, tool_read_fn, tool_read_format, TOOL_READ);
-    /* ... existing tools ... */
-    register_one("mytool",
-        "One sentence describing what this tool does and when to use it.",
-        SCHEMA_MYTOOL, tool_mytool_fn, tool_mytool_format, TOOL_MYTOOL);
-}
-```
-
-The description is shown to the model. Be specific: describe the primary use case, not just the name.
-
-Tools registered at runtime with `tools_register()` set the same field: `struct tool_definition` has a `format_call` member next to `fn`.
-
----
-
-## Step 5 — Add to the Makefile
-
-The Makefile discovers tool sources via a wildcard, so no Makefile change is needed — `src/tools/mytool.c` will be compiled automatically on the next `make`.
-
----
-
-## Step 6 — Write tests
-
-Open `tests/test_tools.c`. Add a forward declaration at the top:
-
-```c
-struct tool_result tool_mytool_fn(const char *arguments_json,
-				  const struct agent_configuration *cfg,
-				  struct memory_arena *scratch);
-```
-
-Add test functions in a new section:
-
-```c
 /* -------------------------------------------------------------------------
- * Mytool
+ * Definition
  * ---------------------------------------------------------------------- */
 
-static void test_mytool_basic(void)
-{
-    printf("  Test: mytool - basic usage\n");
+static const char SCHEMA_MYTOOL[] =
+	"{"
+	"\"type\":\"object\","
+	"\"properties\":{"
+	"\"input\":{\"type\":\"string\","
+	"\"description\":\"The input to process.\"}"
+	"},"
+	"\"required\":[\"input\"]"
+	"}";
 
-    struct agent_configuration cfg = make_cfg();
-    struct tool_result r = tool_mytool_fn(
-        "{\"input\":\"hello\"}", &cfg, g_scratch);
-
-    ASSERT(r.is_error == false);
-    ASSERT(r.content != NULL);
-    if (r.content)
-        ASSERT(strstr(r.content, "expected_output") != NULL);
-
-    tool_result_free(&r);
-    configuration_destroy(&cfg);
-}
-
-static void test_mytool_missing_arg(void)
-{
-    printf("  Test: mytool - missing required arg returns error\n");
-
-    struct agent_configuration cfg = make_cfg();
-    struct tool_result r = tool_mytool_fn("{}", &cfg, g_scratch);
-
-    ASSERT(r.is_error == true);
-
-    tool_result_free(&r);
-    configuration_destroy(&cfg);
-}
+const struct tool_definition tool_mytool_definition = {
+	.name = "mytool",
+	.description = "One or two sentences: what it does and when to use it.",
+	.parameters_schema = SCHEMA_MYTOOL,
+	.fn = tool_mytool_fn,
+	.format_call = tool_mytool_format,
+	.flag = TOOL_MYTOOL,
+	.confirm = TOOL_CONFIRM_NEVER,
+};
 ```
 
-Cover at minimum: the happy path, missing required arguments, and any sandbox or permission checks your tool performs.
+**Function rules**
+- Name it `tool_<name>_fn`; the signature is fixed.
+- On success return `tool_result_ok("mytool", heap_string)` (takes ownership) or `tool_result_ok_copy()`.
+- On error return `tool_result_errorf("mytool", "message %s", ...)`. Write errors the model can act on: say what was wrong and what to do instead.
+- You do not need to limit output size for the context window; dispatch does that. Do limit work (files read, bytes downloaded, time spent) and check `tools_cancelled()` in long loops so Ctrl+C stops the tool.
 
-Call your tests from `main()` in the same file:
+**Formatter rules**
+- One short line; the tool name is printed separately, so leave it out.
+- Read argument strings in place. Never copy large values (file content) just to describe them; report a length instead, like `write` and `edit` do.
+- No escaping needed: the registry runs the result through `term_sanitize()`.
+
+**Description and schema**
+These are sent with every request, so keep them short and precise. They are also part of the prompt prefix that providers cache: changing them later invalidates every cached conversation.
+
+**Confirmation class** (`confirm`)
+
+| Value | Asks first when |
+|---|---|
+| `TOOL_CONFIRM_NEVER` | never |
+| `TOOL_CONFIRM_WRITES` | `behaviour.confirm_writes` is on (write, edit, move, delete) |
+| `TOOL_CONFIRM_RUN` | `behaviour.confirm_run` is on |
+| `TOOL_CONFIRM_FETCH` | `behaviour.confirm_fetch` is on (the default) |
+
+### Filesystem access
+
+Validate every path against the sandbox before touching it, and use only the resolved path afterwards:
 
 ```c
-printf("\n--- Mytool ---\n");
-test_mytool_basic();
-test_mytool_missing_arg();
+#include <limits.h>
+
+char resolved[PATH_MAX];
+struct tool_result err;
+if (tools_sandbox_resolve(cfg, user_path, resolved, sizeof(resolved), &err) != 0)
+	return err;   /* "Access denied: '...' is outside the sandbox" */
 ```
 
-Run with `make test` to verify.
+`tools_sandbox_resolve()` follows symlinks, which is right for reading and writing *content*. For operations on the directory entry itself (renaming, deleting) use `tools_sandbox_resolve_entry()`: it resolves the parent directory and appends the final name, so a symlink names the link rather than its target, and it refuses `.`, `..` and the sandbox root. When walking a directory tree, use `lstat()` and never follow symlinks (see `search.c` and `delete.c`).
 
 ---
 
-## Step 7 — Enable by default (optional)
+## Step 3 — Declare and list it
 
-If your tool should be enabled by default, add it to the `tools.enabled` line in `config/boris.ini.example`:
+In `include/tool_builtins.h`:
 
-```ini
-[tools]
-enabled = read,write,list_dir,memory,run,mytool
+```c
+DECLARE_BUILTIN_TOOL(mytool);
 ```
 
-If it requires configuration (API keys, endpoints, etc.), add the relevant keys to `boris.ini.example` with comments explaining what they do.
+In `src/tools.c`, add it to `BUILTIN_TOOLS` where it should appear in the model's tool list:
+
+```c
+static const struct tool_definition *const BUILTIN_TOOLS[] = {
+	&tool_read_definition,
+	/* ... */
+	&tool_mytool_definition,
+};
+```
+
+The Makefile picks up `src/tools/*.c` with a wildcard, so no build change is needed.
+
+Tools can also be registered at runtime with `tools_register()`, which takes the same `struct tool_definition`.
 
 ---
 
-## Step 8 — `--tools` and the environment variable
+## Step 4 — Write tests
 
-Nothing to do. The `--tools` flag, `tools.enabled` and `BORIS_TOOLS` all look tool names up in the `TOOL_FLAG_NAMES` table you extended in Step 1.
+`tests/test_tools.c` includes `tool_builtins.h`, so `tool_mytool_fn` is already declared. Add a section:
+
+```c
+static void test_mytool_basic(void)
+{
+	printf("  Test: mytool - basic usage\n");
+
+	struct agent_configuration cfg = make_cfg();
+	struct tool_result r = tool_mytool_fn("{\"input\":\"hello\"}", &cfg, g_scratch);
+	ASSERT(!r.is_error);
+	ASSERT(r.content && strstr(r.content, "hello"));
+	tool_result_free(&r);
+
+	r = tool_mytool_fn("{}", &cfg, g_scratch);
+	ASSERT(r.is_error);
+	tool_result_free(&r);
+	configuration_destroy(&cfg);
+}
+```
+
+and call it from `main()`. Cover the happy path, missing arguments, and every sandbox or permission check the tool makes. `put_file()`, `get_file()` and `exists_in_sandbox()` help with file fixtures.
+
+---
+
+## Step 5 — Configuration (optional)
+
+If the tool needs settings, add fields to `struct agent_configuration`, defaults in `configuration_set_defaults()`, keys in `configuration_set_key()` (and `configuration_destroy()` for strings), and document them in `config/boris.ini.example`.
 
 ---
 
 ## Checklist
 
-- [ ] `TOOL_MYTOOL` flag added to `boris_types.h`, `TOOL_ALL` updated
-- [ ] Name added to `TOOL_FLAG_NAMES` in `tools.c`
-- [ ] `src/tools/mytool.c` created with correct function signature
-- [ ] `tool_mytool_format()` written (or `NULL` passed)
-- [ ] `SCHEMA_MYTOOL` written in `tools.c`
-- [ ] Forward declarations of `tool_mytool_fn` and `tool_mytool_format` added to `tools.c`
-- [ ] `register_one()` call added to `tools_register_builtins()`
-- [ ] Forward declaration added to `tests/test_tools.c`
-- [ ] Tests written and passing under `make test`
-- [ ] `boris.ini.example` updated if needed
+- [ ] `TOOL_MYTOOL` flag in `boris_types.h`, added to `TOOL_ALL` (and to `TOOL_DEFAULT` unless it should be opt-in)
+- [ ] `src/tools/mytool.c` with the function, formatter, schema and `tool_mytool_definition`
+- [ ] `DECLARE_BUILTIN_TOOL(mytool)` in `tool_builtins.h`
+- [ ] Entry in `BUILTIN_TOOLS` in `src/tools.c`
+- [ ] Tests in `tests/test_tools.c`, passing under `make test`
+- [ ] `boris.ini.example` updated if the tool has settings

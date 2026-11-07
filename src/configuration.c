@@ -153,6 +153,8 @@ unsigned int configuration_parse_tools_mask(const char *value)
 		tok = trim_whitespace(tok);
 		if (strcmp(tok, "all") == 0) {
 			mask = TOOL_ALL;
+		} else if (strcmp(tok, "default") == 0) {
+			mask |= TOOL_DEFAULT;
 		} else if (strcmp(tok, "none") == 0) {
 			mask = TOOL_NONE;
 		} else {
@@ -193,6 +195,8 @@ void configuration_set_defaults(struct agent_configuration *config)
 	config->stream_responses = false;
 	config->confirm_writes = false;
 	config->confirm_bash = false;
+	config->confirm_fetch = true;
+	config->fetch_allow_private = false;
 	config->memory_persist = false;
 	config->show_metrics = false;
 	config->show_tool_calls = true;
@@ -259,6 +263,8 @@ enum boris_error configuration_set_key(struct agent_configuration *config,
 		return set_int(&config->max_result_bytes, key, value);
 	if (strcmp(key, "tools.memory_persist") == 0)
 		return set_bool(&config->memory_persist, key, value);
+	if (strcmp(key, "tools.fetch_allow_private") == 0)
+		return set_bool(&config->fetch_allow_private, key, value);
 
 	/* [behaviour] */
 	if (strcmp(key, "behaviour.confirm_writes") == 0)
@@ -266,6 +272,8 @@ enum boris_error configuration_set_key(struct agent_configuration *config,
 	if (strcmp(key, "behaviour.confirm_run") == 0 ||
 	    strcmp(key, "behaviour.confirm_bash") == 0) /* older name */
 		return set_bool(&config->confirm_bash, key, value);
+	if (strcmp(key, "behaviour.confirm_fetch") == 0)
+		return set_bool(&config->confirm_fetch, key, value);
 
 	/* [logging] */
 	if (strcmp(key, "logging.level") == 0) {

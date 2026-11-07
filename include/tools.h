@@ -171,4 +171,15 @@ int tools_sandbox_resolve(const struct agent_configuration *cfg,
 			  const char *path, char *resolved, size_t size,
 			  struct tool_result *err_out);
 
+/*
+ * Like tools_sandbox_resolve(), for tools that act on a directory entry
+ * itself (move, delete): the parent directory is resolved and checked
+ * against the sandbox, and the final name is appended as given. A symlink
+ * therefore names the link, never its target. Refuses paths whose final
+ * component is empty, "." or "..", which also rules out the sandbox root.
+ */
+int tools_sandbox_resolve_entry(const struct agent_configuration *cfg,
+				const char *path, char *resolved, size_t size,
+				struct tool_result *err_out);
+
 #endif /* TOOLS_H */

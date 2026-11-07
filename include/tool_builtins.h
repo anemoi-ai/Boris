@@ -26,9 +26,21 @@
 
 DECLARE_BUILTIN_TOOL(read);
 DECLARE_BUILTIN_TOOL(write);
+DECLARE_BUILTIN_TOOL(edit);
 DECLARE_BUILTIN_TOOL(list_dir);
+DECLARE_BUILTIN_TOOL(search);
+DECLARE_BUILTIN_TOOL(move);
+DECLARE_BUILTIN_TOOL(delete);
 DECLARE_BUILTIN_TOOL(memory);
 DECLARE_BUILTIN_TOOL(run);
+DECLARE_BUILTIN_TOOL(plan);
+DECLARE_BUILTIN_TOOL(fetch);
+
+/* Forget the plan tool's checklist (the REPL calls this on /clear, /reset). */
+void tool_plan_reset(void);
+
+/* Reduce HTML to readable plain text (fetch). Returns a heap string. */
+char *tool_fetch_html_to_text(const char *html, size_t len);
 
 /* The built-in definitions in registration order, and how many there are. */
 const struct tool_definition *const *tools_builtins(size_t *out_count);

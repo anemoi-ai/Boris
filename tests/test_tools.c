@@ -12,6 +12,12 @@
 #include "tools.h"
 #include "tool_builtins.h"
 #include "cJSON.h"
+#include "fs.h"
+#include "json.h"
+#include "http_client.h"
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include "arena.h"
 #include "configuration.h"
 #include "boris_types.h"
@@ -1229,6 +1235,558 @@ static void test_builtin_definitions(void)
 	ASSERT(seen == TOOL_ALL);
 }
 
+/* -------------------------------------------------------------------------
+ * Helpers for the file-management tools
+ * ---------------------------------------------------------------------- */
+
+/* Create sandbox-relative file rel (and its directories) with content. */
+static void put_file(const char *rel, const char *content)
+{
+	char path[PATH_MAX];
+	snprintf(path, sizeof(path), "%s/%s", g_sandbox, rel);
+	fs_mkdirp_parent(path, 0755);
+	FILE *f = fopen(path, "w");
+	if (f) {
+		fputs(content, f);
+		fclose(f);
+	}
+}
+
+/* Contents of sandbox-relative file rel, or NULL. Caller frees. */
+static char *get_file(const char *rel)
+{
+	char path[PATH_MAX];
+	snprintf(path, sizeof(path), "%s/%s", g_sandbox, rel);
+	size_t len = 0;
+	return file_read_all(path, 1 << 20, &len);
+}
+
+static bool exists_in_sandbox(const char *rel)
+{
+	char path[PATH_MAX];
+	struct stat st;
+	snprintf(path, sizeof(path), "%s/%s", g_sandbox, rel);
+	return lstat(path, &st) == 0;
+}
+
+static bool contains(const struct tool_result *r, const char *needle)
+{
+	return r->content && strstr(r->content, needle) != NULL;
+}
+
+/* -------------------------------------------------------------------------
+ * Edit
+ * ---------------------------------------------------------------------- */
+
+static void test_edit_unique_replacement(void)
+{
+	printf("  Test: edit - replaces a unique string and reports the line\n");
+	put_file("edit/a.txt", "one\ntwo\nthree\n");
+	struct agent_configuration cfg = make_cfg();
+
+	struct tool_result r = tool_edit_fn(
+		"{\"path\":\"edit/a.txt\",\"old_string\":\"two\",\"new_string\":\"2\"}",
+		&cfg, g_scratch);
+	ASSERT(!r.is_error);
+	ASSERT(contains(&r, "replaced 1 occurrence (first at line 2)"));
+	char *text = get_file("edit/a.txt");
+	ASSERT(text && strcmp(text, "one\n2\nthree\n") == 0);
+	free(text);
+	tool_result_free(&r);
+
+	/* deleting text with an empty new_string */
+	r = tool_edit_fn("{\"path\":\"edit/a.txt\",\"old_string\":\"one\\n\",\"new_string\":\"\"}",
+			 &cfg, g_scratch);
+	ASSERT(!r.is_error);
+	text = get_file("edit/a.txt");
+	ASSERT(text && strcmp(text, "2\nthree\n") == 0);
+	free(text);
+	tool_result_free(&r);
+	configuration_destroy(&cfg);
+}
+
+static void test_edit_ambiguous_and_missing(void)
+{
+	printf("  Test: edit - refuses ambiguous or missing old_string; replace_all\n");
+	put_file("edit/b.txt", "x = 1\nx = 1\n");
+	struct agent_configuration cfg = make_cfg();
+
+	struct tool_result r = tool_edit_fn(
+		"{\"path\":\"edit/b.txt\",\"old_string\":\"x = 1\",\"new_string\":\"x = 2\"}",
+		&cfg, g_scratch);
+	ASSERT(r.is_error && contains(&r, "occurs 2 times"));
+	tool_result_free(&r);
+	char *text = get_file("edit/b.txt");
+	ASSERT(text && strcmp(text, "x = 1\nx = 1\n") == 0); /* untouched */
+	free(text);
+
+	r = tool_edit_fn("{\"path\":\"edit/b.txt\",\"old_string\":\"x = 1\","
+			 "\"new_string\":\"x = 2\",\"replace_all\":true}",
+			 &cfg, g_scratch);
+	ASSERT(!r.is_error && contains(&r, "replaced 2 occurrences"));
+	tool_result_free(&r);
+	text = get_file("edit/b.txt");
+	ASSERT(text && strcmp(text, "x = 2\nx = 2\n") == 0);
+	free(text);
+
+	r = tool_edit_fn("{\"path\":\"edit/b.txt\",\"old_string\":\"y\",\"new_string\":\"z\"}",
+			 &cfg, g_scratch);
+	ASSERT(r.is_error && contains(&r, "not found"));
+	tool_result_free(&r);
+
+	r = tool_edit_fn("{\"path\":\"edit/b.txt\",\"old_string\":\"x\",\"new_string\":\"x\"}",
+			 &cfg, g_scratch);
+	ASSERT(r.is_error && contains(&r, "identical"));
+	tool_result_free(&r);
+
+	r = tool_edit_fn("{\"path\":\"edit/b.txt\",\"old_string\":\"\",\"new_string\":\"z\"}",
+			 &cfg, g_scratch);
+	ASSERT(r.is_error && contains(&r, "must not be empty"));
+	tool_result_free(&r);
+
+	r = tool_edit_fn("{\"path\":\"edit/none.txt\",\"old_string\":\"a\",\"new_string\":\"b\"}",
+			 &cfg, g_scratch);
+	ASSERT(r.is_error && contains(&r, "File not found"));
+	tool_result_free(&r);
+
+	r = tool_edit_fn("{\"path\":\"../outside.txt\",\"old_string\":\"a\",\"new_string\":\"b\"}",
+			 &cfg, g_scratch);
+	ASSERT(r.is_error && contains(&r, "outside the sandbox"));
+	tool_result_free(&r);
+	configuration_destroy(&cfg);
+}
+
+static void test_edit_crlf_hint_and_mode(void)
+{
+	printf("  Test: edit - CRLF hint; file mode kept\n");
+	put_file("edit/crlf.txt", "a\r\nb\r\n");
+	char path[PATH_MAX];
+	snprintf(path, sizeof(path), "%s/edit/crlf.txt", g_sandbox);
+	chmod(path, 0600);
+	struct agent_configuration cfg = make_cfg();
+
+	struct tool_result r = tool_edit_fn(
+		"{\"path\":\"edit/crlf.txt\",\"old_string\":\"a\\nb\",\"new_string\":\"c\"}",
+		&cfg, g_scratch);
+	ASSERT(r.is_error && contains(&r, "CRLF"));
+	tool_result_free(&r);
+
+	r = tool_edit_fn("{\"path\":\"edit/crlf.txt\",\"old_string\":\"a\\r\\nb\","
+			 "\"new_string\":\"c\"}",
+			 &cfg, g_scratch);
+	ASSERT(!r.is_error);
+	tool_result_free(&r);
+	struct stat st;
+	ASSERT(stat(path, &st) == 0 && (st.st_mode & 0777) == 0600);
+	configuration_destroy(&cfg);
+}
+
+/* -------------------------------------------------------------------------
+ * Search
+ * ---------------------------------------------------------------------- */
+
+static void make_search_tree(void)
+{
+	/* the blank line before the match must not end the scan */
+	put_file("srch/src/a.c", "int main(void)\n\n{\n\t/* TODO fix */\n}\n");
+	put_file("srch/src/b.py", "# todo later\nprint('TODO')\n");
+	put_file("srch/.hidden/c.c", "TODO hidden\n");
+	put_file("srch/notes.md", "nothing here\n");
+
+	char path[PATH_MAX];
+	snprintf(path, sizeof(path), "%s/srch/bin.dat", g_sandbox);
+	FILE *f = fopen(path, "wb");
+	if (f) {
+		fwrite("TODO\0\0\0binary", 1, 14, f);
+		fclose(f);
+	}
+
+	/* A symlink to a directory outside the sandbox must not be followed */
+	char outside[512];
+	snprintf(outside, sizeof(outside), "%s/outside_search", g_home);
+	mkdir(outside, 0755);
+	snprintf(path, sizeof(path), "%s/secret.txt", outside);
+	f = fopen(path, "w");
+	if (f) {
+		fputs("TODO secret\n", f);
+		fclose(f);
+	}
+	snprintf(path, sizeof(path), "%s/srch/link", g_sandbox);
+	symlink(outside, path);
+}
+
+static void test_search_contents(void)
+{
+	printf("  Test: search - matches, skips hidden, binary and symlinked dirs\n");
+	make_search_tree();
+	struct agent_configuration cfg = make_cfg();
+
+	struct tool_result r = tool_search_fn("{\"pattern\":\"TODO\",\"path\":\"srch\"}",
+					      &cfg, g_scratch);
+	ASSERT(!r.is_error);
+	ASSERT(contains(&r, "srch/src/a.c:4: \t/* TODO fix */"));
+	ASSERT(contains(&r, "srch/src/b.py:2: print('TODO')"));
+	ASSERT(!contains(&r, "hidden"));
+	ASSERT(!contains(&r, "secret"));
+	ASSERT(!contains(&r, "bin.dat"));
+	ASSERT(contains(&r, "2 matches in 2 files"));
+	ASSERT(contains(&r, "1 skipped"));
+	/* a.c sorts before b.py: output order is deterministic */
+	ASSERT(r.content && strstr(r.content, "a.c") < strstr(r.content, "b.py"));
+	tool_result_free(&r);
+
+	r = tool_search_fn("{\"pattern\":\"todo\",\"path\":\"srch\",\"ignore_case\":true}",
+			   &cfg, g_scratch);
+	ASSERT(contains(&r, "3 matches in 2 files"));
+	tool_result_free(&r);
+
+	r = tool_search_fn("{\"pattern\":\"TODO\",\"path\":\"srch\",\"glob\":\"*.c\"}",
+			   &cfg, g_scratch);
+	ASSERT(contains(&r, "a.c:4") && !contains(&r, "b.py"));
+	tool_result_free(&r);
+
+	r = tool_search_fn("{\"pattern\":\"T[O]DO\",\"path\":\"srch\",\"max_results\":1}",
+			   &cfg, g_scratch);
+	ASSERT(contains(&r, "1 match in 1 file") && contains(&r, "Stopped at the result"));
+	tool_result_free(&r);
+	configuration_destroy(&cfg);
+}
+
+static void test_search_names_and_errors(void)
+{
+	printf("  Test: search - glob-only listing; regex and argument errors\n");
+	struct agent_configuration cfg = make_cfg();
+
+	struct tool_result r = tool_search_fn("{\"glob\":\"*.py\",\"path\":\"srch\"}",
+					      &cfg, g_scratch);
+	ASSERT(!r.is_error && contains(&r, "srch/src/b.py\n") && contains(&r, "1 file ("));
+	tool_result_free(&r);
+
+	/* path globs, as models write them */
+	const char *path_globs[] = {"srch/src/*.py", "src/*.py", "**/b.py", "**/*.py",
+				    "**/src/b.py", "./src/b.py"};
+	for (size_t i = 0; i < sizeof(path_globs) / sizeof(path_globs[0]); i++) {
+		char args[256];
+		snprintf(args, sizeof(args), "{\"glob\":\"%s\",\"path\":\"srch\"}",
+			 path_globs[i]);
+		r = tool_search_fn(args, &cfg, g_scratch);
+		ASSERT(!r.is_error && contains(&r, "srch/src/b.py\n") && !contains(&r, "a.c"));
+		tool_result_free(&r);
+	}
+	/* "**" "/" also matches at the top of the search path */
+	r = tool_search_fn("{\"glob\":\"**/notes.md\",\"path\":\"srch\"}", &cfg, g_scratch);
+	ASSERT(contains(&r, "srch/notes.md\n"));
+	tool_result_free(&r);
+
+	r = tool_search_fn("{\"pattern\":\"x\",\"glob\":\"*.rs\",\"path\":\"srch\"}",
+			   &cfg, g_scratch);
+	ASSERT(!r.is_error && contains(&r, "No files under srch match glob '*.rs'"));
+	tool_result_free(&r);
+
+	r = tool_search_fn("{\"pattern\":\"main(\",\"path\":\"srch\"}", &cfg, g_scratch);
+	ASSERT(r.is_error && contains(&r, "Invalid regular expression"));
+	tool_result_free(&r);
+
+	r = tool_search_fn("{\"pattern\":\"main(\",\"path\":\"srch\",\"literal\":true}",
+			   &cfg, g_scratch);
+	ASSERT(!r.is_error && contains(&r, "srch/src/a.c:1: int main(void)"));
+	tool_result_free(&r);
+
+	r = tool_search_fn("{\"path\":\"srch\"}", &cfg, g_scratch);
+	ASSERT(r.is_error && contains(&r, "pattern"));
+	tool_result_free(&r);
+
+	r = tool_search_fn("{\"pattern\":\"x\",\"path\":\"../\"}", &cfg, g_scratch);
+	ASSERT(r.is_error && contains(&r, "outside the sandbox"));
+	tool_result_free(&r);
+
+	r = tool_search_fn("{\"pattern\":\"zzz\",\"path\":\"srch\"}", &cfg, g_scratch);
+	ASSERT(!r.is_error && contains(&r, "No matches found"));
+	tool_result_free(&r);
+	configuration_destroy(&cfg);
+}
+
+/* -------------------------------------------------------------------------
+ * Move and delete
+ * ---------------------------------------------------------------------- */
+
+static void test_move(void)
+{
+	printf("  Test: move - rename, refuse overwrite, into dir/, symlink itself\n");
+	put_file("mv/a.txt", "A");
+	put_file("mv/b.txt", "B");
+	put_file("mv/dir/keep.txt", "K");
+	struct agent_configuration cfg = make_cfg();
+
+	struct tool_result r = tool_move_fn("{\"from\":\"mv/a.txt\",\"to\":\"mv/c.txt\"}",
+					    &cfg, g_scratch);
+	ASSERT(!r.is_error && !exists_in_sandbox("mv/a.txt") && exists_in_sandbox("mv/c.txt"));
+	tool_result_free(&r);
+
+	r = tool_move_fn("{\"from\":\"mv/c.txt\",\"to\":\"mv/b.txt\"}", &cfg, g_scratch);
+	ASSERT(r.is_error && contains(&r, "Destination exists"));
+	tool_result_free(&r);
+
+	r = tool_move_fn("{\"from\":\"mv/c.txt\",\"to\":\"mv/b.txt\",\"overwrite\":true}",
+			 &cfg, g_scratch);
+	ASSERT(!r.is_error);
+	char *text = get_file("mv/b.txt");
+	ASSERT(text && strcmp(text, "A") == 0);
+	free(text);
+	tool_result_free(&r);
+
+	r = tool_move_fn("{\"from\":\"mv/b.txt\",\"to\":\"mv/dir/\"}", &cfg, g_scratch);
+	ASSERT(!r.is_error && exists_in_sandbox("mv/dir/b.txt"));
+	tool_result_free(&r);
+
+	/* A symlink is moved itself; its target stays where it is */
+	char link_path[PATH_MAX];
+	snprintf(link_path, sizeof(link_path), "%s/mv/link", g_sandbox);
+	symlink("dir/keep.txt", link_path);
+	r = tool_move_fn("{\"from\":\"mv/link\",\"to\":\"mv/link2\"}", &cfg, g_scratch);
+	ASSERT(!r.is_error && exists_in_sandbox("mv/link2") &&
+	       exists_in_sandbox("mv/dir/keep.txt"));
+	tool_result_free(&r);
+
+	r = tool_move_fn("{\"from\":\"mv/dir/keep.txt\",\"to\":\"../escaped.txt\"}", &cfg,
+			 g_scratch);
+	ASSERT(r.is_error && contains(&r, "outside the sandbox"));
+	ASSERT(exists_in_sandbox("mv/dir/keep.txt"));
+	tool_result_free(&r);
+
+	r = tool_move_fn("{\"from\":\".\",\"to\":\"mv/root\"}", &cfg, g_scratch);
+	ASSERT(r.is_error && contains(&r, "does not name"));
+	tool_result_free(&r);
+
+	r = tool_move_fn("{\"from\":\"mv/dir\",\"to\":\"mv/dir/inner\"}", &cfg, g_scratch);
+	ASSERT(r.is_error && contains(&r, "into itself"));
+	tool_result_free(&r);
+	configuration_destroy(&cfg);
+}
+
+static void test_delete(void)
+{
+	printf("  Test: delete - file, empty/non-empty dirs, never through symlinks\n");
+	put_file("del/f.txt", "F");
+	put_file("del/tree/a/b.txt", "B");
+	put_file("del/tree/c.txt", "C");
+	char path[PATH_MAX];
+	snprintf(path, sizeof(path), "%s/del/empty", g_sandbox);
+	mkdir(path, 0755);
+
+	/* outside the sandbox, reachable only through a symlink in the tree */
+	char outside[512], outside_file[PATH_MAX];
+	snprintf(outside, sizeof(outside), "%s/outside_delete", g_home);
+	mkdir(outside, 0755);
+	snprintf(outside_file, sizeof(outside_file), "%s/precious.txt", outside);
+	FILE *f = fopen(outside_file, "w");
+	if (f) {
+		fputs("keep me", f);
+		fclose(f);
+	}
+	snprintf(path, sizeof(path), "%s/del/tree/escape", g_sandbox);
+	symlink(outside, path);
+	snprintf(path, sizeof(path), "%s/del/dirlink", g_sandbox);
+	symlink(outside, path);
+
+	struct agent_configuration cfg = make_cfg();
+	struct stat st;
+
+	struct tool_result r = tool_delete_fn("{\"path\":\"del/f.txt\"}", &cfg, g_scratch);
+	ASSERT(!r.is_error && !exists_in_sandbox("del/f.txt"));
+	tool_result_free(&r);
+
+	r = tool_delete_fn("{\"path\":\"del/empty\"}", &cfg, g_scratch);
+	ASSERT(!r.is_error && !exists_in_sandbox("del/empty"));
+	tool_result_free(&r);
+
+	r = tool_delete_fn("{\"path\":\"del/tree\"}", &cfg, g_scratch);
+	ASSERT(r.is_error && contains(&r, "not empty"));
+	tool_result_free(&r);
+
+	/* deleting a symlink to a directory removes the link only */
+	r = tool_delete_fn("{\"path\":\"del/dirlink/\",\"recursive\":true}", &cfg, g_scratch);
+	ASSERT(!r.is_error && !exists_in_sandbox("del/dirlink"));
+	ASSERT(stat(outside_file, &st) == 0);
+	tool_result_free(&r);
+
+	r = tool_delete_fn("{\"path\":\"del/tree\",\"recursive\":true}", &cfg, g_scratch);
+	ASSERT(!r.is_error && !exists_in_sandbox("del/tree"));
+	ASSERT(contains(&r, "(3 files, 2 directories)")); /* b, c, the link; a, tree */
+	ASSERT(stat(outside_file, &st) == 0);		  /* not followed */
+	tool_result_free(&r);
+
+	r = tool_delete_fn("{\"path\":\".\",\"recursive\":true}", &cfg, g_scratch);
+	ASSERT(r.is_error && contains(&r, "does not name"));
+	tool_result_free(&r);
+	r = tool_delete_fn("{\"path\":\"del/..\",\"recursive\":true}", &cfg, g_scratch);
+	ASSERT(r.is_error);
+	tool_result_free(&r);
+	r = tool_delete_fn("{\"path\":\"../outside_delete\",\"recursive\":true}", &cfg,
+			   g_scratch);
+	ASSERT(r.is_error && contains(&r, "outside the sandbox"));
+	tool_result_free(&r);
+	ASSERT(stat(g_sandbox, &st) == 0);
+
+	r = tool_delete_fn("{\"path\":\"del/missing\"}", &cfg, g_scratch);
+	ASSERT(r.is_error && contains(&r, "Not found"));
+	tool_result_free(&r);
+	configuration_destroy(&cfg);
+}
+
+/* -------------------------------------------------------------------------
+ * Plan
+ * ---------------------------------------------------------------------- */
+
+static void test_plan(void)
+{
+	printf("  Test: plan - update, get, validation, reset\n");
+	struct agent_configuration cfg = make_cfg();
+	tool_plan_reset();
+
+	struct tool_result r = tool_plan_fn("{\"action\":\"get\"}", &cfg, g_scratch);
+	ASSERT(!r.is_error && contains(&r, "No plan yet"));
+	tool_result_free(&r);
+
+	r = tool_plan_fn("{\"action\":\"update\",\"steps\":["
+			 "{\"step\":\"Read the code\",\"status\":\"done\"},"
+			 "{\"step\":\"Fix the bug\",\"status\":\"in_progress\"},"
+			 "{\"step\":\"Run the tests\",\"status\":\"pending\"}]}",
+			 &cfg, g_scratch);
+	ASSERT(!r.is_error && contains(&r, "Plan (1 of 3 done)"));
+	ASSERT(contains(&r, "[x] 1. Read the code") && contains(&r, "[>] 2. Fix the bug") &&
+	       contains(&r, "[ ] 3. Run the tests"));
+	tool_result_free(&r);
+
+	/* a bad step leaves the plan as it was */
+	r = tool_plan_fn("{\"action\":\"update\",\"steps\":[{\"step\":\"x\",\"status\":\"maybe\"}]}",
+			 &cfg, g_scratch);
+	ASSERT(r.is_error && contains(&r, "status must be"));
+	tool_result_free(&r);
+	r = tool_plan_fn("{\"action\":\"get\"}", &cfg, g_scratch);
+	ASSERT(contains(&r, "Plan (1 of 3 done)"));
+	tool_result_free(&r);
+
+	tool_plan_reset();
+	r = tool_plan_fn("{\"action\":\"get\"}", &cfg, g_scratch);
+	ASSERT(contains(&r, "No plan yet"));
+	tool_result_free(&r);
+
+	r = tool_plan_fn("{\"action\":\"delete\"}", &cfg, g_scratch);
+	ASSERT(r.is_error);
+	tool_result_free(&r);
+	configuration_destroy(&cfg);
+}
+
+/* -------------------------------------------------------------------------
+ * Fetch
+ * ---------------------------------------------------------------------- */
+
+static void test_fetch_html_to_text(void)
+{
+	printf("  Test: fetch - HTML reduced to text\n");
+	const char *html =
+		"<html><head><title>T &amp; T</title>"
+		"<style>body { color: red }</style>"
+		"<script>var x = '<p>not text</p>';</script></head>"
+		"<body><!-- comment <p>hidden</p> -->"
+		"<h1>Heading</h1><p>One   two\n three &lt;b&gt; &#169; &#x2014;</p>"
+		"<ul><li>first</li><li>second</li></ul>"
+		"<a href=\"x\" title=\"a > b\">link</a><br>after</body></html>";
+	char *text = tool_fetch_html_to_text(html, strlen(html));
+	ASSERT(text != NULL);
+	if (text) {
+		ASSERT(strstr(text, "T & T") != NULL);
+		ASSERT(strstr(text, "Heading\n") != NULL);
+		ASSERT(strstr(text, "One two three <b> \xc2\xa9 \xe2\x80\x94") != NULL);
+		ASSERT(strstr(text, "- first\n- second") != NULL);
+		ASSERT(strstr(text, "link\nafter") != NULL);
+		ASSERT(strstr(text, "color") == NULL);
+		ASSERT(strstr(text, "not text") == NULL);
+		ASSERT(strstr(text, "hidden") == NULL);
+		ASSERT(strstr(text, "\n\n\n") == NULL);
+	}
+	free(text);
+}
+
+static bool private4(const char *ip)
+{
+	struct sockaddr_in a;
+	memset(&a, 0, sizeof(a));
+	a.sin_family = AF_INET;
+	inet_pton(AF_INET, ip, &a.sin_addr);
+	return http_address_is_private((const struct sockaddr *)&a);
+}
+
+static bool private6(const char *ip)
+{
+	struct sockaddr_in6 a;
+	memset(&a, 0, sizeof(a));
+	a.sin6_family = AF_INET6;
+	inet_pton(AF_INET6, ip, &a.sin6_addr);
+	return http_address_is_private((const struct sockaddr *)&a);
+}
+
+static void test_fetch_address_rules(void)
+{
+	printf("  Test: fetch - private, loopback and link-local addresses refused\n");
+	ASSERT(private4("127.0.0.1"));
+	ASSERT(private4("10.1.2.3"));
+	ASSERT(private4("172.16.0.1"));
+	ASSERT(private4("172.31.255.255"));
+	ASSERT(!private4("172.32.0.1"));
+	ASSERT(private4("192.168.1.1"));
+	ASSERT(private4("169.254.169.254")); /* cloud metadata */
+	ASSERT(private4("100.64.0.1"));
+	ASSERT(private4("0.0.0.0"));
+	ASSERT(private4("224.0.0.1"));
+	ASSERT(private4("255.255.255.255"));
+	ASSERT(!private4("8.8.8.8"));
+	ASSERT(!private4("93.184.215.14"));
+	ASSERT(private6("::1"));
+	ASSERT(private6("::"));
+	ASSERT(private6("fe80::1"));
+	ASSERT(private6("fd12:3456::1"));
+	ASSERT(private6("::ffff:127.0.0.1"));
+	ASSERT(private6("::ffff:10.0.0.1"));
+	ASSERT(!private6("::ffff:8.8.8.8"));
+	ASSERT(!private6("2606:4700:4700::1111"));
+}
+
+static void test_fetch_refusals(void)
+{
+	printf("  Test: fetch - scheme check, loopback refused, confirmation required\n");
+	struct agent_configuration cfg = make_cfg();
+
+	struct tool_result r = tool_fetch_fn("{\"url\":\"file:///etc/passwd\"}", &cfg, g_scratch);
+	ASSERT(r.is_error && contains(&r, "Only http"));
+	tool_result_free(&r);
+
+	r = tool_fetch_fn("{\"url\":\"http://127.0.0.1:9/\"}", &cfg, g_scratch);
+	ASSERT(r.is_error && contains(&r, "Refused") && contains(&r, "fetch_allow_private"));
+	tool_result_free(&r);
+
+	/* allowed by configuration: now it is an ordinary connection failure */
+	cfg.fetch_allow_private = true;
+	r = tool_fetch_fn("{\"url\":\"http://127.0.0.1:9/\"}", &cfg, g_scratch);
+	ASSERT(r.is_error && !contains(&r, "Refused"));
+	tool_result_free(&r);
+
+	/* confirm_fetch is on by default; with nobody to ask, the call is refused */
+	tools_register_builtins();
+	tools_set_observer(NULL);
+	cfg.tools_enabled = TOOL_FETCH;
+	struct tool_call call;
+	memset(&call, 0, sizeof(call));
+	snprintf(call.id, sizeof(call.id), "f1");
+	snprintf(call.name, sizeof(call.name), "fetch");
+	call.argument_json = "{\"url\":\"https://example.com/\"}";
+	r = tools_dispatch(&call, &cfg);
+	ASSERT(r.is_error && contains(&r, "declined"));
+	tool_result_free(&r);
+	configuration_destroy(&cfg);
+}
+
 static void test_mask_to_string_none(void)
 {
 	printf("  Test: tools_mask_to_string - TOOL_NONE -> \"none\"\n");
@@ -1366,6 +1924,27 @@ int main(void)
 
 	printf("\n--- Run ---\n");
 	test_run_output_truncation();
+
+	printf("\n--- Edit ---\n");
+	test_edit_unique_replacement();
+	test_edit_ambiguous_and_missing();
+	test_edit_crlf_hint_and_mode();
+
+	printf("\n--- Search ---\n");
+	test_search_contents();
+	test_search_names_and_errors();
+
+	printf("\n--- Move / Delete ---\n");
+	test_move();
+	test_delete();
+
+	printf("\n--- Plan ---\n");
+	test_plan();
+
+	printf("\n--- Fetch ---\n");
+	test_fetch_html_to_text();
+	test_fetch_address_rules();
+	test_fetch_refusals();
 
 	printf("\n--- Tools Mask ---\n");
 	test_builtin_definitions();
