@@ -221,20 +221,32 @@ typedef struct tool_result (*tool_fn)(const char *argument_json,
 typedef void (*tool_format_fn)(const char *argument_json, char *buf, size_t size);
 
 /*
+ * Which setting, if any, makes a tool ask the user before each call.
+ * The REPL's confirm callback is consulted when the setting is on.
+ */
+enum tool_confirm {
+	TOOL_CONFIRM_NEVER = 0, /* never asks */
+	TOOL_CONFIRM_WRITES,	/* behaviour.confirm_writes */
+	TOOL_CONFIRM_RUN,	/* behaviour.confirm_run */
+};
+
+/*
  * Registered tool descriptor.
  *
- * parameters_schema is heap-allocated by the registry (strdup'd at
- * registration time). fn is the implementation; flag is the TOOL_*
- * bitmask used for enable/disable gating. format_call is optional; without
- * it, displays fall back to the raw (truncated) argument JSON.
+ * Built-in tools define one of these as a const in their own source file
+ * (see tool_builtins.h). parameters_schema is a JSON Schema object string;
+ * the registry stores its own copy. fn is the implementation; flag is the
+ * TOOL_* bit used for enable/disable gating. format_call is optional;
+ * without it, displays fall back to the raw (truncated) argument JSON.
  */
 struct tool_definition {
 	char name[64];
-	char description[512];
-	char *parameters_schema;
+	char description[1024];
+	const char *parameters_schema;
 	tool_fn fn;
 	tool_format_fn format_call;
-	int flag;
+	unsigned int flag;
+	enum tool_confirm confirm;
 };
 
 #endif /* BORIS_TYPES_H */

@@ -8,6 +8,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "tools.h"
+#include "tool_builtins.h"
 #include "arena.h"
 #include "configuration.h"
 #include "sandbox.h"
@@ -199,3 +200,34 @@ void tool_read_format(const char *argument_json, char *buf, size_t size)
 		snprintf(buf, size, "%s", path);
 	cJSON_Delete(root);
 }
+
+/* -------------------------------------------------------------------------
+ * Definition
+ * ---------------------------------------------------------------------- */
+
+static const char SCHEMA_READ[] =
+	"{"
+	"\"type\":\"object\","
+	"\"properties\":{"
+	"\"path\":{\"type\":\"string\","
+	"\"description\":\"File path to read. Relative paths are resolved within the sandbox root.\"},"
+	"\"offset\":{\"type\":\"integer\","
+	"\"description\":\"Byte offset to start reading from.\","
+	"\"default\":0},"
+	"\"length\":{\"type\":\"integer\","
+	"\"description\":\"Maximum bytes to read (capped at 131072).\","
+	"\"default\":65536}"
+	"},"
+	"\"required\":[\"path\"]"
+	"}";
+
+const struct tool_definition tool_read_definition = {
+	.name = "read",
+	.description = "Read the contents of a file within the sandbox. "
+		       "Use offset and length to page through large files.",
+	.parameters_schema = SCHEMA_READ,
+	.fn = tool_read_fn,
+	.format_call = tool_read_format,
+	.flag = TOOL_READ,
+	.confirm = TOOL_CONFIRM_NEVER,
+};

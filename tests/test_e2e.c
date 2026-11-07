@@ -11,16 +11,13 @@
 #include "agent.h"
 #include "llm.h"
 #include "tools.h"
+#include "tool_builtins.h"
 #include "conversation.h"
 #include "configuration.h"
 #include "boris_types.h"
 #include "boris_errors.h"
 #include "cJSON.h"
 
-/* Forward declarations for tool implementations */
-struct tool_result tool_read_fn(const char *arguments_json,
-				const struct agent_configuration *cfg,
-				struct memory_arena *scratch);
 
 #include <stdio.h>
 #include <stdlib.h>

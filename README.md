@@ -132,7 +132,7 @@ src/
 ├── llm.c             HTTP to the LLM API, response parsing, streaming
 ├── conversation.c    Message history, serialisation, truncation
 ├── http_client.c     libcurl wrapper: POST, cancellation, size cap
-├── tools.c           Registry, dispatch, JSON schemas
+├── tools.c           Registry, dispatch, confirmation
 ├── sandbox.c         Path validation via realpath()
 ├── fs.c              mkdir -p, atomic file replacement, ~/.boris paths
 ├── configuration.c   INI + env + flags, layered overrides
@@ -145,7 +145,7 @@ src/
 ├── metrics.c         Token counting, timing
 ├── terminal.c        Colour, TTY detection
 ├── json.c            JSON builder utilities
-└── tools/
+└── tools/            One file per tool: function, schema, definition
     ├── read.c        Paged file read
     ├── write.c       Atomic write (temp + rename)
     ├── list_dir.c    Directory listing

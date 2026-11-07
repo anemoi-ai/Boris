@@ -8,6 +8,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "tools.h"
+#include "tool_builtins.h"
 #include "arena.h"
 #include "configuration.h"
 #include "fs.h"
@@ -180,3 +181,41 @@ void tool_write_format(const char *argument_json, char *buf, size_t size)
 			 mode ? mode : "overwrite", content ? strlen(content) : 0);
 	cJSON_Delete(root);
 }
+
+/* -------------------------------------------------------------------------
+ * Definition
+ * ---------------------------------------------------------------------- */
+
+static const char SCHEMA_WRITE[] =
+	"{"
+	"\"type\":\"object\","
+	"\"properties\":{"
+	"\"path\":{\"type\":\"string\","
+	"\"description\":\"Destination file path.\"},"
+	"\"content\":{\"type\":\"string\","
+	"\"description\":\"Content to write.\"},"
+	"\"mode\":{\"type\":\"string\","
+	"\"enum\":[\"overwrite\",\"append\",\"create_new\"],"
+	"\"default\":\"overwrite\","
+	"\"description\":\"Write mode. create_new fails if the file exists.\"},"
+	"\"create_dirs\":{\"type\":\"boolean\","
+	"\"default\":false,"
+	"\"description\":\"Create parent directories if they do not exist.\"}"
+	"},"
+	"\"required\":[\"path\",\"content\"]"
+	"}";
+
+const struct tool_definition tool_write_definition = {
+	.name = "write",
+	.description = "Write or append content to a file within the sandbox. "
+		       "Use mode=create_new to avoid overwriting existing files. "
+		       "For large files (e.g. long HTML or source code), write in "
+		       "multiple smaller chunks: first call with mode=overwrite to "
+		       "create the file, then mode=append for each subsequent chunk. "
+		       "This avoids JSON encoding errors from embedding large strings.",
+	.parameters_schema = SCHEMA_WRITE,
+	.fn = tool_write_fn,
+	.format_call = tool_write_format,
+	.flag = TOOL_WRITE,
+	.confirm = TOOL_CONFIRM_WRITES,
+};

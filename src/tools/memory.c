@@ -10,6 +10,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "tools.h"
+#include "tool_builtins.h"
 #include "arena.h"
 #include "configuration.h"
 #include "fs.h"
@@ -329,3 +330,38 @@ void tool_memory_format(const char *argument_json, char *buf, size_t size)
 		snprintf(buf, size, "%s", action);
 	cJSON_Delete(root);
 }
+
+/* -------------------------------------------------------------------------
+ * Definition
+ * ---------------------------------------------------------------------- */
+
+static const char SCHEMA_MEMORY[] =
+	"{"
+	"\"type\":\"object\","
+	"\"properties\":{"
+	"\"action\":{\"type\":\"string\","
+	"\"enum\":[\"get\",\"set\",\"delete\",\"list\"],"
+	"\"description\":\"Operation to perform on the key-value store.\"},"
+	"\"key\":{\"type\":\"string\","
+	"\"description\":\"Key name, case-sensitive (required for get, set, delete).\"},"
+	"\"value\":{\"type\":\"string\","
+	"\"description\":\"Value to store (required for set).\"},"
+	"\"prefix\":{\"type\":\"string\","
+	"\"description\":\"list only: return keys starting with this prefix.\"},"
+	"\"limit\":{\"type\":\"integer\","
+	"\"description\":\"list only: maximum entries to return (1-500).\","
+	"\"default\":50}"
+	"},"
+	"\"required\":[\"action\"]"
+	"}";
+
+const struct tool_definition tool_memory_definition = {
+	.name = "memory",
+	.description = "Persistent key-value store. Use to remember facts across turns. "
+		       "Actions: get, set, delete, list.",
+	.parameters_schema = SCHEMA_MEMORY,
+	.fn = tool_memory_fn,
+	.format_call = tool_memory_format,
+	.flag = TOOL_MEMORY,
+	.confirm = TOOL_CONFIRM_NEVER,
+};

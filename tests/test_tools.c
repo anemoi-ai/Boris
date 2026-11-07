@@ -10,6 +10,8 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "tools.h"
+#include "tool_builtins.h"
+#include "cJSON.h"
 #include "arena.h"
 #include "configuration.h"
 #include "boris_types.h"
@@ -21,23 +23,6 @@
 #include <unistd.h>
 #include <limits.h>
 #include <time.h>
-
-/* Forward declarations - tool implementations are not exposed in tools.h */
-struct tool_result tool_read_fn(const char *arguments_json,
-				const struct agent_configuration *cfg,
-				struct memory_arena *scratch);
-struct tool_result tool_write_fn(const char *arguments_json,
-				 const struct agent_configuration *cfg,
-				 struct memory_arena *scratch);
-struct tool_result tool_list_dir_fn(const char *arguments_json,
-				    const struct agent_configuration *cfg,
-				    struct memory_arena *scratch);
-struct tool_result tool_memory_fn(const char *arguments_json,
-				  const struct agent_configuration *cfg,
-				  struct memory_arena *scratch);
-struct tool_result tool_run_fn(const char *arguments_json,
-			       const struct agent_configuration *cfg,
-			       struct memory_arena *scratch);
 
 static int tests_passed = 0;
 static int tests_failed = 0;
@@ -1147,6 +1132,36 @@ static void test_memory_set_missing_key(void)
  * tools_mask_to_string
  * ---------------------------------------------------------------------- */
 
+static void test_builtin_definitions(void)
+{
+	printf("  Test: built-in definitions - unique names and flags, TOOL_ALL complete\n");
+
+	size_t count = 0;
+	const struct tool_definition *const *defs = tools_builtins(&count);
+	unsigned int seen = 0;
+	for (size_t i = 0; i < count; i++) {
+		const struct tool_definition *d = defs[i];
+		ASSERT(d->name[0] != '\0');
+		ASSERT(d->fn != NULL);
+		ASSERT(d->format_call != NULL);
+		ASSERT(d->description[0] != '\0');
+		/* exactly one bit, not used by an earlier tool */
+		ASSERT(d->flag != 0 && (d->flag & (d->flag - 1)) == 0);
+		ASSERT((seen & d->flag) == 0);
+		seen |= d->flag;
+		ASSERT(tools_flag_from_name(d->name) == d->flag);
+		for (size_t j = 0; j < i; j++)
+			ASSERT(strcmp(defs[j]->name, d->name) != 0);
+
+		/* the schema is a JSON object with properties */
+		cJSON *schema = cJSON_Parse(d->parameters_schema);
+		ASSERT(schema != NULL);
+		ASSERT(cJSON_IsObject(cJSON_GetObjectItemCaseSensitive(schema, "properties")));
+		cJSON_Delete(schema);
+	}
+	ASSERT(seen == TOOL_ALL);
+}
+
 static void test_mask_to_string_none(void)
 {
 	printf("  Test: tools_mask_to_string - TOOL_NONE -> \"none\"\n");
@@ -1286,6 +1301,7 @@ int main(void)
 	test_run_output_truncation();
 
 	printf("\n--- Tools Mask ---\n");
+	test_builtin_definitions();
 	test_mask_to_string_none();
 	test_mask_to_string_all();
 	test_mask_to_string_subset();

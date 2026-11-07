@@ -8,6 +8,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "tools.h"
+#include "tool_builtins.h"
 #include "arena.h"
 #include "configuration.h"
 #include "sandbox.h"
@@ -214,3 +215,31 @@ void tool_list_dir_format(const char *argument_json, char *buf, size_t size)
 			 json_get_bool(root, "show_hidden", 0) ? " (including hidden)" : "");
 	cJSON_Delete(root);
 }
+
+/* -------------------------------------------------------------------------
+ * Definition
+ * ---------------------------------------------------------------------- */
+
+static const char SCHEMA_LIST_DIR[] =
+	"{"
+	"\"type\":\"object\","
+	"\"properties\":{"
+	"\"path\":{\"type\":\"string\","
+	"\"description\":\"Directory path to list.\"},"
+	"\"show_hidden\":{\"type\":\"boolean\","
+	"\"default\":false,"
+	"\"description\":\"Include hidden files and directories.\"}"
+	"},"
+	"\"required\":[\"path\"]"
+	"}";
+
+const struct tool_definition tool_list_dir_definition = {
+	.name = "list_dir",
+	.description = "List the contents of a directory within the sandbox, "
+		       "formatted showing names, types and sizes.",
+	.parameters_schema = SCHEMA_LIST_DIR,
+	.fn = tool_list_dir_fn,
+	.format_call = tool_list_dir_format,
+	.flag = TOOL_LIST_DIR,
+	.confirm = TOOL_CONFIRM_NEVER,
+};

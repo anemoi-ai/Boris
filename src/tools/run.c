@@ -21,6 +21,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "tools.h"
+#include "tool_builtins.h"
 #include "arena.h"
 #include "configuration.h"
 #include "sandbox.h"
@@ -617,3 +618,41 @@ void tool_run_format(const char *argument_json, char *buf, size_t size)
 		snprintf(buf + pos, size - pos, " (stdin: %zu bytes)", strlen(stdin_str));
 	cJSON_Delete(root);
 }
+
+/* -------------------------------------------------------------------------
+ * Definition
+ * ---------------------------------------------------------------------- */
+
+static const char SCHEMA_RUN[] =
+	"{"
+	"\"type\":\"object\","
+	"\"properties\":{"
+	"\"path\":{\"type\":\"string\","
+	"\"description\":\"Path to the script file to execute. "
+	"Relative paths are resolved within the sandbox root.\"},"
+	"\"args\":{\"type\":\"array\","
+	"\"items\":{\"type\":\"string\"},"
+	"\"description\":\"Command-line arguments to pass to the script.\","
+	"\"default\":[]},"
+	"\"stdin\":{\"type\":\"string\","
+	"\"description\":\"Data to send to the process on stdin.\","
+	"\"default\":\"\"},"
+	"\"timeout_seconds\":{\"type\":\"integer\","
+	"\"description\":\"Maximum execution time in seconds (1-120).\","
+	"\"default\":30}"
+	"},"
+	"\"required\":[\"path\"]"
+	"}";
+
+const struct tool_definition tool_run_definition = {
+	.name = "run",
+	.description = "Execute a script file within the sandbox and return its output. "
+		       "The interpreter is detected from the shebang line or file extension "
+		       "(.py, .js, .sh, .rb, .lua, .pl, .php). "
+		       "Returns the exit code and combined stdout/stderr.",
+	.parameters_schema = SCHEMA_RUN,
+	.fn = tool_run_fn,
+	.format_call = tool_run_format,
+	.flag = TOOL_RUN,
+	.confirm = TOOL_CONFIRM_RUN,
+};
