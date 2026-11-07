@@ -38,11 +38,6 @@ void metrics_record_tool_call(void)
 	g_metrics.tool_call_count++;
 }
 
-void metrics_record_error(void)
-{
-	g_metrics.error_count++;
-}
-
 void metrics_record_retry(void)
 {
 	g_metrics.retry_count++;

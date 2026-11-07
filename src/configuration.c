@@ -3,9 +3,12 @@
  *
  * Settings are applied in priority order:
  *   1. compiled-in defaults
- *   2. INI file (~/.boris/config.ini)
+ *   2. INI file (~/.boris/config.ini, then any --config FILE)
  *   3. environment variables
  *   (command-line flags are applied by the caller on top)
+ *
+ * Every layer funnels through configuration_set_key(), so parsing,
+ * validation and path expansion live in one place.
  *
  * The INI parser supports [sections], key = value pairs, and # / ;
  * comments. Section + key are joined as "section.key" before dispatch
@@ -19,6 +22,7 @@
 #include "boris_errors.h"
 #include "boris_types.h"
 #include "logger.h"
+#include "tools.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,32 +31,15 @@
 #include <limits.h>
 
 #define FREE_AND_NULL(p)    \
-	do {                	\
-		free(p);    		\
-		(p) = NULL; 		\
+	do {                \
+		free(p);    \
+		(p) = NULL; \
 	} while (0)
 
-#define SET_STRING_FIELD(field, value)            \
-	do {                                          \
-		char *_tmp = strdup(value);               \
-		if (!_tmp)                                \
-			return BORIS_ERROR_OUT_OF_MEMORY; 	  \
-		free(config->field);                      \
-		config->field = _tmp;                     \
-	} while (0)
-
-#define ENV_SET_STRING(field, value)          	  \
-	do {                                  		  \
-		char *_tmp = strdup(value);   			  \
-		if (_tmp) {                   	          \
-			free(config->field);  				  \
-			config->field = _tmp; 				  \
-		}                             			  \
-	} while (0)
-
+/* Expand a leading "~/" (or a bare "~") to $HOME. Caller frees. */
 static char *expand_tilde(const char *path)
 {
-	if (!path || path[0] != '~')
+	if (path[0] != '~' || (path[1] != '\0' && path[1] != '/'))
 		return strdup(path);
 
 	const char *home = getenv("HOME");
@@ -69,33 +56,66 @@ static char *expand_tilde(const char *path)
 	return expanded;
 }
 
-static int parse_int(const char *str, int default_val)
+/* Replace *field with a copy of value (tilde-expanded when is_path). */
+static enum boris_error set_string(char **field, const char *value, bool is_path)
 {
-	char *end = NULL;
-	if (!str || !str[0])
-		return default_val;
-	errno = 0;
-	long val = strtol(str, &end, 10);
-	if (end == str || *end != '\0' || errno != 0)
-		return default_val;
-	if (val > INT_MAX)
-		val = INT_MAX;
-	if (val < INT_MIN)
-		val = INT_MIN;
-	return (int)val;
+	char *copy = is_path ? expand_tilde(value) : strdup(value);
+	if (!copy)
+		return BORIS_ERROR_OUT_OF_MEMORY;
+	free(*field);
+	*field = copy;
+	return BORIS_OK;
 }
 
-static bool parse_bool(const char *value)
+/* Parse a decimal int into *field; on bad input warn and keep the old value. */
+static enum boris_error set_int(int *field, const char *key, const char *value)
 {
-	if (!value)
-		return false;
-	if (strcmp(value, "true") == 0 || strcmp(value, "1") == 0 ||
-	    strcmp(value, "yes") == 0)
-		return true;
-	if (strcmp(value, "false") == 0 || strcmp(value, "0") == 0 ||
-	    strcmp(value, "no") == 0)
-		return false;
-	return false;
+	char *end = NULL;
+	errno = 0;
+	long val = strtol(value, &end, 10);
+	if (end == value || *end != '\0' || errno != 0 ||
+	    val > INT_MAX || val < INT_MIN) {
+		log_warning("configuration: %s: '%s' is not an integer (keeping %d)",
+			    key, value, *field);
+		return BORIS_ERROR_BAD_ARGUMENT;
+	}
+	*field = (int)val;
+	return BORIS_OK;
+}
+
+static enum boris_error set_float(float *field, const char *key, const char *value)
+{
+	char *end = NULL;
+	errno = 0;
+	float val = strtof(value, &end);
+	if (end == value || *end != '\0' || errno != 0) {
+		log_warning("configuration: %s: '%s' is not a number (keeping %g)",
+			    key, value, (double)*field);
+		return BORIS_ERROR_BAD_ARGUMENT;
+	}
+	*field = val;
+	return BORIS_OK;
+}
+
+/* Accepts true/false, yes/no, on/off, 1/0. Anything else keeps the old value:
+ * silently turning "verify_ssl = ture" into false would be a security bug. */
+static enum boris_error set_bool(bool *field, const char *key, const char *value)
+{
+	static const char *const yes[] = {"true", "yes", "on", "1"};
+	static const char *const no[] = {"false", "no", "off", "0"};
+	for (size_t i = 0; i < sizeof(yes) / sizeof(yes[0]); i++) {
+		if (strcmp(value, yes[i]) == 0) {
+			*field = true;
+			return BORIS_OK;
+		}
+		if (strcmp(value, no[i]) == 0) {
+			*field = false;
+			return BORIS_OK;
+		}
+	}
+	log_warning("configuration: %s: '%s' is not a boolean (keeping %s)",
+		    key, value, *field ? "true" : "false");
+	return BORIS_ERROR_BAD_ARGUMENT;
 }
 
 static char *trim_whitespace(char *string)
@@ -129,28 +149,19 @@ unsigned int configuration_parse_tools_mask(const char *value)
 	unsigned int mask = 0;
 	char buf[512];
 	snprintf(buf, sizeof(buf), "%s", value);
-	char *tok = strtok(buf, ",");
-	while (tok) {
-		while (*tok == ' ')
-			tok++;
-		char *end = tok + strlen(tok) - 1;
-		while (end > tok && *end == ' ')
-			*end-- = '\0';
-		if (strcmp(tok, "read") == 0)
-			mask |= TOOL_READ;
-		else if (strcmp(tok, "write") == 0)
-			mask |= TOOL_WRITE;
-		else if (strcmp(tok, "list_dir") == 0)
-			mask |= TOOL_LIST_DIR;
-		else if (strcmp(tok, "memory") == 0)
-			mask |= TOOL_MEMORY;
-		else if (strcmp(tok, "run") == 0)
-			mask |= TOOL_RUN;
-		else if (strcmp(tok, "all") == 0)
+	for (char *tok = strtok(buf, ","); tok; tok = strtok(NULL, ",")) {
+		tok = trim_whitespace(tok);
+		if (strcmp(tok, "all") == 0) {
 			mask = TOOL_ALL;
-		else if (strcmp(tok, "none") == 0)
+		} else if (strcmp(tok, "none") == 0) {
 			mask = TOOL_NONE;
-		tok = strtok(NULL, ",");
+		} else {
+			unsigned int flag = tools_flag_from_name(tok);
+			if (flag)
+				mask |= flag;
+			else if (tok[0])
+				log_warning("configuration: unknown tool '%s' ignored", tok);
+		}
 	}
 	return mask;
 }
@@ -165,7 +176,6 @@ void configuration_set_defaults(struct agent_configuration *config)
 	config->temperature = 0.7f;
 	config->max_tokens = 2048;
 	config->context_window = 8192;
-	config->max_conversation_turns = 32;
 	config->request_timeout_seconds = 120;
 
 	config->run_timeout_seconds = 30;
@@ -173,6 +183,7 @@ void configuration_set_defaults(struct agent_configuration *config)
 	config->max_iterations = 16;
 	config->text_tool_fallback = true; /* parse JSON tool calls embedded in plain text,
 					      for models without native tool_calls support */
+	config->native_tool_reminder = true;
 	config->max_retries = 2;
 	config->retry_backoff_ms = 1000;
 
@@ -181,87 +192,101 @@ void configuration_set_defaults(struct agent_configuration *config)
 	config->stream_responses = false;
 	config->confirm_writes = false;
 	config->confirm_bash = false;
-	config->json_output = false;
 	config->memory_persist = false;
 	config->show_metrics = false;
+	config->show_tool_calls = true;
 
 	config->log_level = 1; /* LOG_LEVEL_INFO */
-	config->log_format = strdup("text");
-	if (!config->log_format)
-		log_warning("configuration: failed to set default log_format");
 }
 
 enum boris_error configuration_set_key(struct agent_configuration *config,
 				       const char *key, const char *value)
 {
-
-	if (strcmp(key, "model.endpoint") == 0) {
-		SET_STRING_FIELD(model_endpoint, value);
-	} else if (strcmp(key, "model.name") == 0) {
-		SET_STRING_FIELD(model_name, value);
-	} else if (strcmp(key, "model.api_key") == 0) {
-		SET_STRING_FIELD(api_key, value);
-	} else if (strcmp(key, "model.temperature") == 0) {
-		config->temperature = strtof(value, NULL);
-	} else if (strcmp(key, "model.max_tokens") == 0) {
-		config->max_tokens = parse_int(value, config->max_tokens);
-	} else if (strcmp(key, "model.context_window") == 0) {
-		config->context_window = parse_int(value, config->context_window);
-	} else if (strcmp(key, "model.timeout_seconds") == 0) {
-		config->request_timeout_seconds = parse_int(value, config->request_timeout_seconds);
-	} else if (strcmp(key, "model.stream") == 0) {
-		config->stream_responses = parse_bool(value);
-	} else if (strcmp(key, "model.verify_ssl") == 0) {
-		config->verify_ssl = parse_bool(value);
-	} else if (strcmp(key, "agent.max_turns") == 0) {
-		config->max_conversation_turns = parse_int(value, config->max_conversation_turns);
-	} else if (strcmp(key, "prompt.system_prompt_file") == 0) {
-		SET_STRING_FIELD(system_prompt_file, value);
-	} else if (strcmp(key, "prompt.system_prompt") == 0) {
-		SET_STRING_FIELD(system_prompt, value);
-	} else if (strcmp(key, "tools.sandbox_root") == 0) {
-		char *expanded = expand_tilde(value);
-		if (!expanded)
-			return BORIS_ERROR_OUT_OF_MEMORY;
-		free(config->sandbox_root);
-		config->sandbox_root = expanded;
-	} else if (strcmp(key, "tools.run_timeout") == 0) {
-		config->run_timeout_seconds = parse_int(value,
-							config->run_timeout_seconds);
-	} else if (strcmp(key, "behaviour.confirm_writes") == 0) {
-		config->confirm_writes = parse_bool(value);
-	} else if (strcmp(key, "logging.level") == 0) {
-		config->log_level = log_level_from_string(value, config->log_level);
-	} else if (strcmp(key, "logging.file") == 0) {
-		SET_STRING_FIELD(log_file, value);
-	} else if (strcmp(key, "output.json") == 0) {
-		config->json_output = parse_bool(value);
-	} else if (strcmp(key, "model.model_path") == 0) {
-		/* deprecated — ignored */
-	} else if (strcmp(key, "agent.max_iterations") == 0) {
-		config->max_iterations = parse_int(value, config->max_iterations);
-	} else if (strcmp(key, "agent.text_tool_fallback") == 0) {
-		config->text_tool_fallback = parse_bool(value);
-	} else if (strcmp(key, "agent.max_retries") == 0) {
-		config->max_retries = parse_int(value, config->max_retries);
-	} else if (strcmp(key, "agent.retry_backoff_ms") == 0) {
-		config->retry_backoff_ms = parse_int(value, config->retry_backoff_ms);
-	} else if (strcmp(key, "tools.enabled") == 0) {
-		config->tools_enabled = configuration_parse_tools_mask(value);
-	} else if (strcmp(key, "tools.memory_persist") == 0) {
-		config->memory_persist = parse_bool(value);
-	} else if (strcmp(key, "behaviour.confirm_bash") == 0) {
-		config->confirm_bash = parse_bool(value);
-	} else if (strcmp(key, "logging.format") == 0) {
-		SET_STRING_FIELD(log_format, value);
-	} else if (strcmp(key, "output.show_metrics") == 0) {
-		config->show_metrics = parse_bool(value);
-	} else {
-		log_warning("Unknown configuration key: %s", key);
+	if (!config || !key || !value)
 		return BORIS_ERROR_BAD_ARGUMENT;
+
+	/* [model] */
+	if (strcmp(key, "model.endpoint") == 0)
+		return set_string(&config->model_endpoint, value, false);
+	if (strcmp(key, "model.name") == 0)
+		return set_string(&config->model_name, value, false);
+	if (strcmp(key, "model.api_key") == 0)
+		return set_string(&config->api_key, value, false);
+	if (strcmp(key, "model.temperature") == 0)
+		return set_float(&config->temperature, key, value);
+	if (strcmp(key, "model.max_tokens") == 0)
+		return set_int(&config->max_tokens, key, value);
+	if (strcmp(key, "model.context_window") == 0)
+		return set_int(&config->context_window, key, value);
+	if (strcmp(key, "model.timeout_seconds") == 0)
+		return set_int(&config->request_timeout_seconds, key, value);
+	if (strcmp(key, "model.stream") == 0)
+		return set_bool(&config->stream_responses, key, value);
+	if (strcmp(key, "model.verify_ssl") == 0)
+		return set_bool(&config->verify_ssl, key, value);
+
+	/* [prompt] */
+	if (strcmp(key, "prompt.system_prompt_file") == 0)
+		return set_string(&config->system_prompt_file, value, true);
+	if (strcmp(key, "prompt.system_prompt") == 0)
+		return set_string(&config->system_prompt, value, false);
+
+	/* [agent] */
+	if (strcmp(key, "agent.max_iterations") == 0)
+		return set_int(&config->max_iterations, key, value);
+	if (strcmp(key, "agent.text_tool_fallback") == 0)
+		return set_bool(&config->text_tool_fallback, key, value);
+	if (strcmp(key, "agent.native_tool_reminder") == 0)
+		return set_bool(&config->native_tool_reminder, key, value);
+	if (strcmp(key, "agent.max_retries") == 0)
+		return set_int(&config->max_retries, key, value);
+	if (strcmp(key, "agent.retry_backoff_ms") == 0)
+		return set_int(&config->retry_backoff_ms, key, value);
+
+	/* [tools] */
+	if (strcmp(key, "tools.enabled") == 0) {
+		config->tools_enabled = configuration_parse_tools_mask(value);
+		return BORIS_OK;
+	}
+	if (strcmp(key, "tools.sandbox_root") == 0)
+		return set_string(&config->sandbox_root, value, true);
+	if (strcmp(key, "tools.run_timeout") == 0)
+		return set_int(&config->run_timeout_seconds, key, value);
+	if (strcmp(key, "tools.memory_persist") == 0)
+		return set_bool(&config->memory_persist, key, value);
+
+	/* [behaviour] */
+	if (strcmp(key, "behaviour.confirm_writes") == 0)
+		return set_bool(&config->confirm_writes, key, value);
+	if (strcmp(key, "behaviour.confirm_run") == 0 ||
+	    strcmp(key, "behaviour.confirm_bash") == 0) /* older name */
+		return set_bool(&config->confirm_bash, key, value);
+
+	/* [logging] */
+	if (strcmp(key, "logging.level") == 0) {
+		config->log_level = log_level_from_string(value, config->log_level);
+		return BORIS_OK;
+	}
+	if (strcmp(key, "logging.file") == 0)
+		return set_string(&config->log_file, value, true);
+
+	/* [output] */
+	if (strcmp(key, "output.show_metrics") == 0)
+		return set_bool(&config->show_metrics, key, value);
+	if (strcmp(key, "output.show_tool_calls") == 0)
+		return set_bool(&config->show_tool_calls, key, value);
+
+	/* Accepted for compatibility with older config files; no effect. */
+	if (strcmp(key, "model.model_path") == 0 ||
+	    strcmp(key, "agent.max_turns") == 0 ||
+	    strcmp(key, "logging.format") == 0 ||
+	    strcmp(key, "output.json") == 0) {
+		log_debug("configuration: '%s' is no longer used", key);
+		return BORIS_OK;
 	}
 
-	return BORIS_OK;
+	log_warning("Unknown configuration key: %s", key);
+	return BORIS_ERROR_BAD_ARGUMENT;
 }
 
 /*
@@ -272,7 +297,7 @@ enum boris_error configuration_load_from_file(struct agent_configuration *config
 					      const char *file_path)
 {
 	FILE *file;
-	char line[1024];
+	char line[4096];
 	char current_section[256];
 	int line_number = 0;
 
@@ -281,7 +306,7 @@ enum boris_error configuration_load_from_file(struct agent_configuration *config
 
 	file = fopen(file_path, "r");
 	if (!file) {
-		log_warning("Configuration file not found: %s (using defaults)", file_path);
+		log_info("Configuration file not found: %s (using defaults)", file_path);
 		return BORIS_OK; /* Not having a config file is OK */
 	}
 
@@ -294,8 +319,16 @@ enum boris_error configuration_load_from_file(struct agent_configuration *config
 
 		line_number++;
 
+		if (!strchr(line, '\n') && !feof(file)) {
+			log_warning("%s:%d: line too long, skipped", file_path, line_number);
+			int c;
+			while ((c = fgetc(file)) != EOF && c != '\n')
+				;
+			continue;
+		}
+
 		/* Remove the newline at the end */
-		line[strcspn(line, "\n")] = '\0';
+		line[strcspn(line, "\r\n")] = '\0';
 
 		trimmed = trim_whitespace(line);
 
@@ -309,8 +342,7 @@ enum boris_error configuration_load_from_file(struct agent_configuration *config
 			if (close_bracket) {
 				*close_bracket = '\0';
 				snprintf(current_section, sizeof(current_section), "%s",
-					 trimmed + 1);
-				trim_whitespace(current_section);
+					 trim_whitespace(trimmed + 1));
 			}
 			continue;
 		}
@@ -318,8 +350,8 @@ enum boris_error configuration_load_from_file(struct agent_configuration *config
 		/* Key-value pair: key = value */
 		value = strchr(trimmed, '=');
 		if (!value) {
-			log_warning("Skipping malformed line %d in config: %s",
-				    line_number, trimmed);
+			log_warning("%s:%d: malformed line skipped: %s",
+				    file_path, line_number, trimmed);
 			continue;
 		}
 
@@ -331,15 +363,16 @@ enum boris_error configuration_load_from_file(struct agent_configuration *config
 		value = trim_whitespace(value);
 
 		/* Build the full key: "section.key" */
-		if (current_section[0] != '\0') {
-			char full_key[512];
+		char full_key[512];
+		if (current_section[0] != '\0')
 			snprintf(full_key, sizeof(full_key), "%s.%s",
 				 current_section, key);
-			configuration_set_key(config, full_key, value);
-		} else {
-			/* No section - use the key as-is */
-			configuration_set_key(config, key, value);
-		}
+		else
+			snprintf(full_key, sizeof(full_key), "%s", key);
+
+		if (configuration_set_key(config, full_key, value) != BORIS_OK)
+			log_warning("%s:%d: could not apply '%s'",
+				    file_path, line_number, full_key);
 	}
 
 	fclose(file);
@@ -348,73 +381,35 @@ enum boris_error configuration_load_from_file(struct agent_configuration *config
 	return BORIS_OK;
 }
 
-/*
- * Override config fields from environment variables. Recognised variables:
- *   BORIS_MODEL_ENDPOINT, BORIS_MODEL_NAME, BORIS_API_KEY,
- *   BORIS_LOG_LEVEL, BORIS_LOG_FILE, BORIS_SANDBOX_ROOT,
- *   BORIS_LLM_MODE, BORIS_MODEL_VERIFY_SSL, BORIS_MAX_ITERATIONS,
- *   BORIS_MAX_RETRIES, BORIS_TOOLS, BORIS_MEMORY_PERSIST,
- *   BORIS_SHOW_METRICS
- */
+/* Environment variable -> configuration key. */
+static const struct {
+	const char *env;
+	const char *key;
+} ENV_KEYS[] = {
+	{"BORIS_MODEL_ENDPOINT", "model.endpoint"},
+	{"BORIS_MODEL_NAME", "model.name"},
+	{"BORIS_API_KEY", "model.api_key"},
+	{"BORIS_MODEL_VERIFY_SSL", "model.verify_ssl"},
+	{"BORIS_LOG_LEVEL", "logging.level"},
+	{"BORIS_LOG_FILE", "logging.file"},
+	{"BORIS_SANDBOX_ROOT", "tools.sandbox_root"},
+	{"BORIS_TOOLS", "tools.enabled"},
+	{"BORIS_MEMORY_PERSIST", "tools.memory_persist"},
+	{"BORIS_MAX_ITERATIONS", "agent.max_iterations"},
+	{"BORIS_MAX_RETRIES", "agent.max_retries"},
+	{"BORIS_SHOW_METRICS", "output.show_metrics"},
+};
+
 void configuration_apply_environment(struct agent_configuration *config)
 {
-	const char *value;
-
 	if (!config)
 		return;
 
-	value = getenv("BORIS_MODEL_ENDPOINT");
-	if (value)
-		ENV_SET_STRING(model_endpoint, value);
-
-	value = getenv("BORIS_MODEL_NAME");
-	if (value)
-		ENV_SET_STRING(model_name, value);
-
-	value = getenv("BORIS_API_KEY");
-	if (value)
-		ENV_SET_STRING(api_key, value);
-
-	value = getenv("BORIS_LOG_LEVEL");
-	if (value)
-		config->log_level = log_level_from_string(value, config->log_level);
-
-	value = getenv("BORIS_LOG_FILE");
-	if (value)
-		ENV_SET_STRING(log_file, value);
-
-	value = getenv("BORIS_SANDBOX_ROOT");
-	if (value) {
-		char *expanded = expand_tilde(value);
-		if (expanded) {
-			free(config->sandbox_root);
-			config->sandbox_root = expanded;
-		}
+	for (size_t i = 0; i < sizeof(ENV_KEYS) / sizeof(ENV_KEYS[0]); i++) {
+		const char *value = getenv(ENV_KEYS[i].env);
+		if (value)
+			configuration_set_key(config, ENV_KEYS[i].key, value);
 	}
-
-	value = getenv("BORIS_MODEL_VERIFY_SSL");
-	if (value)
-		config->verify_ssl = parse_bool(value);
-
-	value = getenv("BORIS_MAX_ITERATIONS");
-	if (value)
-		config->max_iterations = parse_int(value, config->max_iterations);
-
-	value = getenv("BORIS_MAX_RETRIES");
-	if (value)
-		config->max_retries = parse_int(value, config->max_retries);
-
-	value = getenv("BORIS_TOOLS");
-	if (value)
-		config->tools_enabled = configuration_parse_tools_mask(value);
-
-	value = getenv("BORIS_MEMORY_PERSIST");
-	if (value)
-		config->memory_persist = parse_bool(value);
-
-	value = getenv("BORIS_SHOW_METRICS");
-	if (value)
-		config->show_metrics = parse_bool(value);
 }
 
 /* Free all heap strings owned by config. */
@@ -430,5 +425,4 @@ void configuration_destroy(struct agent_configuration *config)
 	FREE_AND_NULL(config->system_prompt_file);
 	FREE_AND_NULL(config->sandbox_root);
 	FREE_AND_NULL(config->log_file);
-	FREE_AND_NULL(config->log_format);
 }

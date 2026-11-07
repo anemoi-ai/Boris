@@ -55,6 +55,10 @@ TARGET = boris
 TEST_SOURCE_FILES = $(wildcard tests/test_*.c)
 TEST_TARGETS = $(patsubst tests/%.c,$(BUILD_DIR)/%,$(TEST_SOURCE_FILES))
 
+# The .d files define rules too; without this the first of them (an object
+# file) would become the default goal and plain `make` would stop relinking.
+.DEFAULT_GOAL := all
+
 DEP_FILES = $(ALL_OBJECT_FILES:.o=.d)
 -include $(DEP_FILES)
 
@@ -98,7 +102,8 @@ test: $(TEST_TARGETS)
 	echo ""; \
 	echo "================================"; \
 	echo "Results: $$passed passed, $$failed failed"; \
-	echo "================================"
+	echo "================================"; \
+	[ $$failed -eq 0 ]
 
 # test_e2e links mock_http.c instead of the real http_client.o
 $(BUILD_DIR)/test_e2e: tests/test_e2e.c $(LIB_OBJECT_FILES_NO_HTTP) tests/mock_http.c

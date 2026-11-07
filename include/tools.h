@@ -10,6 +10,7 @@
 #define TOOLS_H
 
 #include <stddef.h>
+#include <signal.h>
 #include "boris_types.h"
 
 struct cJSON;
@@ -61,6 +62,47 @@ const struct tool_definition *tools_get_all(size_t *out_count);
 struct tool_result tools_dispatch(const struct tool_call *call,
 				  const struct agent_configuration *cfg);
 
+/*
+ * Observer for tool activity, typically installed by the REPL.
+ *
+ * summary is the call's one-line, display-safe description (see
+ * tools_format_call()); it is valid only for the duration of the callback.
+ *
+ * confirm   : asked before a call that needs confirmation (a "write" when
+ *             cfg->confirm_writes is set, a "run" when cfg->confirm_bash is
+ *             set). Return true to allow. If confirmation is required and no
+ *             confirm callback is installed, the call is refused.
+ * on_result : told about every dispatch outcome - success, tool error, and
+ *             unknown, disabled or declined calls - after the result is final.
+ *
+ * Either callback may be NULL.
+ */
+struct tool_observer {
+	bool (*confirm)(const struct tool_call *call, const char *summary, void *ctx);
+	void (*on_result)(const struct tool_call *call, const char *summary,
+			  const struct tool_result *result, void *ctx);
+	void *ctx;
+};
+
+/* Install an observer (copied) or clear it with NULL. */
+void tools_set_observer(const struct tool_observer *observer);
+
+/*
+ * Write a one-line, display-safe summary of call's arguments into buf:
+ * the tool's own formatter if it has one, otherwise the raw argument JSON.
+ * Control characters are removed and the text is truncated to fit
+ * (see term_sanitize()). Based on upstream PR #3 by @ilmich.
+ */
+void tools_format_call(const struct tool_call *call, char *buf, size_t size);
+
+/*
+ * Register a flag (typically set by a SIGINT handler) that long-running
+ * tools poll to stop early. Pass NULL to clear. tools_cancelled() reports
+ * whether it is currently set.
+ */
+void tools_set_cancel_flag(const volatile sig_atomic_t *flag);
+bool tools_cancelled(void);
+
 /* -------------------------------------------------------------------------
  * Memory management
  * ---------------------------------------------------------------------- */
@@ -70,6 +112,9 @@ void tool_result_free(struct tool_result *r);
 
 /* Free all heap members of a tool_call_list. Does not free the struct. */
 void tool_call_list_free(struct tool_call_list *list);
+
+/* Return the TOOL_* flag for a tool name ("read", "run", ...), or 0. */
+unsigned int tools_flag_from_name(const char *name);
 
 /* -------------------------------------------------------------------------
  * Convenience constructors (used by tool implementations)
@@ -106,6 +151,12 @@ struct tool_result tool_result_errorf(const char *tool_name,
  * NUL-terminated.
  */
 void tools_mask_to_string(unsigned int mask, char *buf, size_t size);
+
+/*
+ * Copy the required string argument "path" from a parsed arguments object
+ * into out. Returns 0, or -1 if it is missing, not a string, or too long.
+ */
+int tools_arg_path(const struct cJSON *args, char *out, size_t size);
 
 /*
  * Validate path against the sandbox and resolve it to an absolute path.

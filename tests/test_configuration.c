@@ -51,12 +51,10 @@ static void test_configuration_defaults(void)
 	/* Numbers should have sensible defaults */
 	ASSERT(config.temperature == 0.7f);
 	ASSERT(config.max_tokens == 2048);
-	ASSERT(config.max_conversation_turns == 32);
 	ASSERT(config.request_timeout_seconds == 120);
 	ASSERT(config.log_level == 1); /* INFO */
 	ASSERT(config.stream_responses == false);
 	ASSERT(config.confirm_writes == false);
-	ASSERT(config.json_output == false);
 
 	configuration_destroy(&config);
 }

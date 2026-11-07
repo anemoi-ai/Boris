@@ -15,14 +15,12 @@
 #include "boris_errors.h"
 #include "logger.h"
 #include "json.h"
+#include "fs.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <errno.h>
-#include <unistd.h>
-#include <sys/stat.h>
-#include <libgen.h>
 
 /* Start with room for 8 messages. We'll grow as needed. */
 #define INITIAL_CAPACITY 8
@@ -89,12 +87,55 @@ static size_t message_character_count(const struct conversation_message *msg)
 	return n;
 }
 
-static void tool_call_copy(struct tool_call *dst, const struct tool_call *src)
+/*
+ * Fill msg with copies of the given fields (any may be NULL). On
+ * allocation failure everything already copied is freed.
+ */
+static enum boris_error message_init(struct conversation_message *msg,
+				     enum message_role role,
+				     const char *content,
+				     const char *tool_call_id,
+				     const char *tool_name,
+				     const struct tool_call *tool_calls,
+				     size_t tool_call_count)
 {
-	snprintf(dst->id, sizeof(dst->id), "%s", src->id);
-	snprintf(dst->name, sizeof(dst->name), "%s", src->name);
-	dst->argument_json = src->argument_json ? strdup(src->argument_json) : NULL;
+	memset(msg, 0, sizeof(*msg));
+	msg->role = role;
+
+	if ((content && !(msg->content = strdup(content))) ||
+	    (tool_call_id && !(msg->tool_call_id = strdup(tool_call_id))) ||
+	    (tool_name && !(msg->tool_name = strdup(tool_name))))
+		goto oom;
+
+	if (tool_calls && tool_call_count > 0) {
+		msg->tool_calls = calloc(tool_call_count, sizeof(struct tool_call));
+		if (!msg->tool_calls)
+			goto oom;
+		for (size_t i = 0; i < tool_call_count; i++) {
+			struct tool_call *dst = &msg->tool_calls[i];
+			const struct tool_call *src = &tool_calls[i];
+			snprintf(dst->id, sizeof(dst->id), "%s", src->id);
+			snprintf(dst->name, sizeof(dst->name), "%s", src->name);
+			msg->tool_call_count++;
+			if (src->argument_json &&
+			    !(dst->argument_json = strdup(src->argument_json)))
+				goto oom;
+		}
+	}
+	return BORIS_OK;
+
+oom:
+	message_free_content(msg);
+	return BORIS_ERROR_OUT_OF_MEMORY;
 }
+
+static enum boris_error message_copy(struct conversation_message *dst,
+				     const struct conversation_message *src)
+{
+	return message_init(dst, src->role, src->content, src->tool_call_id,
+			    src->tool_name, src->tool_calls, src->tool_call_count);
+}
+
 
 /*
  * Free a conversation and all its messages.
@@ -136,6 +177,38 @@ static enum boris_error conversation_grow(struct conversation_history *conv)
 	return BORIS_OK;
 }
 
+
+/*
+ * Append msg, taking ownership of its heap fields. On failure they are
+ * freed, so callers never need to clean up after this.
+ */
+static enum boris_error append_message(struct conversation_history *conv,
+				       struct conversation_message *msg)
+{
+	if (conv->count >= conv->capacity && conversation_grow(conv) != BORIS_OK) {
+		message_free_content(msg);
+		return BORIS_ERROR_OUT_OF_MEMORY;
+	}
+	conv->messages[conv->count++] = *msg;
+	conv->total_characters += message_character_count(msg);
+	return BORIS_OK;
+}
+
+/* Build a message from the given fields and append it. */
+static enum boris_error add_message(struct conversation_history *conv,
+				    enum message_role role,
+				    const char *content,
+				    const char *tool_call_id,
+				    const char *tool_name,
+				    const struct tool_call *tool_calls,
+				    size_t tool_call_count)
+{
+	struct conversation_message msg;
+	enum boris_error err = message_init(&msg, role, content, tool_call_id,
+					    tool_name, tool_calls, tool_call_count);
+	return err != BORIS_OK ? err : append_message(conv, &msg);
+}
+
 /*
  * Add a message to the conversation.
  */
@@ -143,33 +216,9 @@ enum boris_error conversation_add(struct conversation_history *conv,
 				  enum message_role role,
 				  const char *content)
 {
-	struct conversation_message *msg;
-
 	if (!conv || !content)
 		return BORIS_ERROR_BAD_ARGUMENT;
-
-	/* Grow if needed */
-	if (conv->count >= conv->capacity) {
-		enum boris_error err = conversation_grow(conv);
-		if (err != BORIS_OK)
-			return err;
-	}
-
-	msg = &conv->messages[conv->count];
-	msg->role = role;
-	msg->content = strdup(content);
-	if (!msg->content)
-		return BORIS_ERROR_OUT_OF_MEMORY;
-
-	msg->tool_call_id = NULL;
-	msg->tool_name = NULL;
-	msg->tool_calls = NULL;
-	msg->tool_call_count = 0;
-
-	conv->count++;
-	conv->total_characters += message_character_count(msg);
-
-	return BORIS_OK;
+	return add_message(conv, role, content, NULL, NULL, NULL, 0);
 }
 
 /*
@@ -204,37 +253,8 @@ enum boris_error conversation_add_assistant_raw(
 {
 	if (!conv)
 		return BORIS_ERROR_BAD_ARGUMENT;
-
-	if (conv->count >= conv->capacity) {
-		enum boris_error err = conversation_grow(conv);
-		if (err != BORIS_OK)
-			return err;
-	}
-
-	struct conversation_message msg;
-	memset(&msg, 0, sizeof(msg));
-	msg.role = MESSAGE_ROLE_ASSISTANT;
-	msg.content = content ? strdup(content) : NULL;
-	msg.tool_call_id = NULL;
-	msg.tool_name = NULL;
-
-	if (tool_calls && tool_call_count > 0) {
-		msg.tool_calls = calloc(tool_call_count,
-					sizeof(struct tool_call));
-		if (!msg.tool_calls) {
-			free(msg.content);
-			return BORIS_ERROR_OUT_OF_MEMORY;
-		}
-		msg.tool_call_count = tool_call_count;
-
-		for (size_t i = 0; i < tool_call_count; i++)
-			tool_call_copy(&msg.tool_calls[i], &tool_calls[i]);
-	}
-
-	conv->messages[conv->count] = msg;
-	conv->count++;
-	conv->total_characters += message_character_count(&conv->messages[conv->count - 1]);
-	return BORIS_OK;
+	return add_message(conv, MESSAGE_ROLE_ASSISTANT, content, NULL, NULL,
+			   tool_calls, tool_call_count);
 }
 
 /*
@@ -261,33 +281,12 @@ enum boris_error conversation_add_tool_result(
 	const char *tool_name,
 	const char *content)
 {
-	struct conversation_message *msg;
-
 	if (!conv || !content)
 		return BORIS_ERROR_BAD_ARGUMENT;
-
-	if (conv->count >= conv->capacity) {
-		enum boris_error err = conversation_grow(conv);
-		if (err != BORIS_OK)
-			return err;
-	}
-
-	msg = &conv->messages[conv->count];
-	msg->role = MESSAGE_ROLE_TOOL;
-	msg->content = strdup(content);
-	if (!msg->content)
-		return BORIS_ERROR_OUT_OF_MEMORY;
-
-	msg->tool_call_id = tool_call_id ? strdup(tool_call_id) : NULL;
-	msg->tool_name = tool_name ? strdup(tool_name) : NULL;
-	msg->tool_calls = NULL;
-	msg->tool_call_count = 0;
-
-	conv->count++;
-	conv->total_characters += message_character_count(msg);
-
-	return BORIS_OK;
+	return add_message(conv, MESSAGE_ROLE_TOOL, content, tool_call_id,
+			   tool_name, NULL, 0);
 }
+
 
 /* Rough token estimate: chars/4 + 4 per message (API role/separator overhead). */
 size_t conversation_estimate_tokens(const struct conversation_history *conv)
@@ -520,23 +519,38 @@ void conversation_clear(struct conversation_history *conv)
 		conv->total_characters += message_character_count(&conv->messages[i]);
 }
 
+
 enum boris_error conversation_replace_system_prompt(
 	struct conversation_history *conv, const char *new_prompt)
 {
 	if (!conv || !new_prompt)
 		return BORIS_ERROR_BAD_ARGUMENT;
 
+	char *copy = strdup(new_prompt);
+	if (!copy)
+		return BORIS_ERROR_OUT_OF_MEMORY;
+
 	if (conv->count > 0 && conv->messages[0].role == MESSAGE_ROLE_SYSTEM) {
 		conv->total_characters -= message_character_count(&conv->messages[0]);
 		free(conv->messages[0].content);
-		conv->messages[0].content = strdup(new_prompt);
-		if (!conv->messages[0].content)
-			return BORIS_ERROR_OUT_OF_MEMORY;
+		conv->messages[0].content = copy;
 		conv->total_characters += message_character_count(&conv->messages[0]);
 		return BORIS_OK;
 	}
 
-	return conversation_add_system(conv, new_prompt);
+	/* No system message yet: insert one at index 0 */
+	if (conv->count >= conv->capacity && conversation_grow(conv) != BORIS_OK) {
+		free(copy);
+		return BORIS_ERROR_OUT_OF_MEMORY;
+	}
+	memmove(&conv->messages[1], &conv->messages[0],
+		conv->count * sizeof(struct conversation_message));
+	memset(&conv->messages[0], 0, sizeof(struct conversation_message));
+	conv->messages[0].role = MESSAGE_ROLE_SYSTEM;
+	conv->messages[0].content = copy;
+	conv->count++;
+	conv->total_characters += message_character_count(&conv->messages[0]);
+	return BORIS_OK;
 }
 
 /*
@@ -554,48 +568,15 @@ enum boris_error conversation_clone(struct conversation_history *dst,
 	dst->count = 0;
 	dst->total_characters = 0;
 
-	/* Grow dst to fit all of src */
-	while (dst->capacity < src->count) {
-		if (conversation_grow(dst) != BORIS_OK)
+	for (size_t i = 0; i < src->count; i++) {
+		struct conversation_message msg;
+		if (message_copy(&msg, &src->messages[i]) != BORIS_OK ||
+		    append_message(dst, &msg) != BORIS_OK)
 			return BORIS_ERROR_OUT_OF_MEMORY;
 	}
-
-	/* Deep-copy each message */
-	for (size_t i = 0; i < src->count; i++) {
-		const struct conversation_message *s = &src->messages[i];
-		struct conversation_message *d = &dst->messages[i];
-
-		d->role = s->role;
-		d->content = s->content ? strdup(s->content) : NULL;
-		d->tool_call_id = s->tool_call_id ? strdup(s->tool_call_id) : NULL;
-		d->tool_name = s->tool_name ? strdup(s->tool_name) : NULL;
-		d->tool_calls = NULL;
-		d->tool_call_count = 0;
-
-		if (s->tool_calls && s->tool_call_count > 0) {
-			d->tool_calls = calloc(s->tool_call_count,
-					       sizeof(struct tool_call));
-			if (!d->tool_calls) {
-				free(d->content);
-				free(d->tool_call_id);
-				free(d->tool_name);
-				d->content = NULL;
-				d->tool_call_id = NULL;
-				d->tool_name = NULL;
-				dst->count = i;
-				return BORIS_ERROR_OUT_OF_MEMORY;
-			}
-			d->tool_call_count = s->tool_call_count;
-			for (size_t t = 0; t < s->tool_call_count; t++)
-				tool_call_copy(&d->tool_calls[t], &s->tool_calls[t]);
-		}
-
-		dst->total_characters += message_character_count(d);
-	}
-
-	dst->count = src->count;
 	return BORIS_OK;
 }
+
 
 /*
  * Count messages with a given role.
@@ -650,34 +631,20 @@ static struct cJSON *build_save_doc(const struct conversation_history *conv)
 	return doc;
 }
 
-/*
- * Parse a single tool_call JSON object into a struct tool_call.
- */
-static int parse_tool_call(const struct cJSON *tc_obj, struct tool_call *tc)
+int tool_call_from_json(const struct cJSON *tc_obj, struct tool_call *tc)
 {
 	memset(tc, 0, sizeof(*tc));
 
-	const cJSON *id_item = cJSON_GetObjectItemCaseSensitive(tc_obj, "id");
-	if (id_item && cJSON_IsString(id_item))
-		snprintf(tc->id, sizeof(tc->id), "%s", id_item->valuestring);
+	const char *id = json_get_str(tc_obj, "id");
+	snprintf(tc->id, sizeof(tc->id), "%s", id ? id : "");
 
 	const cJSON *fn = cJSON_GetObjectItemCaseSensitive(tc_obj, "function");
-	if (!fn)
-		return -1;
+	const char *name = json_get_str(fn, "name");
+	const char *args = json_get_str(fn, "arguments");
+	snprintf(tc->name, sizeof(tc->name), "%s", name ? name : "");
 
-	const cJSON *name = cJSON_GetObjectItemCaseSensitive(fn, "name");
-	if (name && cJSON_IsString(name))
-		snprintf(tc->name, sizeof(tc->name), "%s", name->valuestring);
-
-	const cJSON *args = cJSON_GetObjectItemCaseSensitive(fn, "arguments");
-	if (args && cJSON_IsString(args))
-		tc->argument_json = strdup(args->valuestring);
-	else
-		tc->argument_json = strdup("{}");
-
-	if (!tc->argument_json)
-		return -1;
-	return 0;
+	tc->argument_json = strdup(args ? args : "{}");
+	return tc->argument_json ? 0 : -1;
 }
 
 /*
@@ -723,8 +690,8 @@ static int parse_message(const struct cJSON *msg_obj,
 				struct cJSON *tc_obj = NULL;
 				cJSON_ArrayForEach(tc_obj, tc_arr)
 				{
-					if (parse_tool_call(tc_obj,
-							    &msg->tool_calls[msg->tool_call_count]) == 0)
+					if (tool_call_from_json(tc_obj,
+								&msg->tool_calls[msg->tool_call_count]) == 0)
 						msg->tool_call_count++;
 				}
 			}
@@ -747,42 +714,15 @@ static int parse_message(const struct cJSON *msg_obj,
 	return 0;
 }
 
+
 enum boris_error conversation_save(const struct conversation_history *conv,
 				   const char *file_path)
 {
 	if (!conv || !file_path)
 		return BORIS_ERROR_BAD_ARGUMENT;
 
-	/* Create parent directory if needed */
-	char path_copy[1024];
-	size_t path_len;
-	snprintf(path_copy, sizeof(path_copy), "%s", file_path);
-	path_len = strlen(path_copy);
-	if (path_len >= sizeof(path_copy))
-		return BORIS_ERROR_BAD_ARGUMENT;
-	char *dir = dirname(path_copy);
-	if (dir && dir[0] && dir[0] != '.') {
-		size_t dir_len = strlen(dir);
-		if (dir_len >= sizeof(path_copy))
-			return BORIS_ERROR_BAD_ARGUMENT;
-		struct stat st;
-		if (stat(dir, &st) != 0) {
-			/* Create directories */
-			char work[1024];
-			snprintf(work, sizeof(work), "%s", dir);
-			for (char *p = work + 1; *p; p++) {
-				if (*p == '/') {
-					*p = '\0';
-					if (mkdir(work, 0755) != 0 &&
-					    errno != EEXIST)
-						return BORIS_ERROR_IO;
-					*p = '/';
-				}
-			}
-			if (mkdir(work, 0755) != 0 && errno != EEXIST)
-				return BORIS_ERROR_IO;
-		}
-	}
+	if (fs_mkdirp_parent(file_path, 0755) != 0)
+		return BORIS_ERROR_IO;
 
 	struct cJSON *doc = build_save_doc(conv);
 	if (!doc)
@@ -793,28 +733,12 @@ enum boris_error conversation_save(const struct conversation_history *conv,
 	if (!json)
 		return BORIS_ERROR_OUT_OF_MEMORY;
 
-	/* Write atomically: write to .tmp then rename */
-	char tmp_path[1024];
-	snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", file_path);
-
-	FILE *f = fopen(tmp_path, "w");
-	if (!f) {
-		free(json);
-		return BORIS_ERROR_IO;
-	}
-
-	size_t len = strlen(json);
-	size_t written = fwrite(json, 1, len, f);
-	fclose(f);
+	/* Sessions can contain file contents and tool output: owner-only. */
+	int rc = fs_write_atomic(file_path, json, strlen(json), 0600, false);
 	free(json);
-
-	if (written != len) {
-		unlink(tmp_path);
-		return BORIS_ERROR_IO;
-	}
-
-	if (rename(tmp_path, file_path) != 0) {
-		unlink(tmp_path);
+	if (rc != 0) {
+		log_warning("Cannot save conversation to %s: %s",
+			    file_path, strerror(errno));
 		return BORIS_ERROR_IO;
 	}
 
@@ -831,7 +755,12 @@ struct conversation_history *conversation_load(const char *file_path)
 	size_t file_len;
 	char *buf = file_read_all(file_path, 10 * 1024 * 1024, &file_len);
 	if (!buf) {
-		log_warning("Cannot load conversation: %s not found", file_path);
+		/* No saved session yet is the normal first-run case */
+		if (errno == ENOENT)
+			log_info("No saved conversation at %s", file_path);
+		else
+			log_warning("Cannot load conversation from %s: %s",
+				    file_path, strerror(errno));
 		return NULL;
 	}
 
@@ -857,25 +786,10 @@ struct conversation_history *conversation_load(const char *file_path)
 		return NULL;
 	}
 
-	int msg_count = cJSON_GetArraySize(msgs);
-	if (msg_count <= 0) {
-		cJSON_Delete(doc);
-		return conversation_create();
-	}
-
 	struct conversation_history *conv = conversation_create();
 	if (!conv) {
 		cJSON_Delete(doc);
 		return NULL;
-	}
-
-	/* Grow to fit all messages */
-	while (conv->capacity < (size_t)msg_count) {
-		if (conversation_grow(conv) != BORIS_OK) {
-			conversation_destroy(conv);
-			cJSON_Delete(doc);
-			return NULL;
-		}
 	}
 
 	struct cJSON *msg_obj = NULL;
@@ -886,12 +800,11 @@ struct conversation_history *conversation_load(const char *file_path)
 			message_free_content(&msg);
 			continue;
 		}
-
-		/* Copy into the conversation */
-		struct conversation_message *slot = &conv->messages[conv->count];
-		*slot = msg;
-		conv->count++;
-		conv->total_characters += message_character_count(slot);
+		if (append_message(conv, &msg) != BORIS_OK) {
+			conversation_destroy(conv);
+			cJSON_Delete(doc);
+			return NULL;
+		}
 	}
 
 	cJSON_Delete(doc);
@@ -900,6 +813,7 @@ struct conversation_history *conversation_load(const char *file_path)
 		 file_path, conv->count);
 	return conv;
 }
+
 
 char *conversation_load_saved_at(const char *file_path)
 {
@@ -938,12 +852,5 @@ char *conversation_load_saved_at(const char *file_path)
 
 char *conversation_session_path(void)
 {
-	const char *home = getenv("HOME");
-	char buf[1024];
-
-	if (!home || !home[0])
-		return NULL;
-
-	snprintf(buf, sizeof(buf), "%s/.boris/sessions/session.json", home);
-	return strdup(buf);
+	return fs_boris_path("sessions/session.json");
 }

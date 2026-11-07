@@ -917,6 +917,378 @@ static void test_stream_no_finish_reason(void)
  * Main
  * ---------------------------------------------------------------------- */
 
+/* -------------------------------------------------------------------------
+ * Regression tests for review findings (docs/code-review.md)
+ * ---------------------------------------------------------------------- */
+
+static const char LENGTH_RESPONSE[] =
+	"{\"choices\":[{\"finish_reason\":\"length\","
+	"\"message\":{\"content\":\"partial\"}}]}";
+
+/* Index of the first message with the given role at or after start, or -1. */
+static int find_role(const struct conversation_history *conv, size_t start,
+		     enum message_role role)
+{
+	for (size_t i = start; i < conv->count; i++)
+		if (conv->messages[i].role == role)
+			return (int)i;
+	return -1;
+}
+
+static bool conv_contains(const struct conversation_history *conv,
+			  const char *needle)
+{
+	for (size_t i = 0; i < conv->count; i++)
+		if (conv->messages[i].content &&
+		    strstr(conv->messages[i].content, needle))
+			return true;
+	return false;
+}
+
+/* H1: an SSE data line longer than 8 KB must not be dropped. */
+static void test_stream_long_line(void)
+{
+	printf("  Test: Stream - tool call chunk longer than 8 KB\n");
+
+	size_t n = 20000;
+	char *body = malloc(n + 512);
+	int p = sprintf(body,
+			"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,"
+			"\"id\":\"c1\",\"function\":{\"name\":\"write\",\"arguments\":\""
+			"{\\\"content\\\":\\\"");
+	memset(body + p, 'B', n);
+	sprintf(body + p + n, "\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n"
+			      "data: [DONE]\n\n");
+
+	mock_http_reset();
+	mock_http_queue_response(body, 200);
+	free(body);
+
+	struct agent_configuration cfg = make_test_config();
+	struct conversation_history *conv = conversation_create();
+	conversation_add_user(conv, "hi");
+	struct llm_response *r = llm_complete(conv, NULL, 0, &cfg);
+
+	ASSERT(r && !r->error, "response should not be an error");
+	ASSERT(r && r->tool_calls.count == 1, "the long tool call should be parsed");
+	ASSERT(r && strcmp(r->finish_reason, "tool_calls") == 0,
+	       "finish_reason should survive");
+	if (r && r->tool_calls.count == 1)
+		ASSERT(strlen(r->tool_calls.calls[0].argument_json) > n,
+		       "arguments should be complete");
+
+	llm_response_free(r);
+	conversation_destroy(conv);
+	configuration_destroy(&cfg);
+}
+
+/* M2: stream requested but server replied with plain JSON. */
+static void test_stream_requested_json_reply(void)
+{
+	printf("  Test: Stream requested, server replies with plain JSON\n");
+
+	mock_http_reset();
+	char *resp = make_stop_response("plain json");
+	mock_http_queue_response(resp, 200);
+	free(resp);
+
+	struct agent_configuration cfg = make_test_config();
+	cfg.stream_responses = true;
+	struct agent_result result = agent_run("Hi", &cfg);
+
+	ASSERT(result.finish_reason == FINISHED_NATURALLY, "should finish naturally");
+	ASSERT(result.final_response && strcmp(result.final_response, "plain json") == 0,
+	       "JSON content should be parsed");
+
+	agent_result_free(&result);
+	configuration_destroy(&cfg);
+}
+
+/* SSE: usage arrives in a final chunk with an empty choices array, and an
+ * error object in the stream is reported as an error. */
+static void test_stream_usage_and_error(void)
+{
+	printf("  Test: Stream - usage-only chunk and error object\n");
+
+	mock_http_reset();
+	mock_http_queue_response(
+		"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n"
+		"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3}}\n\n"
+		"data: [DONE]\n\n", 200);
+	mock_http_queue_response(
+		"data: {\"error\":{\"message\":\"boom\"}}\n\n", 200);
+
+	struct agent_configuration cfg = make_test_config();
+	struct conversation_history *conv = conversation_create();
+	conversation_add_user(conv, "hi");
+
+	struct llm_response *r = llm_complete(conv, NULL, 0, &cfg);
+	ASSERT(r && r->prompt_tokens == 7 && r->completion_tokens == 3,
+	       "usage from a choices-less chunk should be recorded");
+	llm_response_free(r);
+
+	r = llm_complete(conv, NULL, 0, &cfg);
+	ASSERT(r && r->error && strstr(r->err.msg, "boom"),
+	       "stream error object should produce an error");
+	llm_response_free(r);
+
+	conversation_destroy(conv);
+	configuration_destroy(&cfg);
+}
+
+/* H2: length cut-offs separated by tool turns must not accumulate. */
+static void test_continuations_reset_after_tool_turn(void)
+{
+	printf("  Test: max_tokens continuations reset after a tool turn\n");
+
+	mock_http_reset();
+	for (int i = 0; i < 4; i++) {
+		char id[16];
+		snprintf(id, sizeof(id), "c%d", i);
+		mock_http_queue_response(LENGTH_RESPONSE, 200);
+		char *tool = make_tool_response(NULL, id, "nope", "{}");
+		mock_http_queue_response(tool, 200);
+		free(tool);
+	}
+	char *stop = make_stop_response("done");
+	mock_http_queue_response(stop, 200);
+	free(stop);
+
+	struct agent_configuration cfg = make_test_config();
+	cfg.max_iterations = 20;
+	struct agent_result result = agent_run("go", &cfg);
+
+	ASSERT(result.finish_reason == FINISHED_NATURALLY,
+	       "independent cut-offs should not abort the run");
+
+	agent_result_free(&result);
+	configuration_destroy(&cfg);
+}
+
+/* H3: permanent HTTP errors are not retried; transient ones are. */
+static void test_retry_classification(void)
+{
+	printf("  Test: 401 is not retried, 503 is\n");
+
+	struct agent_configuration cfg = make_test_config();
+	cfg.max_retries = 2;
+	cfg.retry_backoff_ms = 1;
+
+	mock_http_reset();
+	for (int i = 0; i < 3; i++)
+		mock_http_queue_response("{\"error\":{\"message\":\"bad key\"}}", 401);
+	struct agent_result result = agent_run("go", &cfg);
+	ASSERT(result.finish_reason == FINISHED_ERROR, "401 should fail");
+	ASSERT(mock_http_call_count() == 1, "401 should not be retried");
+	agent_result_free(&result);
+
+	mock_http_reset();
+	mock_http_queue_response("{\"error\":{\"message\":\"busy\"}}", 503);
+	mock_http_queue_response("{\"error\":{\"message\":\"busy\"}}", 503);
+	char *stop = make_stop_response("ok");
+	mock_http_queue_response(stop, 200);
+	free(stop);
+	result = agent_run("go", &cfg);
+	ASSERT(result.finish_reason == FINISHED_NATURALLY, "503 should be retried");
+	ASSERT(mock_http_call_count() == 3, "two retries expected");
+	agent_result_free(&result);
+
+	configuration_destroy(&cfg);
+}
+
+/* H4: Ctrl+C during a request ends the run without retrying. */
+static void test_interrupt_during_request(void)
+{
+	printf("  Test: Ctrl+C during a request stops without retrying\n");
+
+	mock_http_reset();
+	mock_http_queue_interrupt();
+	char *stop = make_stop_response("should not be reached");
+	mock_http_queue_response(stop, 200);
+	free(stop);
+
+	struct agent_configuration cfg = make_test_config();
+	cfg.max_retries = 2;
+	cfg.retry_backoff_ms = 1;
+	struct agent_result result = agent_run("go", &cfg);
+
+	ASSERT(result.finish_reason == FINISHED_INTERRUPTED, "should be interrupted");
+	ASSERT(mock_http_call_count() == 1, "should not retry after Ctrl+C");
+
+	agent_result_free(&result);
+	configuration_destroy(&cfg);
+}
+
+/* M3: an error mid-run still reports the turns and tokens used. */
+static void test_error_result_keeps_turns(void)
+{
+	printf("  Test: error result keeps turn count\n");
+
+	mock_http_reset();
+	char *tool = make_tool_response(NULL, "c1", "nope", "{}");
+	mock_http_queue_response(tool, 200);
+	free(tool);
+	mock_http_queue_response("{\"error\":{\"message\":\"bad\"}}", 400);
+
+	struct agent_configuration cfg = make_test_config();
+	struct agent_result result = agent_run("go", &cfg);
+
+	ASSERT(result.finish_reason == FINISHED_ERROR, "should fail");
+	ASSERT(result.turns_used == 2, "turns_used should be 2");
+	ASSERT(result.total_prompt_tokens == 20, "tokens should be kept");
+
+	agent_result_free(&result);
+	configuration_destroy(&cfg);
+}
+
+/* M3: text-fallback tool results must directly follow the assistant call
+ * (a reminder in between is rejected by OpenAI-compatible APIs). */
+static void test_text_fallback_results_follow_call(void)
+{
+	printf("  Test: text fallback - tool result follows the call\n");
+
+	mock_http_reset();
+	char *text = make_stop_response(
+		"<tool_call>{\"name\":\"nope\",\"arguments\":{}}</tool_call>");
+	mock_http_queue_response(text, 200);
+	free(text);
+	char *stop = make_stop_response("done");
+	mock_http_queue_response(stop, 200);
+	free(stop);
+
+	struct agent_configuration cfg = make_test_config();
+	struct conversation_history *conv = conversation_create();
+	conversation_add_system(conv, "sys");
+	conversation_add_user(conv, "go");
+	struct agent_result result = agent_run_conv(conv, &cfg);
+
+	int a = find_role(conv, 0, MESSAGE_ROLE_ASSISTANT);
+	ASSERT(a >= 0 && conv->messages[a].tool_call_count == 1,
+	       "assistant turn should carry the parsed call");
+	ASSERT(a >= 0 && (size_t)a + 1 < conv->count &&
+		       conv->messages[a + 1].role == MESSAGE_ROLE_TOOL,
+	       "tool result should immediately follow the call");
+	ASSERT(conv_contains(conv, "native tool_calls channel"),
+	       "text-fallback reminder should still be injected");
+
+	agent_result_free(&result);
+	conversation_destroy(conv);
+	configuration_destroy(&cfg);
+}
+
+/*
+ * agent.native_tool_reminder gates the text-fallback reminder.
+ * Ported from upstream PR #4 by @ilmich.
+ */
+static void test_native_tool_reminder_setting(void)
+{
+	printf("  Test: native_tool_reminder=false suppresses the text-fallback reminder\n");
+
+	for (int enabled = 1; enabled >= 0; enabled--) {
+		mock_http_reset();
+		char *text = make_stop_response(
+			"<tool_call>{\"name\":\"nope\",\"arguments\":{}}</tool_call>");
+		mock_http_queue_response(text, 200);
+		free(text);
+		char *stop = make_stop_response("done");
+		mock_http_queue_response(stop, 200);
+		free(stop);
+
+		struct agent_configuration cfg = make_test_config();
+		cfg.native_tool_reminder = enabled;
+		struct conversation_history *conv = conversation_create();
+		conversation_add_system(conv, "sys");
+		conversation_add_user(conv, "go");
+		struct agent_result result = agent_run_conv(conv, &cfg);
+
+		ASSERT(result.finish_reason == FINISHED_NATURALLY,
+		       "should finish naturally after the text tool call");
+		bool reminded = conv_contains(conv, "native tool_calls channel");
+		if (enabled)
+			ASSERT(reminded, "reminder should be injected by default");
+		else
+			ASSERT(!reminded, "reminder must not be injected when disabled");
+
+		agent_result_free(&result);
+		conversation_destroy(conv);
+		configuration_destroy(&cfg);
+	}
+}
+
+/* "stream" used to be sent as true on every request (cJSON_False is a
+ * non-zero type tag), so usage was never reported by llama.cpp. */
+static void test_request_stream_flag(void)
+{
+	printf("  Test: request sends stream only when enabled, with include_usage\n");
+
+	for (int streaming = 0; streaming <= 1; streaming++) {
+		mock_http_reset();
+		char *stop = make_stop_response("ok");
+		mock_http_queue_response(stop, 200);
+		free(stop);
+
+		struct agent_configuration cfg = make_test_config();
+		cfg.stream_responses = streaming;
+		struct agent_result result = agent_run("hi", &cfg);
+
+		cJSON *req = cJSON_Parse(mock_http_request_body(0));
+		cJSON *stream = cJSON_GetObjectItemCaseSensitive(req, "stream");
+		cJSON *opts = cJSON_GetObjectItemCaseSensitive(req, "stream_options");
+		if (streaming) {
+			ASSERT(cJSON_IsTrue(stream), "stream should be true when enabled");
+			ASSERT(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(opts, "include_usage")),
+			       "streaming requests should ask for usage");
+		} else {
+			ASSERT(cJSON_IsFalse(stream), "stream should be false by default");
+			ASSERT(opts == NULL, "no stream_options without streaming");
+		}
+		ASSERT(result.total_prompt_tokens == 10, "usage should be parsed");
+
+		cJSON_Delete(req);
+		agent_result_free(&result);
+		configuration_destroy(&cfg);
+	}
+}
+
+/* M3: two identical calls in one turn, repeated, are detected. */
+static void test_repeat_detection_duplicate_calls(void)
+{
+	printf("  Test: repeated turn of duplicate calls is detected\n");
+
+	const char *dup =
+		"{\"choices\":[{\"finish_reason\":\"tool_calls\",\"message\":{"
+		"\"content\":null,\"tool_calls\":["
+		"{\"id\":\"a\",\"type\":\"function\",\"function\":{\"name\":\"list_dir\",\"arguments\":\"{\\\"path\\\":\\\".\\\"}\"}},"
+		"{\"id\":\"b\",\"type\":\"function\",\"function\":{\"name\":\"list_dir\",\"arguments\":\"{\\\"path\\\":\\\".\\\"}\"}}"
+		"]}}]}";
+
+	mock_http_reset();
+	mock_http_queue_response(dup, 200);
+	mock_http_queue_response(dup, 200);
+	char *stop = make_stop_response("done");
+	mock_http_queue_response(stop, 200);
+	free(stop);
+
+	struct agent_configuration cfg = make_test_config();
+	char sandbox[64];
+	snprintf(sandbox, sizeof(sandbox), "/tmp/boris_e2e_repeat_%d", (int)getpid());
+	mkdir(sandbox, 0755);
+	cfg.sandbox_root = strdup(sandbox);
+	cfg.tools_enabled = TOOL_LIST_DIR;
+	tools_register_builtins();
+	struct conversation_history *conv = conversation_create();
+	conversation_add_user(conv, "go");
+	struct agent_result result = agent_run_conv(conv, &cfg);
+
+	ASSERT(conv_contains(conv, "same tool call(s) as the previous turn"),
+	       "repeat reminder should be injected");
+	rmdir(sandbox);
+
+	agent_result_free(&result);
+	conversation_destroy(conv);
+	configuration_destroy(&cfg);
+}
+
 int main(void)
 {
 	printf("\n=== End-to-End Tests ===\n\n");
@@ -941,6 +1313,17 @@ int main(void)
 	test_stream_malformed_json();
 	test_stream_no_done();
 	test_stream_no_finish_reason();
+	test_stream_long_line();
+	test_stream_requested_json_reply();
+	test_stream_usage_and_error();
+	test_continuations_reset_after_tool_turn();
+	test_retry_classification();
+	test_interrupt_during_request();
+	test_error_result_keeps_turns();
+	test_text_fallback_results_follow_call();
+	test_repeat_detection_duplicate_calls();
+	test_native_tool_reminder_setting();
+	test_request_stream_flag();
 
 	printf("\n--- E2E Results ---\n");
 	if (failures == 0)

@@ -1,0 +1,45 @@
+/*
+ * fs.h - Small filesystem helpers shared across the codebase.
+ *
+ * Directory creation, crash-safe file replacement, and the location of
+ * Boris's per-user data directory (~/.boris).
+ */
+
+#ifndef FS_H
+#define FS_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <sys/types.h>
+
+/* Create dir and any missing parents (like mkdir -p). Returns 0 or -1. */
+int fs_mkdirp(const char *dir, mode_t mode);
+
+/* Create the directory that will contain file_path. Returns 0 or -1. */
+int fs_mkdirp_parent(const char *file_path, mode_t mode);
+
+/* Write all len bytes to fd, retrying short writes. Returns 0 or -1. */
+int fs_write_all(int fd, const char *data, size_t len);
+
+/*
+ * Replace path with data atomically: write a uniquely named temp file in
+ * the same directory, fsync it, then rename it over path. Readers see the
+ * old or the new content, never a partial file.
+ *
+ * mode is used for a new file; an existing file keeps its permission bits.
+ * With no_replace, an existing path is left untouched and the call fails
+ * with errno == EEXIST (the check and the creation are a single step).
+ *
+ * Returns 0, or -1 with errno set.
+ */
+int fs_write_atomic(const char *path, const char *data, size_t len,
+		    mode_t mode, bool no_replace);
+
+/*
+ * Return "$HOME/.boris/<relative>" (or "$HOME/.boris" when relative is
+ * NULL or empty) as a heap string. Falls back to the passwd entry when
+ * HOME is unset. Returns NULL if no home directory can be found.
+ */
+char *fs_boris_path(const char *relative);
+
+#endif /* FS_H */

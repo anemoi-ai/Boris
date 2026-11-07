@@ -45,7 +45,6 @@ struct agent_configuration {
 	float temperature;
 	int max_tokens;
 	int context_window;
-	int max_conversation_turns;
 	int request_timeout_seconds;
 
 	char *system_prompt;
@@ -59,6 +58,11 @@ struct agent_configuration {
 
 	int max_iterations;
 	bool text_tool_fallback; /* Parse XML tool calls embedded in plain-text responses */
+	/* Remind the model to prefer native tool_calls when it emits them as text.
+	 * Turn off for models that can only produce text tool calls (e.g.
+	 * qwen2.5-coder): there the reminder is noise it cannot act on.
+	 * Ported from upstream PR #4 by @ilmich. */
+	bool native_tool_reminder;
 	int max_retries;
 	int retry_backoff_ms;
 
@@ -69,10 +73,9 @@ struct agent_configuration {
 
 	int log_level;
 	char *log_file;
-	char *log_format; /* "text" or "json" */
 
-	bool json_output;
 	bool show_metrics;
+	bool show_tool_calls; /* print each tool call and a result preview in the REPL */
 };
 
 /*
@@ -154,11 +157,10 @@ struct tool_call {
 	char *argument_json;
 };
 
-/* Growable array of tool calls from a single LLM response. */
+/* Array of tool calls from a single LLM response. */
 struct tool_call_list {
 	struct tool_call *calls;
 	size_t count;
-	size_t cap;
 };
 
 /*
@@ -207,17 +209,30 @@ typedef struct tool_result (*tool_fn)(const char *argument_json,
 				      struct memory_arena *scratch);
 
 /*
+ * Tool call formatter.
+ *
+ * Writes a short, one-line summary of a call's arguments into buf (at most
+ * size bytes, NUL-terminated), e.g. "notes.md (overwrite, 812 bytes)". The
+ * tool name is shown separately, so do not repeat it. Read argument strings
+ * in place; never copy large values (file content) just to describe them.
+ * The registry sanitises the result for terminal display.
+ */
+typedef void (*tool_format_fn)(const char *argument_json, char *buf, size_t size);
+
+/*
  * Registered tool descriptor.
  *
  * parameters_schema is heap-allocated by the registry (strdup'd at
  * registration time). fn is the implementation; flag is the TOOL_*
- * bitmask used for enable/disable gating.
+ * bitmask used for enable/disable gating. format_call is optional; without
+ * it, displays fall back to the raw (truncated) argument JSON.
  */
 struct tool_definition {
 	char name[64];
 	char description[512];
 	char *parameters_schema;
 	tool_fn fn;
+	tool_format_fn format_call;
 	int flag;
 };
 

@@ -81,18 +81,6 @@ int json_get_int(const cJSON *obj, const char *key, int def)
 	return def;
 }
 
-double json_get_double(const cJSON *obj, const char *key, double def)
-{
-	if (!obj || !key)
-		return def;
-	const cJSON *item = cJSON_GetObjectItemCaseSensitive(obj, key);
-	if (!item)
-		return def;
-	if (cJSON_IsNumber(item))
-		return item->valuedouble;
-	return def;
-}
-
 int json_get_bool(const cJSON *obj, const char *key, int def)
 {
 	if (!obj || !key)
@@ -116,13 +104,6 @@ char *json_to_str(const cJSON *obj)
 	return cJSON_PrintUnformatted(obj);
 }
 
-char *json_to_str_pretty(const cJSON *obj)
-{
-	if (!obj)
-		return NULL;
-	return cJSON_Print(obj);
-}
-
 char *file_read_all(const char *path, size_t max_bytes, size_t *out_len)
 {
 	if (out_len)
@@ -139,7 +120,8 @@ char *file_read_all(const char *path, size_t max_bytes, size_t *out_len)
 	long sz = ftell(f);
 	fseek(f, 0, SEEK_SET);
 
-	if (sz <= 0 || (size_t)sz > max_bytes) {
+	/* An empty file is valid and yields "" */
+	if (sz < 0 || (size_t)sz > max_bytes) {
 		fclose(f);
 		return NULL;
 	}

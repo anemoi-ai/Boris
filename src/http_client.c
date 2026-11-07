@@ -24,10 +24,31 @@ struct response_buffer {
 	char *data;
 	size_t length;
 	size_t capacity;
+	bool too_large; /* set when HTTP_MAX_RESPONSE_BYTES was exceeded */
 };
 
 /* Global initialisation state */
 static int g_http_initialised = 0;
+
+/* Non-NULL while a caller wants requests to be cancellable. */
+static const volatile sig_atomic_t *g_cancel_flag = NULL;
+
+void http_set_cancel_flag(const volatile sig_atomic_t *flag)
+{
+	g_cancel_flag = flag;
+}
+
+/* libcurl progress callback: returning non-zero aborts the transfer. */
+static int progress_callback(void *userdata, curl_off_t dltotal, curl_off_t dlnow,
+			     curl_off_t ultotal, curl_off_t ulnow)
+{
+	(void)userdata;
+	(void)dltotal;
+	(void)dlnow;
+	(void)ultotal;
+	(void)ulnow;
+	return (g_cancel_flag && *g_cancel_flag) ? 1 : 0;
+}
 
 int http_global_init(void)
 {
@@ -63,6 +84,11 @@ static size_t write_callback(void *contents, size_t size, size_t nmemb,
 	size_t chunk_size = size * nmemb;
 	struct response_buffer *buf = (struct response_buffer *)userdata;
 	size_t new_length = buf->length + chunk_size;
+
+	if (new_length > HTTP_MAX_RESPONSE_BYTES) {
+		buf->too_large = true;
+		return 0; /* Abort the transfer */
+	}
 
 	/* Grow the buffer if needed */
 	if (new_length >= buf->capacity) {
@@ -103,6 +129,8 @@ static void curl_setup_common(CURL *curl, const char *url, int timeout_secs,
 	curl_easy_setopt(curl, CURLOPT_WRITEDATA, buf);
 	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
 	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+	curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+	curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, progress_callback);
 	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, verify_ssl ? 1L : 0L);
 	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, verify_ssl ? 2L : 0L);
 }
@@ -145,6 +173,7 @@ struct http_response http_post(const char *url,
 	buf.data = malloc(4096);
 	buf.length = 0;
 	buf.capacity = 4096;
+	buf.too_large = false;
 	if (!buf.data) {
 		response.error = strdup("Out of memory");
 		curl_easy_cleanup(curl);
@@ -180,7 +209,12 @@ struct http_response http_post(const char *url,
 	result = curl_easy_perform(curl);
 
 	if (result != CURLE_OK) {
-		response.error = strdup(curl_easy_strerror(result));
+		const char *msg = curl_easy_strerror(result);
+		if (result == CURLE_ABORTED_BY_CALLBACK)
+			msg = "Request cancelled";
+		else if (buf.too_large)
+			msg = "Response too large";
+		response.error = strdup(msg);
 		log_error("HTTP request failed: %s", response.error);
 	} else {
 		curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE,

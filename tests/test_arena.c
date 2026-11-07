@@ -294,6 +294,33 @@ static void test_arena_destroy_null(void)
 }
 
 /*
+ * Test: a single allocation larger than the block size gets its own block
+ * big enough to hold it (previously this overflowed the heap).
+ */
+static void test_arena_oversized_allocation(void)
+{
+	printf("  Test: allocation larger than block size\n");
+
+	struct memory_arena *arena = arena_create(64);
+	ASSERT(arena != NULL);
+
+	char *small = arena_allocate(arena, 16);
+	char *big = arena_allocate(arena, 1000);
+	ASSERT(small != NULL);
+	ASSERT(big != NULL);
+	memset(big, 'x', 1000); /* ASan flags this if the block is too small */
+	ASSERT(arena->current_block->total_size >= 1000);
+
+	char *after = arena_allocate(arena, 16);
+	ASSERT(after != NULL);
+	ASSERT(big[999] == 'x');
+
+	ASSERT(arena_allocate(arena, (size_t)-1) == NULL);
+
+	arena_destroy(arena);
+}
+
+/*
  * Run all the tests.
  */
 int main(void)
@@ -310,6 +337,7 @@ int main(void)
 	test_arena_reset();
 	test_arena_checkpoint();
 	test_arena_multiple_blocks();
+	test_arena_oversized_allocation();
 	test_arena_destroy_null();
 
 	printf("\n--- Arena Results ---\n");

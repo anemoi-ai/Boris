@@ -40,11 +40,6 @@ const char *json_get_str(const cJSON *obj, const char *key);
 int json_get_int(const cJSON *obj, const char *key, int def);
 
 /*
- * Return the double value of key, or def on failure.
- */
-double json_get_double(const cJSON *obj, const char *key, double def);
-
-/*
  * Return 1/0 for a boolean key, or def on failure.
  */
 int json_get_bool(const cJSON *obj, const char *key, int def);
@@ -56,14 +51,6 @@ int json_get_bool(const cJSON *obj, const char *key, int def);
  * Returns NULL on OOM.
  */
 char *json_to_str(const cJSON *obj);
-
-/*
- * Serialise obj to a pretty-printed JSON string.
- *
- * The caller must free() the returned string.
- * Returns NULL on OOM.
- */
-char *json_to_str_pretty(const cJSON *obj);
 
 /*
  * Read an entire file into a heap-allocated, NUL-terminated buffer.

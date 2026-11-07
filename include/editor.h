@@ -58,9 +58,6 @@ void editor_end(struct editor_state *ed);
 /* Return a strdup'd copy of the buffer (caller must free). */
 char *editor_get_text(struct editor_state *ed);
 
-/* Read-only pointer into the live buffer (don't free). */
-const char *editor_get_buffer(struct editor_state *ed);
-
 /* Set the tab-completion callback (optional). */
 void editor_set_completion(editor_completion_fn fn, void *ctx);
 

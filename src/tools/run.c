@@ -21,6 +21,8 @@
 #include "sandbox.h"
 #include "json.h"
 #include "logger.h"
+#include "fs.h"
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -129,6 +131,7 @@ static int build_argv_shebang(const char *script_path,
 	return argc;
 }
 
+
 /* -------------------------------------------------------------------------
  * Argument parsing
  * ---------------------------------------------------------------------- */
@@ -138,15 +141,13 @@ struct run_args {
 	char user_args[USER_ARGS_MAX][USER_ARG_LEN];
 	int user_argc;
 	int timeout_seconds;
-	char *stdin_data; /* heap-allocated, may be NULL */
+	char *stdin_data; /* scratch-arena copy, may be NULL */
 	size_t stdin_len;
 };
 
-static int parse_run_args(const char *json_str, struct run_args *out)
+static int parse_run_args(const char *json_str, struct run_args *out,
+			  struct memory_arena *scratch)
 {
-	if (!json_str || !out)
-		return -1;
-
 	memset(out, 0, sizeof(*out));
 	out->timeout_seconds = RUN_DEFAULT_TIMEOUT;
 
@@ -154,37 +155,30 @@ static int parse_run_args(const char *json_str, struct run_args *out)
 	if (!root)
 		return -1;
 
-	const char *path = json_get_str(root, "path");
-	if (!path || strlen(path) >= sizeof(out->path)) {
+	if (tools_arg_path(root, out->path, sizeof(out->path)) != 0) {
 		cJSON_Delete(root);
 		return -1;
 	}
-	snprintf(out->path, sizeof(out->path), "%s", path);
 
 	cJSON *args_node = cJSON_GetObjectItemCaseSensitive(root, "args");
-	if (args_node && cJSON_IsArray(args_node)) {
-		int n = cJSON_GetArraySize(args_node);
-		if (n > USER_ARGS_MAX)
-			n = USER_ARGS_MAX;
-		for (int i = 0; i < n; i++) {
-			cJSON *item = cJSON_GetArrayItem(args_node, i);
-			if (!item || !cJSON_IsString(item))
-				continue;
-			snprintf(out->user_args[out->user_argc],
-				 USER_ARG_LEN, "%s", item->valuestring);
-			out->user_argc++;
-		}
+	cJSON *args_arr = cJSON_IsArray(args_node) ? args_node : NULL;
+	cJSON *item = NULL;
+	cJSON_ArrayForEach(item, args_arr)
+	{
+		if (out->user_argc >= USER_ARGS_MAX)
+			break;
+		if (!cJSON_IsString(item))
+			continue;
+		snprintf(out->user_args[out->user_argc], USER_ARG_LEN, "%s",
+			 item->valuestring);
+		out->user_argc++;
 	}
 
 	cJSON *timeout_node = cJSON_GetObjectItemCaseSensitive(root,
 							       "timeout_seconds");
-	if (timeout_node && cJSON_IsNumber(timeout_node)) {
-		int t = (int)timeout_node->valuedouble;
-		if (t < 1)
-			t = 1;
-		if (t > RUN_MAX_TIMEOUT)
-			t = RUN_MAX_TIMEOUT;
-		out->timeout_seconds = t;
+	if (cJSON_IsNumber(timeout_node)) {
+		double t = timeout_node->valuedouble;
+		out->timeout_seconds = t < 1 ? 1 : t > RUN_MAX_TIMEOUT ? RUN_MAX_TIMEOUT : (int)t;
 	}
 
 	const char *stdin_str = json_get_str(root, "stdin");
@@ -192,12 +186,8 @@ static int parse_run_args(const char *json_str, struct run_args *out)
 		size_t slen = strlen(stdin_str);
 		if (slen > RUN_MAX_STDIN)
 			slen = RUN_MAX_STDIN;
-		out->stdin_data = malloc(slen + 1);
-		if (out->stdin_data) {
-			memcpy(out->stdin_data, stdin_str, slen);
-			out->stdin_data[slen] = '\0';
-			out->stdin_len = slen;
-		}
+		out->stdin_data = arena_duplicate_string_length(scratch, stdin_str, slen);
+		out->stdin_len = out->stdin_data ? slen : 0;
 	}
 
 	cJSON_Delete(root);
@@ -211,202 +201,224 @@ static long elapsed_ms(const struct timespec *start)
 	return (long)((now.tv_sec - start->tv_sec) * 1000 + (now.tv_nsec - start->tv_nsec) / 1000000);
 }
 
+/* -------------------------------------------------------------------------
+ * Child process
+ * ---------------------------------------------------------------------- */
+
+/* Longest a single poll() waits, so timeouts and Ctrl+C are noticed promptly. */
+#define RUN_POLL_SLICE_MS 200
+
+static _Noreturn void exec_in_child(char *const argv[], const char *cwd,
+			  int out_fd, int in_fd)
+{
+	/* Own process group, so a timeout can kill everything the script
+	 * started, not just the script itself. */
+	setpgid(0, 0);
+	signal(SIGPIPE, SIG_DFL);
+
+	/* Python block-buffers stdout when it is a pipe, so a script killed at
+	 * the timeout would report no output at all, hiding where it hung. */
+	setenv("PYTHONUNBUFFERED", "1", 1);
+
+	dup2(out_fd, STDOUT_FILENO);
+	dup2(out_fd, STDERR_FILENO);
+	close(out_fd);
+
+	if (in_fd < 0)
+		in_fd = open("/dev/null", O_RDONLY);
+	if (in_fd >= 0) {
+		dup2(in_fd, STDIN_FILENO);
+		close(in_fd);
+	}
+
+	if (cwd && chdir(cwd) != 0) {
+		fprintf(stderr, "run: cannot chdir to '%s': %s\n", cwd, strerror(errno));
+		_exit(127);
+	}
+
+	execvp(argv[0], argv);
+	fprintf(stderr, "run: cannot execute '%s': %s\n", argv[0], strerror(errno));
+	_exit(127);
+}
+
+/* Write stdin data to the child, ignoring SIGPIPE: a script that exits
+ * without reading its input must not kill Boris. */
+static void feed_stdin(int fd, const char *data, size_t len)
+{
+	struct sigaction ign, old;
+	memset(&ign, 0, sizeof(ign));
+	ign.sa_handler = SIG_IGN;
+	sigemptyset(&ign.sa_mask);
+	sigaction(SIGPIPE, &ign, &old);
+	fs_write_all(fd, data, len); /* EPIPE just means the child stopped reading */
+	sigaction(SIGPIPE, &old, NULL);
+	close(fd);
+}
+
+struct child_output {
+	char *buf; /* RUN_MAX_OUTPUT + 1 bytes */
+	size_t len;
+	bool truncated;
+};
+
+/* Read combined output until EOF, the deadline, or cancellation.
+ * Returns false if the child must be killed (timeout or Ctrl+C). */
+static bool collect_output(int fd, struct child_output *out,
+			   const struct timespec *start, int timeout_seconds)
+{
+	for (;;) {
+		long remaining = (long)timeout_seconds * 1000 - elapsed_ms(start);
+		if (remaining <= 0 || tools_cancelled())
+			return false;
+
+		struct pollfd pfd = {.fd = fd, .events = POLLIN};
+		int r = poll(&pfd, 1, remaining < RUN_POLL_SLICE_MS ? (int)remaining
+								     : RUN_POLL_SLICE_MS);
+		if (r < 0 && errno == EINTR)
+			continue;
+		if (r < 0)
+			return true; /* treat as EOF; waitpid below still applies */
+		if (r == 0)
+			continue;
+
+		char drain[4096];
+		size_t space = RUN_MAX_OUTPUT - out->len;
+		char *dst = space > 0 ? out->buf + out->len : drain;
+		ssize_t n = read(fd, dst, space > 0 ? space : sizeof(drain));
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			return true; /* EOF: child closed its output */
+		if (space > 0)
+			out->len += (size_t)n;
+		else
+			out->truncated = true;
+	}
+}
+
+/* Wait for the child to exit, still honouring the deadline: a script can
+ * close its output and keep running. The child is left unreaped (WNOWAIT)
+ * so its process-group ID cannot be reused before we kill the group.
+ * Returns false on timeout/cancel. */
+static bool wait_for_exit(pid_t pid, const struct timespec *start,
+			  int timeout_seconds)
+{
+	for (;;) {
+		siginfo_t info;
+		memset(&info, 0, sizeof(info));
+		int r = waitid(P_PID, (id_t)pid, &info, WEXITED | WNOHANG | WNOWAIT);
+		if ((r == 0 && info.si_pid == pid) || (r < 0 && errno != EINTR))
+			return true;
+		if (elapsed_ms(start) >= (long)timeout_seconds * 1000 || tools_cancelled())
+			return false;
+		struct timespec ts = {0, 20 * 1000000L};
+		nanosleep(&ts, NULL);
+	}
+}
+
 /*
- * exec_child - fork/exec argv, capture combined stdout+stderr with a timeout.
+ * fork/exec argv, capture combined stdout+stderr with a timeout.
  *
  * cwd is the working directory for the child (may be NULL to inherit).
  * Returns a heap-allocated result string, or NULL on internal failure.
- * *timed_out_out is set to 1 if the child was killed for exceeding the limit.
  */
 static char *exec_child(char *const argv[], const char *cwd,
 			const char *stdin_data, size_t stdin_len,
-			int timeout_seconds, int *timed_out_out)
+			int timeout_seconds)
 {
 	int out_pipe[2]; /* parent reads [0], child writes [1] */
-	int in_pipe[2];	 /* parent writes [1], child reads [0] */
-	*timed_out_out = 0;
+	int in_pipe[2] = {-1, -1}; /* parent writes [1], child reads [0] */
+	bool has_stdin = stdin_data && stdin_len > 0;
 
-	if (pipe(out_pipe) != 0)
+	struct child_output out = {.buf = malloc(RUN_MAX_OUTPUT + 1)};
+	if (!out.buf)
 		return NULL;
 
-	int has_stdin = (stdin_data && stdin_len > 0);
+	if (pipe(out_pipe) != 0) {
+		free(out.buf);
+		return NULL;
+	}
 	if (has_stdin && pipe(in_pipe) != 0) {
 		close(out_pipe[0]);
 		close(out_pipe[1]);
+		free(out.buf);
 		return NULL;
 	}
 
 	pid_t pid = fork();
+	if (pid == 0) {
+		close(out_pipe[0]);
+		if (has_stdin)
+			close(in_pipe[1]);
+		exec_in_child(argv, cwd, out_pipe[1], in_pipe[0]);
+	}
+
+	close(out_pipe[1]);
+	if (has_stdin)
+		close(in_pipe[0]);
 	if (pid < 0) {
 		close(out_pipe[0]);
-		close(out_pipe[1]);
-		if (has_stdin) {
-			close(in_pipe[0]);
+		if (has_stdin)
 			close(in_pipe[1]);
-		}
+		free(out.buf);
 		return NULL;
 	}
+	setpgid(pid, pid); /* also in the parent, to win the race with exec */
 
-	if (pid == 0) {
-		/* ---- child ---- */
-		dup2(out_pipe[1], STDOUT_FILENO);
-		dup2(out_pipe[1], STDERR_FILENO);
-		close(out_pipe[0]);
-		close(out_pipe[1]);
-
-		if (has_stdin) {
-			dup2(in_pipe[0], STDIN_FILENO);
-			close(in_pipe[0]);
-			close(in_pipe[1]);
-		} else {
-			int null_fd = open("/dev/null", O_RDONLY);
-			if (null_fd >= 0) {
-				dup2(null_fd, STDIN_FILENO);
-				close(null_fd);
-			}
-		}
-
-		if (cwd) {
-			if (chdir(cwd) != 0) {
-				fprintf(stderr, "run: cannot chdir to '%s': %s\n",
-					cwd, strerror(errno));
-				_exit(127);
-			}
-		}
-
-		execvp(argv[0], argv);
-		fprintf(stderr, "run: cannot execute '%s': %s\n",
-			argv[0], strerror(errno));
-		_exit(127);
-	}
-
-	/* ---- parent ---- */
-	close(out_pipe[1]);
-
-	if (has_stdin) {
-		close(in_pipe[0]);
-		size_t written = 0;
-		while (written < stdin_len) {
-			ssize_t n = write(in_pipe[1],
-					  stdin_data + written,
-					  stdin_len - written);
-			if (n <= 0)
-				break;
-			written += (size_t)n;
-		}
-		close(in_pipe[1]);
-	}
-
-	/* Capture output with deadline */
-	char *outbuf = malloc(RUN_MAX_OUTPUT + 1);
-	if (!outbuf) {
-		kill(pid, SIGKILL);
-		waitpid(pid, NULL, 0);
-		close(out_pipe[0]);
-		return NULL;
-	}
-	size_t outlen = 0;
-	int timed_out = 0;
-	int output_truncated = 0;
+	if (has_stdin)
+		feed_stdin(in_pipe[1], stdin_data, stdin_len);
 
 	struct timespec start;
 	clock_gettime(CLOCK_MONOTONIC, &start);
 
-	for (;;) {
-		long remaining = (long)timeout_seconds * 1000 - elapsed_ms(&start);
-		if (remaining <= 0) {
-			timed_out = 1;
-			break;
-		}
-
-		int poll_ms = (int)(remaining > 5000 ? 5000 : remaining);
-		struct pollfd pfd = {.fd = out_pipe[0], .events = POLLIN};
-		int r = poll(&pfd, 1, poll_ms);
-
-		if (r < 0) {
-			if (errno == EINTR)
-				continue;
-			break;
-		}
-		if (r == 0)
-			continue; /* re-check deadline */
-
-		size_t space = RUN_MAX_OUTPUT - outlen;
-		char drain[4096];
-		char *readbuf = space > 0 ? (outbuf + outlen) : drain;
-		size_t readlen = space > 0 ? space : sizeof(drain);
-
-		ssize_t n = read(out_pipe[0], readbuf, readlen);
-		if (n < 0) {
-			if (errno == EINTR)
-				continue;
-			break;
-		}
-		if (n == 0)
-			break; /* EOF — child closed its write end */
-
-		if (space > 0)
-			outlen += (size_t)n;
-		else
-			output_truncated = 1;
-	}
-	outbuf[outlen] = '\0';
-	close(out_pipe[0]);
-
-	if (timed_out)
-		kill(pid, SIGKILL);
-
 	int status = 0;
-	waitpid(pid, &status, 0);
+	bool finished = collect_output(out_pipe[0], &out, &start, timeout_seconds) &&
+			wait_for_exit(pid, &start, timeout_seconds);
+	close(out_pipe[0]);
+	out.buf[out.len] = '\0';
 
-	int exit_code = 0;
-	if (WIFEXITED(status))
-		exit_code = WEXITSTATUS(status);
-	else if (WIFSIGNALED(status))
-		exit_code = 128 + WTERMSIG(status);
+	/* Kill the whole group: on timeout/cancel, and also after a normal exit
+	 * so background processes the script started do not outlive it. */
+	kill(-pid, SIGKILL);
+	while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
+		;
 
-	/* Format result: header + captured output */
-	size_t result_cap = outlen + 256;
+	bool cancelled = !finished && tools_cancelled();
+	int exit_code = WIFEXITED(status)   ? WEXITSTATUS(status)
+			: WIFSIGNALED(status) ? 128 + WTERMSIG(status)
+					      : 0;
+
+	/* Format result: header + captured output + optional note */
+	size_t result_cap = out.len + 256;
 	char *result = malloc(result_cap);
 	if (!result) {
-		free(outbuf);
+		free(out.buf);
 		return NULL;
 	}
 
 	int hlen;
-	if (timed_out) {
+	if (cancelled)
+		hlen = snprintf(result, result_cap,
+				"Cancelled by the user (process killed)\n"
+				"--- output (partial) ---\n");
+	else if (!finished)
 		hlen = snprintf(result, result_cap,
 				"Timed out after %d seconds (process killed)\n"
 				"--- output (partial) ---\n",
 				timeout_seconds);
-	} else {
+	else
 		hlen = snprintf(result, result_cap,
-				"Exit code: %d\n--- output ---\n",
-				exit_code);
-	}
+				"Exit code: %d\n--- output ---\n", exit_code);
 
-	if (hlen > 0 && (size_t)hlen < result_cap) {
-		size_t space = result_cap - (size_t)hlen - 1;
-		size_t copy = outlen < space ? outlen : space;
-		memcpy(result + hlen, outbuf, copy);
-		result[hlen + copy] = '\0';
-	}
+	memcpy(result + hlen, out.buf, out.len);
+	size_t pos = (size_t)hlen + out.len;
+	if (out.truncated)
+		snprintf(result + pos, result_cap - pos,
+			 "\n[Output truncated at %d bytes]", RUN_MAX_OUTPUT);
+	else
+		result[pos] = '\0';
 
-	free(outbuf);
-
-	if (output_truncated) {
-		/* Append truncation notice — reallocate since result_cap was tight */
-		const char *note = "\n[Output truncated at 65536 bytes]";
-		size_t cur = strlen(result);
-		size_t note_len = strlen(note);
-		char *extended = realloc(result, cur + note_len + 1);
-		if (extended) {
-			memcpy(extended + cur, note, note_len + 1);
-			result = extended;
-		}
-	}
-
-	*timed_out_out = timed_out;
+	free(out.buf);
 	return result;
 }
 
@@ -418,33 +430,25 @@ struct tool_result tool_run_fn(const char *arguments_json,
 			       const struct agent_configuration *cfg,
 			       struct memory_arena *scratch)
 {
-	(void)scratch;
 	struct run_args args;
 
 	if (!arguments_json)
 		return tool_result_errorf("run", "Missing arguments");
 
-	if (parse_run_args(arguments_json, &args) != 0)
+	if (parse_run_args(arguments_json, &args, scratch) != 0)
 		return tool_result_errorf("run", "Invalid arguments");
 
 	char resolved[PATH_MAX];
 	struct tool_result sandbox_err;
 	if (tools_sandbox_resolve(cfg, args.path, resolved, sizeof(resolved),
-				  &sandbox_err) != 0) {
-		free(args.stdin_data);
+				  &sandbox_err) != 0)
 		return sandbox_err;
-	}
 
 	struct stat st;
-	if (stat(resolved, &st) != 0) {
-		free(args.stdin_data);
+	if (stat(resolved, &st) != 0)
 		return tool_result_errorf("run", "File not found: %s", args.path);
-	}
-	if (S_ISDIR(st.st_mode)) {
-		free(args.stdin_data);
-		return tool_result_errorf("run",
-					  "Path is a directory: %s", args.path);
-	}
+	if (!S_ISREG(st.st_mode))
+		return tool_result_errorf("run", "Not a regular file: %s", args.path);
 
 	/* Build argv - shebang takes priority over extension */
 	char *user_argv[USER_ARGS_MAX + 1];
@@ -453,24 +457,20 @@ struct tool_result tool_run_fn(const char *arguments_json,
 
 	char *exec_argv[RUN_MAX_ARGV];
 	char shebang_buf[512];
-	int argc;
-
-	argc = build_argv_shebang(resolved,
-				  (char *const *)user_argv, args.user_argc,
-				  exec_argv, RUN_MAX_ARGV,
-				  shebang_buf, sizeof(shebang_buf));
+	int argc = build_argv_shebang(resolved,
+				      (char *const *)user_argv, args.user_argc,
+				      exec_argv, RUN_MAX_ARGV,
+				      shebang_buf, sizeof(shebang_buf));
 
 	if (argc < 0) {
 		const char *interp = interp_from_extension(resolved);
-		if (!interp) {
-			free(args.stdin_data);
+		if (!interp)
 			return tool_result_errorf("run",
 						  "Cannot determine interpreter for '%s'. "
 						  "Add a shebang (e.g. #!/usr/bin/env python3) "
 						  "or use a recognised extension: "
 						  ".py .js .sh .rb .lua .pl .php",
 						  args.path);
-		}
 		argc = 0;
 		exec_argv[argc++] = (char *)interp;
 		exec_argv[argc++] = resolved;
@@ -496,14 +496,38 @@ struct tool_result tool_run_fn(const char *arguments_json,
 	log_info("run: %s (interpreter=%s, timeout=%ds)",
 		 resolved, exec_argv[0], timeout);
 
-	int timed_out = 0;
 	char *output = exec_child((char *const *)exec_argv, dir_buf,
-				  args.stdin_data, args.stdin_len,
-				  timeout, &timed_out);
-	free(args.stdin_data);
-
+				  args.stdin_data, args.stdin_len, timeout);
 	if (!output)
 		return tool_result_errorf("run", "Failed to launch process");
 
 	return tool_result_ok("run", output);
+}
+
+/* "build.sh --fast (stdin: 120 bytes)". */
+void tool_run_format(const char *argument_json, char *buf, size_t size)
+{
+	cJSON *root = json_parse(argument_json);
+	const char *path = json_get_str(root, "path");
+	if (!path) {
+		snprintf(buf, size, "(invalid arguments)");
+		cJSON_Delete(root);
+		return;
+	}
+
+	size_t pos = (size_t)snprintf(buf, size, "%s", path);
+	cJSON *args = cJSON_GetObjectItemCaseSensitive(root, "args");
+	cJSON *arr = cJSON_IsArray(args) ? args : NULL;
+	cJSON *item = NULL;
+	cJSON_ArrayForEach(item, arr)
+	{
+		if (pos >= size)
+			break;
+		if (cJSON_IsString(item))
+			pos += (size_t)snprintf(buf + pos, size - pos, " %s", item->valuestring);
+	}
+	const char *stdin_str = json_get_str(root, "stdin");
+	if (stdin_str && stdin_str[0] && pos < size)
+		snprintf(buf + pos, size - pos, " (stdin: %zu bytes)", strlen(stdin_str));
+	cJSON_Delete(root);
 }

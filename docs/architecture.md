@@ -107,7 +107,7 @@ Serialises the full conversation history and tool schemas into the OpenAI chat c
 
 ### `http_client.c` — HTTP transport
 
-Thin libcurl wrapper. Sends a single POST request and returns the response body as a heap-allocated string. Handles SSL verification, connection reuse, and request timeout. Has no retry logic — retries are the caller's (`agent.c`) responsibility.
+Thin libcurl wrapper. Sends a single POST request and returns the response body as a heap-allocated string. Handles SSL verification, request timeout, a response size cap (`HTTP_MAX_RESPONSE_BYTES`), and cancellation: `http_set_cancel_flag()` registers a flag (the agent's SIGINT flag) that a curl progress callback checks to abort the transfer. Each request uses a fresh curl handle. Has no retry logic — retries are the caller's (`agent.c`) responsibility.
 
 ### `tools.c` — Tool registry
 
@@ -116,6 +116,12 @@ Maintains a static array of `tool_definition` structs registered at startup. `to
 ### `sandbox.c` — Path validation
 
 Called by every tool that accesses the filesystem before any `open()`, `stat()`, or `exec`. Uses `realpath()` to resolve symlinks and `..` sequences, then checks that the resolved path has `sandbox_root` as a prefix. Naive string prefix checks are not used — `realpath()` is called first.
+
+A `..` that follows a component which does not exist yet is rejected: `realpath()` cannot resolve it, and once `write` creates the missing directories the kernel would follow it out of the sandbox. `write` also re-resolves the path after creating directories.
+
+### `fs.c` — Filesystem helpers
+
+`fs_mkdirp()`, `fs_write_atomic()` (temp file via `mkstemp`, `fsync`, then `rename`; or `link` when the target must not already exist) and `fs_boris_path()` for locations under `~/.boris`. Used by the write and memory tools, session persistence and the setup wizard.
 
 ### `conversation.c` — Message history
 

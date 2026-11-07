@@ -181,6 +181,8 @@ static void buf_ensure(struct editor_state *ed, size_t need)
 static void buf_insert(struct editor_state *ed, const char *bytes, size_t blen)
 {
 	buf_ensure(ed, ed->len + blen + 1);
+	if (ed->cap <= ed->len + blen)
+		return; /* out of memory */
 	memmove(ed->buf + ed->cursor + blen,
 		ed->buf + ed->cursor,
 		ed->len - ed->cursor);
@@ -221,6 +223,8 @@ static size_t next_char(struct editor_state *ed, size_t pos)
 static void set_buf_text(struct editor_state *ed, const char *text, size_t tlen)
 {
 	buf_ensure(ed, tlen + 1);
+	if (ed->cap <= tlen)
+		return; /* out of memory */
 	memcpy(ed->buf, text, tlen);
 	ed->buf[tlen] = '\0';
 	ed->len = tlen;
@@ -504,7 +508,7 @@ static enum editor_action process_raw(struct editor_state *ed)
 	/* Ctrl+L - Clear screen */
 	if (c == 0x0C) {
 		if (term_is_tty()) {
-			printf("\033[2J\033[H");
+			term_erase_screen();
 			g_prev_lines = 1;
 			g_prev_cursor_line = 0;
 			render_line(ed);
@@ -550,24 +554,35 @@ static enum editor_action process_fgets(struct editor_state *ed)
 	printf("%s", ed->prompt);
 	fflush(stdout);
 
-	char line[4096];
-	if (!fgets(line, sizeof(line), stdin))
+	/* getline: whole lines regardless of length, so long piped input is
+	 * not split into several messages */
+	char *line = NULL;
+	size_t line_cap = 0;
+	ssize_t got = getline(&line, &line_cap, stdin);
+	if (got < 0) {
+		free(line);
 		return ed->len == 0 ? EDITOR_EOF : EDITOR_DONE;
+	}
 
-	size_t len = strlen(line);
+	size_t len = (size_t)got;
 	while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
 		line[--len] = '\0';
 
-	if (len == 0)
+	if (len == 0) {
+		free(line);
 		return ed->len > 0 ? EDITOR_DONE : EDITOR_MORE;
+	}
 
 	buf_ensure(ed, ed->len + len + 2);
-	if (ed->len > 0)
-		ed->buf[ed->len++] = '\n';
-	memcpy(ed->buf + ed->len, line, len);
-	ed->len += len;
-	ed->buf[ed->len] = '\0';
-	ed->cursor = ed->len;
+	if (ed->cap > ed->len + len + 1) {
+		if (ed->len > 0)
+			ed->buf[ed->len++] = '\n';
+		memcpy(ed->buf + ed->len, line, len);
+		ed->len += len;
+		ed->buf[ed->len] = '\0';
+		ed->cursor = ed->len;
+	}
+	free(line);
 	return EDITOR_DONE;
 }
 
@@ -626,11 +641,6 @@ void editor_end(struct editor_state *ed)
 char *editor_get_text(struct editor_state *ed)
 {
 	return ed->buf ? strdup(ed->buf) : strdup("");
-}
-
-const char *editor_get_buffer(struct editor_state *ed)
-{
-	return ed->buf ? ed->buf : "";
 }
 
 void editor_set_completion(editor_completion_fn fn, void *ctx)

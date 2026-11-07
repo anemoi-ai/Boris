@@ -11,6 +11,7 @@
  */
 
 #include "arena.h"
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -25,11 +26,18 @@ static unsigned char *block_data_start(struct memory_block *block)
 	return (unsigned char *)(((size_t)raw_start + 15) & ~(size_t)15);
 }
 
-static struct memory_block *arena_create_block(struct memory_arena *arena)
+/*
+ * Allocate a block with a data area of at least min_data bytes. Normally
+ * this is arena->block_size; a single allocation larger than that gets a
+ * block sized to fit it.
+ */
+static struct memory_block *arena_create_block(struct memory_arena *arena,
+					       size_t min_data)
 {
 	struct memory_block *block;
 	size_t header_size;
 	size_t aligned_start;
+	size_t data_size;
 	size_t total_size;
 
 	/*
@@ -38,14 +46,17 @@ static struct memory_block *arena_create_block(struct memory_arena *arena)
 	 */
 	header_size = sizeof(struct memory_block);
 	aligned_start = ((header_size + 15) & ~(size_t)15);
-	total_size = aligned_start + arena->block_size;
+	data_size = min_data > arena->block_size ? min_data : arena->block_size;
+	if (data_size > SIZE_MAX - aligned_start)
+		return NULL;
+	total_size = aligned_start + data_size;
 
 	block = malloc(total_size);
 	if (!block)
 		return NULL;
 
 	block->next_block = NULL;
-	block->total_size = arena->block_size;
+	block->total_size = data_size;
 	block->used_bytes = 0;
 
 	return block;
@@ -66,7 +77,7 @@ struct memory_arena *arena_create(size_t block_size)
 	arena->first_block = NULL;
 	arena->current_block = NULL;
 
-	arena->first_block = arena_create_block(arena);
+	arena->first_block = arena_create_block(arena, block_size);
 	if (!arena->first_block) {
 		free(arena);
 		return NULL;
@@ -120,14 +131,14 @@ void arena_reset(struct memory_arena *arena)
 
 void *arena_allocate(struct memory_arena *arena, size_t bytes)
 {
+	if (!arena || bytes == 0 || bytes > SIZE_MAX - 15)
+		return NULL;
+
 	/* Round up to 16-byte alignment: (bytes + 15) & ~15 */
 	size_t aligned_bytes = (bytes + 15) & ~(size_t)15;
 
-	if (!arena || bytes == 0)
-		return NULL;
-
-	if (arena->current_block->used_bytes + aligned_bytes > arena->current_block->total_size) {
-		struct memory_block *new_block = arena_create_block(arena);
+	if (aligned_bytes > arena->current_block->total_size - arena->current_block->used_bytes) {
+		struct memory_block *new_block = arena_create_block(arena, aligned_bytes);
 		if (!new_block)
 			return NULL;
 

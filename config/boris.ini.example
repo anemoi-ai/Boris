@@ -1,6 +1,6 @@
 # Boris Configuration File
 #
-# Copy this file to boris.ini and adjust settings for your environment.
+# Copy this file to ~/.boris/config.ini and adjust it for your environment.
 # Settings can also be overridden via environment variables and CLI flags.
 
 [model]
@@ -8,8 +8,9 @@ endpoint = http://localhost:8080
 name = llama3
 api_key = your-api-key-here
 temperature = 0.7
-max_tokens = 4096
-context_window = 4096
+# context_window must match your model's context length; max_tokens well below it
+context_window = 32768
+max_tokens = 8192
 timeout_seconds = 120
 stream = true
 verify_ssl = true
@@ -19,6 +20,9 @@ max_iterations = 16
 max_retries = 2
 retry_backoff_ms = 1000
 text_tool_fallback = false
+# Nudge models that emit tool calls as text towards native tool_calls.
+# Set to false for models that can only produce text tool calls.
+native_tool_reminder = true
 
 [tools]
 enabled = read,write,list_dir,memory,run
@@ -26,14 +30,16 @@ sandbox_root = ~/.boris/sandbox
 memory_persist = true
 
 [behaviour]
+# Ask before each write / script run (needs an interactive terminal)
 confirm_writes = false
+confirm_run = false
 
 [logging]
 level = info
-format = text
 
 [output]
-json = false
+# Print each tool call and a short result preview (off with --quiet)
+show_tool_calls = true
 show_metrics = true
 
 [prompt]

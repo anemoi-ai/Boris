@@ -13,6 +13,7 @@
 
 #include "http_client.h"
 #include "mock_http.h"
+#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -20,6 +21,7 @@ struct mock_response {
 	char *body;
 	long status_code;
 	int is_error;
+	int raise_sigint;
 };
 
 static struct mock_response g_mock_responses[MOCK_HTTP_MAX_QUEUED];
@@ -40,6 +42,7 @@ void mock_http_queue_response(const char *json_body, long status_code)
 	g_mock_responses[g_mock_count].body = strdup(json_body ? json_body : "");
 	g_mock_responses[g_mock_count].status_code = status_code;
 	g_mock_responses[g_mock_count].is_error = 0;
+	g_mock_responses[g_mock_count].raise_sigint = 0;
 	g_mock_count++;
 }
 
@@ -50,6 +53,18 @@ void mock_http_queue_error(const char *error_msg)
 	g_mock_responses[g_mock_count].body = strdup(error_msg ? error_msg : "mock error");
 	g_mock_responses[g_mock_count].status_code = 0;
 	g_mock_responses[g_mock_count].is_error = 1;
+	g_mock_responses[g_mock_count].raise_sigint = 0;
+	g_mock_count++;
+}
+
+void mock_http_queue_interrupt(void)
+{
+	if (g_mock_count >= MOCK_HTTP_MAX_QUEUED)
+		return;
+	g_mock_responses[g_mock_count].body = strdup("interrupted");
+	g_mock_responses[g_mock_count].status_code = 0;
+	g_mock_responses[g_mock_count].is_error = 1;
+	g_mock_responses[g_mock_count].raise_sigint = 1;
 	g_mock_count++;
 }
 
@@ -64,7 +79,7 @@ void mock_http_reset(void)
 {
 	for (int i = 0; i < g_mock_count; i++)
 		free(g_mock_responses[i].body);
-	for (int i = 0; i < g_mock_request_count; i++)
+	for (int i = 0; i < g_mock_request_count && i < MOCK_HTTP_MAX_QUEUED; i++)
 		free(g_mock_request_bodies[i]);
 	g_mock_count = 0;
 	g_mock_index = 0;
@@ -93,6 +108,13 @@ int http_global_init(void)
 }
 void http_global_cleanup(void) {}
 
+static const volatile sig_atomic_t *g_cancel_flag = NULL;
+
+void http_set_cancel_flag(const volatile sig_atomic_t *flag)
+{
+	g_cancel_flag = flag;
+}
+
 struct http_response http_post(const char *url,
 			       const char *body,
 			       const char *content_type,
@@ -120,7 +142,11 @@ struct http_response http_post(const char *url,
 	}
 
 	struct mock_response *m = &g_mock_responses[g_mock_index++];
-	if (m->is_error) {
+	if (m->raise_sigint)
+		raise(SIGINT); /* simulate Ctrl+C while the request is in flight */
+	if (g_cancel_flag && *g_cancel_flag) {
+		resp.error = strdup("Request cancelled");
+	} else if (m->is_error) {
 		resp.error = strdup(m->body);
 	} else {
 		resp.body = strdup(m->body ? m->body : "");

@@ -54,22 +54,20 @@ So let's go through it.
 Open `agent.c` and look for `run_loop`. Inside the first thirty lines or so you will find this:
 
 ```c
-int iterations = 0;
-int total_prompt_tok = 0;
-int total_completion_tok = 0;
-int continuation_count = 0;
-
-int consecutive_tool_errors = 0;
-int consecutive_toolcall_turns = 0;
-int last_error_reminder_iter = -REMINDER_COOLDOWN_ITERS;
-int last_truncation_reminder_iter = -REMINDER_COOLDOWN_ITERS;
-int last_textfallback_reminder_iter = -REMINDER_COOLDOWN_ITERS;
-int last_repeat_reminder_iter = -REMINDER_COOLDOWN_ITERS;
-int last_drift_reminder_iter = -REMINDER_COOLDOWN_ITERS;
-uint64_t last_tool_fingerprint = 0;
+struct loop_state {
+	int iterations;
+	int prompt_tokens;
+	int completion_tokens;
+	int continuation_count;
+	int consecutive_tool_errors;
+	int consecutive_toolcall_turns;
+	uint64_t last_tool_fingerprint;
+	int last_reminder_iter[REMIND_COUNT];
+	char *last_response;
+};
 ```
 
-These are all the variables that change *across* iterations of the loop. There are about a dozen of them. Note where they live: locals in `run_loop`. There is no agent object. There is no global state. (There's one global, a `sig_atomic_t` flag for SIGINT, and I'll get to that.) The bookkeeping has the same lifetime as the call to `run_loop`. When the function returns, all of this evaporates and the only thing left is the conversation, which the caller owns.
+These are all the variables that change *across* iterations of the loop. There are about a dozen of them. Note where they live: one `struct loop_state` that is a local in `run_loop`. There is no agent object. There is no global state. (There's one global, a `sig_atomic_t` flag for SIGINT, and I'll get to that.) The bookkeeping has the same lifetime as the call to `run_loop`. When the function returns, all of this evaporates and the only thing left is the conversation, which the caller owns.
 
 This is on purpose, and it matters more than it looks.
 
@@ -87,7 +85,7 @@ Each of those counters also has a story. Let me give you the short version.
 
 `consecutive_toolcall_turns` counts how many turns in a row the model has only called tools, without producing a text response. Used to detect drift — an agent that's busy doing things but has stopped checking in.
 
-`last_X_reminder_iter` is the iteration each kind of reminder last fired on. We use `iterations - last_X >= REMINDER_COOLDOWN_ITERS` as a "is it OK to fire this again yet?" check. Five iterations of cooldown means we can't double-nudge the model. (This is one of those numbers that came from staring at logs. Three felt like nagging. Seven let the agent drift for too long. Five turned out right.)
+`last_reminder_iter[kind]` is the iteration each kind of reminder last fired on. `maybe_remind()` uses `iterations - last_reminder_iter[kind] >= REMINDER_COOLDOWN_ITERS` as a "is it OK to fire this again yet?" check. Five iterations of cooldown means we can't double-nudge the model. (This is one of those numbers that came from staring at logs. Three felt like nagging. Seven let the agent drift for too long. Five turned out right.)
 
 `last_tool_fingerprint` is a 64-bit hash of the previous turn's tool calls, used for detecting repeats. I'll come back to it in a moment because it's the most interesting one.
 
@@ -177,29 +175,30 @@ static struct llm_response *llm_complete_with_retry(
     const struct agent_configuration *cfg,
     char *err_out, size_t err_size)
 {
-    struct llm_response *resp = llm_complete(conv, tools, num_tools, cfg);
-    if (!resp) { ... }
-    if (!resp->error)
-        return resp;
-    ...
-    int transient = is_transient_error(resp);
-    llm_response_free(resp);
+    for (int attempt = 0;; attempt++) {
+        struct llm_response *resp = llm_complete(conv, tools, num_tools, cfg);
+        if (!resp) { ... }
+        if (!resp->error)
+            return resp;
 
-    if (!transient || cfg->max_retries <= 0)
-        return NULL;
+        bool retry = resp->err.recoverable && attempt < cfg->max_retries &&
+                     !g_interrupted;
+        ...
+        llm_response_free(resp);
+        if (!retry)
+            return NULL;
 
-    for (int i = 0; i < cfg->max_retries; i++) {
-        int backoff_ms = cfg->retry_backoff_ms * (1 << i);
+        int backoff_ms = cfg->retry_backoff_ms * (1 << attempt);
         ...
         sleep_ms(backoff_ms);
         ...
 ```
 
-Two things to notice. First, `is_transient_error` decides what's worth retrying. A 5xx, a timeout, a dropped connection: transient, retry. A 400, an auth failure, an OOM building the request: permanent, don't retry into a wall. The exact check is in the function and it's deliberately conservative — when in doubt, treat as permanent. A misbehaving retry loop hammers your provider; a missed retry annoys one user.
+Two things to notice. First, `resp->err.recoverable` decides what's worth retrying, and it is decided where the error is understood: `llm.c` sets it for each failure. A timeout, a dropped connection, a 429 or a 5xx: transient, retry. A 400, an auth failure, a missing endpoint, an OOM building the request: permanent, don't retry into a wall. A misbehaving retry loop hammers your provider; a missed retry annoys one user.
 
-Second, the backoff is exponential: `cfg->retry_backoff_ms * (1 << i)`. Default `retry_backoff_ms` is small, default `max_retries` is two, so the typical pattern is something like 500 ms, 1 s, give up. You can tune both. The `(1 << i)` is just `pow(2, i)` in integer form — `1`, `2`, `4`, `8`. (Real production systems add jitter so that a thousand clients all hitting the same rate limit don't all retry at the same instant and re-hit it together. Boris doesn't, because Boris is usually one client. If you're embedding it in a multi-tenant server, add jitter.)
+Second, the backoff is exponential: `cfg->retry_backoff_ms * (1 << attempt)`. Default `retry_backoff_ms` is 1000 and default `max_retries` is two, so the typical pattern is 1 s, 2 s, give up. You can tune both. The `(1 << attempt)` is just `pow(2, attempt)` in integer form — `1`, `2`, `4`, `8`. (Real production systems add jitter so that a thousand clients all hitting the same rate limit don't all retry at the same instant and re-hit it together. Boris doesn't, because Boris is usually one client. If you're embedding it in a multi-tenant server, add jitter.) `sleep_ms` resumes after unrelated signals (the REPL spinner fires `SIGALRM` every 80 ms) but returns early on Ctrl+C.
 
-By the time we get back to the loop body, one of three things has happened: we have a parsed response in hand, we have a permanent error and `resp` is `NULL`, or we caught a SIGINT during a retry sleep and `g_interrupted` is set. The loop body checks for the SIGINT first, then for `NULL`, then proceeds with `resp`.
+By the time we get back to the loop body, one of three things has happened: we have a parsed response in hand, we have a permanent error and `resp` is `NULL`, or the user pressed Ctrl+C (during the request, which aborts it, or during a retry sleep) and `g_interrupted` is set. The loop body checks for the SIGINT first, then for `NULL`, then proceeds with `resp`.
 
 This is one of the most important properties of a well-written C program. **Layers below you should make it safe to be naive at your level.** If `llm_complete_with_retry` left the conversation in a half-mutated state on failure, every caller would have to know about that and clean up. It doesn't — the conversation isn't touched until we know we have a clean response. So the loop body can be short, because it doesn't have to defend against problems that were already handled below it.
 
@@ -216,15 +215,15 @@ Except — and here's the first thing that surprised me — we don't return imme
 ```c
 if (strcmp(resp->finish_reason, LLM_FINISH_STOP) == 0 &&
     resp->tool_calls.count == 0) {
-    if (cfg->text_tool_fallback && resp->content) {
-        ...
-        int nc = parse_text_tool_calls(resp->content, &text_calls, scratch);
-        if (nc > 0) {
-            ...synthesize a fake tool_calls turn and continue the loop
-        }
+    if (cfg->text_tool_fallback && resp->content &&
+        try_text_tool_calls(conv, &st, resp, cfg, scratch)) {
+        /* parsed calls were recorded as a tool_calls turn and run */
+        llm_response_free(resp);
+        resp = NULL;
+        continue;
     }
-    append_assistant_turn(conv, resp);
-    result = make_result(FINISHED_NATURALLY, ...);
+    conversation_add_assistant_response(conv, resp);
+    result = make_result(&st, FINISHED_NATURALLY, resp->content);
     goto cleanup;
 }
 ```
@@ -235,7 +234,7 @@ If we accept that at face value, the agent ends prematurely and the user sees a 
 
 `parse_text_tool_calls` does two passes. First it looks for `<tool_call>...</tool_call>` XML tags. If that finds nothing, it looks for triple-backtick code fences whose content starts with `{`. The `{` check is what stops us from parsing every shell snippet the model writes as a tool call. (Ask me how I know.)
 
-If we find any, we synthesise a fake `llm_response` with the parsed calls and a `finish_reason` of `"tool_calls"`, append that to the conversation, and run the same dispatch path as Case 2 below. We also inject a reminder telling the model to prefer the native channel next time — which sometimes actually works, especially with the better-behaved local models.
+If we find any, we append an assistant turn carrying the parsed calls and run the same dispatch path as Case 2 below (`dispatch_tool_turn()`). After the results are appended — never between the call and its results, which OpenAI-compatible APIs reject — we also inject a reminder telling the model to prefer the native channel next time — which sometimes actually works, especially with the better-behaved local models.
 
 This whole branch is what makes Boris usable with llama.cpp and Ollama out of the box, instead of being an OpenAI-only toy. It's about thirty lines of code. It is, hands-down, the highest-leverage thirty lines in the file.
 
@@ -244,68 +243,62 @@ This whole branch is what makes Boris usable with llama.cpp and Ollama out of th
 But before we even get there, we compute the *turn fingerprint*:
 
 ```c
-uint64_t this_turn_fp = 0;
-for (size_t ti = 0; ti < resp->tool_calls.count; ti++)
-    this_turn_fp ^= tool_call_fingerprint(
-        &resp->tool_calls.calls[ti]);
-
-bool repeated_calls = (last_tool_fingerprint != 0 &&
-                       this_turn_fp == last_tool_fingerprint);
-last_tool_fingerprint = this_turn_fp;
+uint64_t fp = turn_fingerprint(calls);
+bool repeated = (st->last_tool_fingerprint == fp);
+st->last_tool_fingerprint = fp;
 ```
 
-`tool_call_fingerprint` hashes the tool name and arguments together using FNV-1a:
+`tool_call_fingerprint` hashes the tool name and arguments together using FNV-1a, with a separator byte so `"ab"+"c"` and `"a"+"bc"` differ:
 
 ```c
 static uint64_t tool_call_fingerprint(const struct tool_call *tc)
 {
-    uint64_t h = fnv1a_64(tc->name);
-    h ^= fnv1a_64(tc->argument_json);
-    h *= 0x100000001b3ULL;
-    return h;
+    uint64_t h = fnv1a_64(0xcbf29ce484222325ULL, tc->name);
+    h = fnv1a_64(h, "\x1f");
+    return fnv1a_64(h, tc->argument_json);
 }
 ```
 
-And the per-turn fingerprint is the XOR of all the per-call fingerprints. XOR is commutative, so the order doesn't matter — calling `[read("a.txt"), write("b.txt")]` and `[write("b.txt"), read("a.txt")]` produce the same turn fingerprint. That's the right semantic. We want to detect "the model did the same thing twice", and "same thing" doesn't depend on the order of independent tool calls within a turn.
+And the per-turn fingerprint is the *sum* of all the per-call fingerprints. Addition is commutative, so the order doesn't matter — calling `[read("a.txt"), write("b.txt")]` and `[write("b.txt"), read("a.txt")]` produce the same turn fingerprint. That's the right semantic. We want to detect "the model did the same thing twice", and "same thing" doesn't depend on the order of independent tool calls within a turn. (An earlier version used XOR, which is also commutative but cancels duplicates: two identical calls XOR to zero, and `A, B, B` fingerprints the same as `A` alone. A model stuck issuing the same call twice per turn was exactly the case it missed.)
 
 FNV-1a is the right choice for this because it's cheap, has decent avalanche, and produces a 64-bit hash with a tiny code footprint. We don't need cryptographic strength — a collision here means we suppress a single duplicate-call warning, which is harmless. The alternative would be a real string-equality check across every prior turn's tool calls, which is more code, more allocations, and not noticeably more correct.
 
-If `this_turn_fp == last_tool_fingerprint`, the model just made the same tool calls as last turn. After we dispatch and append the results, we'll inject a reminder. We'll get there.
+If the fingerprint matches the previous turn's, the model just made the same tool calls as last turn. After we dispatch and append the results, we'll inject a reminder. We'll get there.
 
-The actual dispatch is a `for` loop over the tool calls:
+The actual dispatch, in `dispatch_tool_turn()` (shared by the native and text-fallback paths), is a `for` loop over the tool calls:
 
 ```c
-for (size_t ti = 0; ti < resp->tool_calls.count; ti++) {
-    struct tool_call *tc = &resp->tool_calls.calls[ti];
+for (size_t i = 0; i < calls->count; i++) {
+    const struct tool_call *tc = &calls->calls[i];
     ...
-    struct tool_result result_tc = tools_dispatch(tc, cfg);
+    struct tool_result result = tools_dispatch(tc, cfg);
     metrics_record_tool_call();
 
-    consecutive_tool_errors = result_tc.is_error
-                              ? consecutive_tool_errors + 1
-                              : 0;
+    st->consecutive_tool_errors = result.is_error
+                                  ? st->consecutive_tool_errors + 1
+                                  : 0;
     ...
-    append_tool_result(conv, &result_tc);
-    tool_result_free(&result_tc);
+    conversation_add_tool_result(conv, result.tool_call_id,
+                                 result.tool_name, result.content);
+    tool_result_free(&result);
 }
 ```
 
 A successful tool call resets `consecutive_tool_errors` to zero. A failed one increments it. The counter is global to the *run*, not to a single turn — three errors across three turns trigger the reminder just as readily as three in one turn. That's deliberate; if the model is consistently misusing one tool, we want to nudge it regardless of pacing.
 
-After the loop, we increment `consecutive_toolcall_turns`, and then we decide whether to inject a reminder. Three independent checks:
+After the loop, we increment `consecutive_toolcall_turns`, reset `continuation_count` (a completed tool turn means the last cut-off was recovered from), and then we decide whether to inject a reminder. Three independent checks, each going through `maybe_remind()`, which handles the cooldown:
 
 ```c
-if (consecutive_tool_errors >= 3 && /* cooldown OK */) {
-    inject_reminder(conv, "3 consecutive tool calls have failed...");
-    last_error_reminder_iter = iterations;
-    consecutive_tool_errors = 0;
-} else if (repeated_calls && /* cooldown OK */) {
-    inject_reminder(conv, "You just issued the same tool call(s)...");
-    last_repeat_reminder_iter = iterations;
-} else if (consecutive_toolcall_turns >= DRIFT_STUCK_THRESHOLD && /* cooldown OK */) {
-    inject_reminder(conv, "You have been executing tools for several turns...");
-    last_drift_reminder_iter = iterations;
-    consecutive_toolcall_turns = 0;
+if (st->consecutive_tool_errors >= TOOL_ERROR_THRESHOLD &&
+    maybe_remind(conv, st, REMIND_TOOL_ERRORS)) {
+    st->consecutive_tool_errors = 0;
+} else if (repeated && maybe_remind(conv, st, REMIND_REPEATED_CALLS)) {
+    /* nothing else */
+} else if (st->consecutive_toolcall_turns >= DRIFT_STUCK_THRESHOLD &&
+           maybe_remind(conv, st, REMIND_DRIFT)) {
+    st->consecutive_toolcall_turns = 0;
+} else if (from_text) {
+    maybe_remind(conv, st, REMIND_TEXT_FALLBACK);
 }
 ```
 
@@ -325,16 +318,16 @@ From the outside they look identical. The only way to tell them apart is to esti
 ```c
 size_t estimated = conversation_estimate_tokens(conv);
 size_t target = (size_t)(cfg->context_window * 3 / 4);
-if (estimated > target && conv->count > 3) {
-    /* context window full — truncate and continue */
-    conversation_truncate(conv, target);
-    inject_reminder(conv, "The conversation was truncated...");
+if (estimated > target && conv->count > 3 &&
+    conversation_truncate(conv, target) > 0) {
+    /* context window full — truncated; tell the model and continue */
+    maybe_remind(conv, &st, REMIND_TRUNCATION);
     continue;
 }
 
 /* otherwise, max_tokens was hit — ask the model to continue */
-if (continuation_count < MAX_CONTINUATIONS) {
-    continuation_count++;
+if (st.continuation_count < MAX_CONTINUATIONS) {
+    st.continuation_count++;
     inject_reminder(conv,
                     "Your previous response was cut off by the "
                     "max_tokens limit. Continue from where you left off...");
@@ -355,10 +348,13 @@ There's also a fourth case the dispatch falls through to:
 ```c
 log_warning("agent: unexpected finish_reason '%s'", resp->finish_reason);
 if (resp->content && resp->content[0]) {
-    append_assistant_turn(conv, resp);
-    result = make_result(FINISHED_NATURALLY, ...);
-    goto cleanup;
+    conversation_add_assistant_response(conv, resp);
+    result = make_result(&st, FINISHED_NATURALLY, resp->content);
+} else {
+    result = make_error_result(&st, "unexpected finish_reason: %s",
+                               resp->finish_reason);
 }
+goto cleanup;
 ```
 
 If the API returns a `finish_reason` we don't know about (`content_filter`, `function_call`, or something we've never seen), and the model produced *some* text, treat it as a natural finish. Only error out if the unknown finish reason came with no content. This is a "be liberal in what you accept" choice that pays off every time you swap LLM providers and discover that, say, the gpt-OSS family has a few finish reasons of its own.

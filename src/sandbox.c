@@ -13,6 +13,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "sandbox.h"
+#include "fs.h"
 #include "logger.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -96,6 +97,9 @@ static int safe_realpath(const char *path, char *out, int *exists_out)
 			const char *component = work;
 			size_t comp_len = work_len;
 
+			if (strcmp(component, "..") == 0)
+				return -1;
+
 			if (suffix_len + 1 + comp_len + 1 > PATH_MAX)
 				break;
 			memmove(suffix + 1 + comp_len, suffix, suffix_len + 1);
@@ -121,6 +125,18 @@ static int safe_realpath(const char *path, char *out, int *exists_out)
 		if (comp_len == 1 && component[0] == '.') {
 			*last_sep = '\0';
 			continue;
+		}
+
+		/*
+		 * A ".." inside the non-existent tail cannot be resolved here:
+		 * once the missing directories are created (write's create_dirs)
+		 * the kernel would follow it, escaping any prefix check made on
+		 * the unresolved string. Reject it outright.
+		 */
+		if (comp_len == 2 && component[0] == '.' && component[1] == '.') {
+			log_warning("sandbox: '..' after non-existent component in '%s'",
+				    path);
+			return -1;
 		}
 
 		if (suffix_len + 1 + comp_len + 1 > PATH_MAX) {
@@ -224,7 +240,7 @@ int sandbox_resolve(const char *root, const char *path,
 				  root, strerror(errno));
 			return -1;
 		}
-		if (sandbox_mkdirp(root, 0755) != 0) {
+		if (fs_mkdirp(root, 0755) != 0) {
 			log_error("sandbox_resolve: cannot create sandbox root '%s'",
 				  root);
 			return -1;
@@ -333,51 +349,3 @@ int sandbox_resolve(const char *root, const char *path,
 	return 0;
 }
 
-int sandbox_mkdirp(const char *dir_path, mode_t mode)
-{
-	if (!dir_path || dir_path[0] == '\0')
-		return -1;
-
-	char work[PATH_MAX];
-	size_t len = strlen(dir_path);
-	if (len >= PATH_MAX)
-		return -1;
-	memcpy(work, dir_path, len + 1);
-
-	for (char *p = work + 1; *p; p++) {
-		if (*p == '/') {
-			*p = '\0';
-			if (mkdir(work, mode) != 0 && errno != EEXIST) {
-				log_warning("sandbox_mkdirp: mkdir('%s') failed: %s",
-					    work, strerror(errno));
-				return -1;
-			}
-			*p = '/';
-		}
-	}
-
-	if (mkdir(work, mode) != 0 && errno != EEXIST) {
-		log_warning("sandbox_mkdirp: mkdir('%s') failed: %s",
-			    work, strerror(errno));
-		return -1;
-	}
-
-	return 0;
-}
-
-int sandbox_contains(const char *root, const char *resolved_path)
-{
-	if (!root || !resolved_path)
-		return 0;
-
-	size_t root_len = strlen(root);
-	if (root_len == 0)
-		return 1;
-
-	if (strncmp(resolved_path, root, root_len) != 0)
-		return 0;
-	if (resolved_path[root_len] != '/')
-		return 0;
-
-	return 1;
-}

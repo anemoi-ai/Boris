@@ -248,6 +248,98 @@ static bool is_hrule(const char *line, size_t len)
 	return true;
 }
 
+
+/* An ANSI sequence when colour is on, nothing otherwise. Lets each block
+ * be written once for both modes. */
+#define SGR(code) (color ? (code) : "")
+
+/* Length of an ordered-list marker ("12. "), or 0 if line is not one. */
+static size_t ordered_marker_len(const char *line, size_t llen)
+{
+	size_t d = 0;
+	while (d < llen && isdigit((unsigned char)line[d]))
+		d++;
+	if (d > 0 && d + 1 < llen && line[d] == '.' && line[d + 1] == ' ')
+		return d + 2;
+	return 0;
+}
+
+/* Render one line of the document. *in_fence tracks fenced code blocks. */
+static void render_line(const char *line, size_t llen, bool *in_fence,
+			FILE *out, bool color)
+{
+	bool fence_line = llen >= 3 &&
+			  (strncmp(line, "```", 3) == 0 || strncmp(line, "~~~", 3) == 0);
+
+	/* ---- Fenced code block ---- */
+	if (fence_line) {
+		*in_fence = !*in_fence;
+		fprintf(out, "%s  %s%s\n", SGR(MD_FENCE), line, SGR(TERM_RESET));
+		return;
+	}
+	if (*in_fence) {
+		fprintf(out, "%s  %s%s\n", SGR(MD_CODE_FG), line, SGR(TERM_RESET));
+		return;
+	}
+
+	/* ---- Blank line ---- */
+	if (llen == 0) {
+		fputc('\n', out);
+		return;
+	}
+
+	/* ---- Heading ---- */
+	const char *htxt = NULL;
+	int hlevel = parse_heading(line, &htxt);
+	if (hlevel > 0) {
+		fprintf(out, "\n%s  ", SGR(hlevel <= 2 ? MD_H1 : MD_H3));
+		render_inline(htxt, strlen(htxt), out, color);
+		fprintf(out, "%s\n", SGR(TERM_RESET));
+		return;
+	}
+
+	/* ---- Horizontal rule ---- */
+	if (is_hrule(line, llen)) {
+		fprintf(out, "\n%s  ──────────────────────────────────────────%s\n\n",
+			SGR(MD_FENCE), SGR(TERM_RESET));
+		return;
+	}
+
+	/* ---- Blockquote ---- */
+	if (line[0] == '>' && (llen == 1 || line[1] == ' ')) {
+		const char *content = (llen > 2) ? line + 2 : "";
+		fprintf(out, "%s  │ ", SGR(MD_QUOTE));
+		render_inline(content, strlen(content), out, color);
+		fprintf(out, "%s\n", SGR(TERM_RESET));
+		return;
+	}
+
+	/* ---- Unordered list item ---- */
+	if ((line[0] == '-' || line[0] == '*' || line[0] == '+') &&
+	    llen > 1 && line[1] == ' ') {
+		fprintf(out, "  %s•%s ", SGR(TERM_BOLD), SGR(TERM_RESET));
+		render_inline(line + 2, llen - 2, out, color);
+		fputc('\n', out);
+		return;
+	}
+
+	/* ---- Ordered list item ---- */
+	size_t marker = ordered_marker_len(line, llen);
+	if (marker > 0) {
+		fprintf(out, "  %.*s ", (int)(marker - 1), line);
+		render_inline(line + marker, llen - marker, out, color);
+		fputc('\n', out);
+		return;
+	}
+
+	/* ---- Normal paragraph line ---- */
+	fputs("  ", out);
+	render_inline(line, llen, out, color);
+	fputc('\n', out);
+}
+
+#undef SGR
+
 /* -------------------------------------------------------------------------
  * markdown_render - main entry point
  * ---------------------------------------------------------------------- */
@@ -276,10 +368,10 @@ void markdown_render(const char *text, FILE *out)
 	buf[trimmed] = '\0';
 
 	bool in_fence = false;
-
-	char *line = buf;
-	while (line) {
+	char *next;
+	for (char *line = buf; line; line = next) {
 		char *nl = strchr(line, '\n');
+		next = nl ? nl + 1 : NULL;
 		if (nl)
 			*nl = '\0';
 
@@ -288,139 +380,7 @@ void markdown_render(const char *text, FILE *out)
 		if (llen > 0 && line[llen - 1] == '\r')
 			line[--llen] = '\0';
 
-		/* ---- Fenced code block ---- */
-		bool fence_line =
-			llen >= 3 &&
-			((line[0] == '`' && line[1] == '`' &&
-			  line[2] == '`') ||
-			 (line[0] == '~' && line[1] == '~' &&
-			  line[2] == '~'));
-
-		if (fence_line) {
-			in_fence = !in_fence;
-			if (color)
-				fprintf(out, "%s  %s%s\n", MD_FENCE,
-					line, TERM_RESET);
-			else
-				fprintf(out, "  %s\n", line);
-			line = nl ? nl + 1 : NULL;
-			continue;
-		}
-
-		if (in_fence) {
-			if (color)
-				fprintf(out, "%s  %s%s\n", MD_CODE_FG,
-					line, TERM_RESET);
-			else
-				fprintf(out, "  %s\n", line);
-			line = nl ? nl + 1 : NULL;
-			continue;
-		}
-
-		/* ---- Blank line ---- */
-		if (llen == 0) {
-			fputc('\n', out);
-			line = nl ? nl + 1 : NULL;
-			continue;
-		}
-
-		/* ---- Heading ---- */
-		const char *htxt = NULL;
-		int hlevel = parse_heading(line, &htxt);
-		if (hlevel > 0) {
-			const char *hfmt =
-				(hlevel <= 2) ? MD_H1 : MD_H3;
-			if (color) {
-				fprintf(out, "\n%s  ", hfmt);
-				render_inline(htxt, strlen(htxt), out,
-					      true);
-				fprintf(out, "%s\n", TERM_RESET);
-			} else {
-				fputs("\n  ", out);
-				render_inline(htxt, strlen(htxt), out,
-					      false);
-				fputc('\n', out);
-			}
-			line = nl ? nl + 1 : NULL;
-			continue;
-		}
-
-		/* ---- Horizontal rule ---- */
-		if (is_hrule(line, llen)) {
-			if (color)
-				fprintf(out,
-					"\n%s  ──────────────────────────────────────────%s\n\n",
-					MD_FENCE, TERM_RESET);
-			else
-				fputs("\n  ──────────────────────────────────────────\n\n",
-				      out);
-			line = nl ? nl + 1 : NULL;
-			continue;
-		}
-
-		/* ---- Blockquote ---- */
-		if (line[0] == '>' &&
-		    (llen == 1 || line[1] == ' ')) {
-			const char *content =
-				(llen > 2) ? line + 2 : "";
-			if (color) {
-				fprintf(out, "%s  │ ", MD_QUOTE);
-				render_inline(content, strlen(content),
-					      out, true);
-				fprintf(out, "%s\n", TERM_RESET);
-			} else {
-				fputs("  │ ", out);
-				render_inline(content, strlen(content),
-					      out, false);
-				fputc('\n', out);
-			}
-			line = nl ? nl + 1 : NULL;
-			continue;
-		}
-
-		/* ---- Unordered list item ---- */
-		if ((line[0] == '-' || line[0] == '*' ||
-		     line[0] == '+') &&
-		    llen > 1 && line[1] == ' ') {
-			const char *content = line + 2;
-			if (color) {
-				fprintf(out, "  %s•%s ", TERM_BOLD,
-					TERM_RESET);
-				render_inline(content, strlen(content),
-					      out, true);
-			} else {
-				fputs("  • ", out);
-				render_inline(content, strlen(content),
-					      out, false);
-			}
-			fputc('\n', out);
-			line = nl ? nl + 1 : NULL;
-			continue;
-		}
-
-		/* ---- Ordered list item ---- */
-		{
-			size_t d = 0;
-			while (d < llen &&
-			       isdigit((unsigned char)line[d]))
-				d++;
-			if (d > 0 && d + 1 < llen &&
-			    line[d] == '.' && line[d + 1] == ' ') {
-				fprintf(out, "  %.*s. ", (int)d, line);
-				render_inline(line + d + 2, llen - d - 2,
-					      out, color);
-				fputc('\n', out);
-				line = nl ? nl + 1 : NULL;
-				continue;
-			}
-		}
-
-		/* ---- Normal paragraph line ---- */
-		fputs("  ", out);
-		render_inline(line, llen, out, color);
-		fputc('\n', out);
-
-		line = nl ? nl + 1 : NULL;
+		render_line(line, llen, &in_fence, out, color);
 	}
 
 	free(buf);

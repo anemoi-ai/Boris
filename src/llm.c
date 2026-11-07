@@ -17,23 +17,13 @@
 #include "json.h"
 #include "logger.h"
 #include "cJSON.h"
+#include "metrics.h"
 #include <stdio.h>
 #include <stdarg.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-
-#include "metrics.h"
-#include "arena.h"
-
-/* Maximum size of accumulated streaming body before we stop appending */
-#define MAX_STREAM_BODY (4 * 1024 * 1024) /* 4 MB */
-
-/* Pre-allocated content buffer size; covers >99% of responses without realloc */
-#define STREAM_CONTENT_ARENA_SIZE (256 * 1024)
-
-/* Maximum number of parallel tool call slots in a streaming response */
-#define MAX_STREAM_TOOL_CALLS 16
 
 /* -------------------------------------------------------------------------
  * Thinking trace extraction
@@ -123,21 +113,50 @@ static struct llm_response *alloc_response(void)
 	return r;
 }
 
-static struct llm_response *error_response(const char *fmt, ...)
+/*
+ * Mark r as failed. recoverable tells the agent whether retrying the same
+ * request could succeed (timeouts, rate limits, server errors) or not
+ * (bad request, auth failure, malformed configuration).
+ */
+static void vset_error(struct llm_response *r, enum boris_error code,
+		       bool recoverable, const char *fmt, va_list ap)
+{
+	vsnprintf(r->err.msg_storage, sizeof(r->err.msg_storage), fmt, ap);
+	r->error = true;
+	r->err.msg = r->err.msg_storage;
+	r->err.code = code;
+	r->err.recoverable = recoverable;
+	log_error("llm: %s", r->err.msg);
+}
+
+static void set_error(struct llm_response *r, enum boris_error code,
+		      bool recoverable, const char *fmt, ...)
+{
+	va_list ap;
+	va_start(ap, fmt);
+	vset_error(r, code, recoverable, fmt, ap);
+	va_end(ap);
+}
+
+/* Allocate a response already marked as failed. NULL only on OOM. */
+static struct llm_response *error_response(enum boris_error code,
+					   bool recoverable,
+					   const char *fmt, ...)
 {
 	struct llm_response *r = alloc_response();
 	if (!r)
 		return NULL;
-	r->error = true;
 	va_list ap;
 	va_start(ap, fmt);
-	vsnprintf(r->err.msg_storage, sizeof(r->err.msg_storage), fmt, ap);
+	vset_error(r, code, recoverable, fmt, ap);
 	va_end(ap);
-	r->err.msg = r->err.msg_storage;
-	r->err.code = BORIS_ERROR_LLM;
-	r->err.recoverable = true;
-	log_error("llm: %s", r->err.msg);
 	return r;
+}
+
+/* HTTP statuses worth retrying: timeout, too early, rate limit, server side. */
+static bool http_status_is_transient(long status)
+{
+	return status == 408 || status == 425 || status == 429 || status >= 500;
 }
 
 /* -------------------------------------------------------------------------
@@ -149,35 +168,26 @@ static struct llm_response *error_response(const char *fmt, ...)
 static struct cJSON *tool_to_json(const struct tool_definition *t)
 {
 	struct cJSON *obj = cJSON_CreateObject();
-	if (!obj)
-		return NULL;
-
-	cJSON_AddStringToObject(obj, "type", "function");
-
 	struct cJSON *fn = cJSON_CreateObject();
-	if (!fn) {
+	if (!obj || !fn) {
 		cJSON_Delete(obj);
+		cJSON_Delete(fn);
 		return NULL;
 	}
 
+	cJSON_AddStringToObject(obj, "type", "function");
 	cJSON_AddStringToObject(fn, "name", t->name);
 	cJSON_AddStringToObject(fn, "description", t->description);
 
-	if (t->parameters_schema && t->parameters_schema[0]) {
-		struct cJSON *params = json_parse(t->parameters_schema);
-		if (params) {
-			cJSON_AddItemToObject(fn, "parameters", params);
-		} else {
-			/* Provide a minimal valid schema as fallback */
-			struct cJSON *fallback = cJSON_CreateObject();
-			cJSON_AddStringToObject(fallback, "type", "object");
-			cJSON_AddItemToObject(fn, "parameters", fallback);
-		}
-	} else {
-		struct cJSON *empty = cJSON_CreateObject();
-		cJSON_AddStringToObject(empty, "type", "object");
-		cJSON_AddItemToObject(fn, "parameters", empty);
+	struct cJSON *params = NULL;
+	if (t->parameters_schema && t->parameters_schema[0])
+		params = json_parse(t->parameters_schema);
+	if (!params) {
+		/* Missing or unparsable schema: minimal valid fallback */
+		params = cJSON_CreateObject();
+		cJSON_AddStringToObject(params, "type", "object");
 	}
+	cJSON_AddItemToObject(fn, "parameters", params);
 
 	cJSON_AddItemToObject(obj, "function", fn);
 	return obj;
@@ -239,9 +249,14 @@ static char *build_request_body(const struct conversation_history *conv,
 	cJSON_AddNumberToObject(root, "temperature", (double)cfg->temperature);
 	cJSON_AddNumberToObject(root, "max_tokens", cfg->max_tokens);
 
-	/* stream */
-	cJSON_AddBoolToObject(root, "stream",
-			      cfg->stream_responses ? cJSON_True : cJSON_False);
+	/* stream. (cJSON_AddBoolToObject takes a C boolean; cJSON_True and
+	 * cJSON_False are type tags, both non-zero, which made this always true.)
+	 * Streams carry no usage unless asked for it. */
+	cJSON_AddBoolToObject(root, "stream", cfg->stream_responses);
+	if (cfg->stream_responses) {
+		struct cJSON *opts = cJSON_AddObjectToObject(root, "stream_options");
+		cJSON_AddBoolToObject(opts, "include_usage", 1);
+	}
 
 	char *body = cJSON_PrintUnformatted(root);
 	cJSON_Delete(root);
@@ -276,6 +291,7 @@ static void build_endpoint_url(char *out, size_t out_size,
 	}
 }
 
+
 /* -------------------------------------------------------------------------
  * Tool call accumulator (for streaming)
  *
@@ -294,14 +310,9 @@ struct stream_tool_slot {
 };
 
 struct stream_tool_accum {
-	struct stream_tool_slot slots[MAX_STREAM_TOOL_CALLS];
+	struct stream_tool_slot slots[TOOL_CALL_LIST_MAX];
 	int count;
 };
-
-static void stream_accum_init(struct stream_tool_accum *a)
-{
-	memset(a, 0, sizeof(*a));
-}
 
 static void stream_accum_free(struct stream_tool_accum *a)
 {
@@ -319,13 +330,16 @@ static struct stream_tool_slot *stream_accum_slot(struct stream_tool_accum *a,
 		if (a->slots[i].index == index)
 			return &a->slots[i];
 	}
-	if (a->count >= MAX_STREAM_TOOL_CALLS)
+	if (a->count >= TOOL_CALL_LIST_MAX)
 		return NULL;
-	struct stream_tool_slot *s = &a->slots[a->count++];
+	struct stream_tool_slot *s = &a->slots[a->count];
 	memset(s, 0, sizeof(*s));
-	s->index = index;
 	s->args_cap = 256;
 	s->args = calloc(1, s->args_cap);
+	if (!s->args)
+		return NULL;
+	s->index = index;
+	a->count++;
 	return s;
 }
 
@@ -366,14 +380,13 @@ static struct tool_call_list stream_accum_to_list(
 
 	for (int i = 0; i < a->count; i++) {
 		const struct stream_tool_slot *s = &a->slots[i];
-		struct tool_call *tc = &list.calls[i];
+		struct tool_call *tc = &list.calls[list.count];
 
 		snprintf(tc->id, sizeof(tc->id), "%s", s->id);
 		snprintf(tc->name, sizeof(tc->name), "%s", s->name);
-		tc->argument_json = s->args && s->args[0]
-					    ? strdup(s->args)
-					    : strdup("{}");
-		list.count++;
+		tc->argument_json = strdup(s->args[0] ? s->args : "{}");
+		if (tc->argument_json)
+			list.count++;
 	}
 
 	return list;
@@ -383,61 +396,35 @@ static struct tool_call_list stream_accum_to_list(
  * Non-streaming response parser
  * ---------------------------------------------------------------------- */
 
-static int parse_tool_calls_array(const struct cJSON *tc_arr,
-				  struct tool_call_list *list)
+static void parse_tool_calls_array(const struct cJSON *tc_arr,
+				   struct tool_call_list *list)
 {
-	if (!tc_arr || !cJSON_IsArray(tc_arr))
-		return 0;
-
 	int n = cJSON_GetArraySize(tc_arr);
 	if (n <= 0)
-		return 0;
+		return;
+	if (n > TOOL_CALL_LIST_MAX)
+		n = TOOL_CALL_LIST_MAX;
 
 	list->calls = calloc((size_t)n, sizeof(struct tool_call));
 	if (!list->calls)
-		return 0;
+		return;
 
-	int parsed = 0;
 	struct cJSON *item = NULL;
 	cJSON_ArrayForEach(item, tc_arr)
 	{
-		if (parsed >= TOOL_CALL_LIST_MAX)
+		if (list->count >= (size_t)n)
 			break;
-
-		struct tool_call *tc = &list->calls[parsed];
-
-		const char *id = json_get_str(item, "id");
-		snprintf(tc->id, sizeof(tc->id), "%s", id ? id : "");
-
-		struct cJSON *fn = cJSON_GetObjectItemCaseSensitive(
-			item, "function");
-		if (fn) {
-			const char *fname = json_get_str(fn, "name");
-			snprintf(tc->name, sizeof(tc->name), "%s",
-				 fname ? fname : "");
-
-			const char *fargs = json_get_str(fn, "arguments");
-			tc->argument_json = strdup(fargs ? fargs : "{}");
-		} else {
-			tc->argument_json = strdup("{}");
-		}
-
-		parsed++;
+		if (tool_call_from_json(item, &list->calls[list->count]) == 0)
+			list->count++;
 	}
-
-	list->count = (size_t)parsed;
-	return parsed;
 }
 
 static void parse_non_streaming(struct llm_response *r, const char *body)
 {
 	struct cJSON *root = json_parse(body);
 	if (!root) {
-		r->error = true;
-		snprintf(r->err.msg_storage, sizeof(r->err.msg_storage),
-			 "failed to parse response JSON");
-		r->err.msg = r->err.msg_storage;
-		r->err.code = BORIS_ERROR_PARSE;
+		set_error(r, BORIS_ERROR_PARSE, false,
+			  "failed to parse response JSON");
 		return;
 	}
 
@@ -445,35 +432,20 @@ static void parse_non_streaming(struct llm_response *r, const char *body)
 	struct cJSON *err_obj = cJSON_GetObjectItemCaseSensitive(root, "error");
 	if (err_obj && cJSON_IsObject(err_obj)) {
 		const char *emsg = json_get_str(err_obj, "message");
-		r->error = true;
-		snprintf(r->err.msg_storage, sizeof(r->err.msg_storage),
-			 "API error: %s", emsg ? emsg : "(no message)");
-		r->err.msg = r->err.msg_storage;
-		r->err.code = BORIS_ERROR_LLM;
+		set_error(r, BORIS_ERROR_LLM, false, "API error: %s",
+			  emsg ? emsg : "(no message)");
 		cJSON_Delete(root);
 		return;
 	}
 
 	/* choices[0].message */
 	struct cJSON *choices = cJSON_GetObjectItemCaseSensitive(root, "choices");
-	if (!choices || !cJSON_IsArray(choices) ||
-	    cJSON_GetArraySize(choices) == 0) {
-		r->error = true;
-		snprintf(r->err.msg_storage, sizeof(r->err.msg_storage),
-			 "response missing 'choices' array");
-		r->err.msg = r->err.msg_storage;
-		r->err.code = BORIS_ERROR_PARSE;
-		cJSON_Delete(root);
-		return;
-	}
-
-	struct cJSON *choice = cJSON_GetArrayItem(choices, 0);
+	struct cJSON *choice = cJSON_IsArray(choices)
+				       ? cJSON_GetArrayItem(choices, 0)
+				       : NULL;
 	if (!choice) {
-		r->error = true;
-		snprintf(r->err.msg_storage, sizeof(r->err.msg_storage),
-			 "choices[0] is null");
-		r->err.msg = r->err.msg_storage;
-		r->err.code = BORIS_ERROR_PARSE;
+		set_error(r, BORIS_ERROR_PARSE, false,
+			  "response missing 'choices' array");
 		cJSON_Delete(root);
 		return;
 	}
@@ -487,30 +459,25 @@ static void parse_non_streaming(struct llm_response *r, const char *body)
 								 "message");
 	if (message) {
 		/* content - strip thinking traces before storing */
-		struct cJSON *content_item = cJSON_GetObjectItemCaseSensitive(
-			message, "content");
-		if (content_item && !cJSON_IsNull(content_item)) {
-			const char *cstr = cJSON_GetStringValue(content_item);
-			if (cstr) {
-				/* Some llama.cpp builds expose thinking separately */
-				struct cJSON *rc = cJSON_GetObjectItemCaseSensitive(
-					message, "reasoning_content");
-				if (rc && cJSON_IsString(rc) && rc->valuestring[0]) {
-					r->thinking = strdup(rc->valuestring);
-					r->content = strdup(cstr);
-				} else {
-					r->content = strip_thinking(cstr, &r->thinking);
-				}
-				if (r->thinking)
-					log_debug("llm: thinking trace: %.120s...",
-						  r->thinking);
+		const char *cstr = json_get_str(message, "content");
+		if (cstr) {
+			/* Some llama.cpp builds expose thinking separately */
+			const char *rc = json_get_str(message, "reasoning_content");
+			if (rc && rc[0]) {
+				r->thinking = strdup(rc);
+				r->content = strdup(cstr);
+			} else {
+				r->content = strip_thinking(cstr, &r->thinking);
 			}
+			if (r->thinking)
+				log_debug("llm: thinking trace: %.120s...",
+					  r->thinking);
 		}
 
 		/* tool_calls */
 		struct cJSON *tc_arr = cJSON_GetObjectItemCaseSensitive(
 			message, "tool_calls");
-		if (tc_arr && cJSON_IsArray(tc_arr)) {
+		if (cJSON_IsArray(tc_arr)) {
 			parse_tool_calls_array(tc_arr, &r->tool_calls);
 			normalise_finish_reason(r);
 		}
@@ -531,87 +498,27 @@ static void parse_non_streaming(struct llm_response *r, const char *body)
  * ---------------------------------------------------------------------- */
 
 struct stream_state {
-	struct memory_arena *arena;
-	char *content;
+	char *content; /* heap, NUL-terminated; NULL until the first delta */
 	size_t content_len;
 	size_t content_cap;
-	int content_heap; /* 1 when content has spilled from arena to a malloc buffer */
 	struct stream_tool_accum tc_accum;
 	char finish_reason[32];
+	char error[256]; /* set if the stream carried an "error" object */
 	int prompt_tokens;
 	int completion_tokens;
 };
-
-static void stream_state_init(struct stream_state *ss)
-{
-	memset(ss, 0, sizeof(*ss));
-
-	ss->arena = arena_create(STREAM_CONTENT_ARENA_SIZE);
-	if (ss->arena) {
-		ss->content = arena_allocate_zeroed(ss->arena, STREAM_CONTENT_ARENA_SIZE);
-		if (ss->content) {
-			ss->content_cap = STREAM_CONTENT_ARENA_SIZE;
-		} else {
-			arena_destroy(ss->arena);
-			ss->arena = NULL;
-		}
-	}
-
-	if (!ss->content) {
-		ss->content_cap = 4096;
-		ss->content = calloc(1, ss->content_cap);
-	}
-
-	snprintf(ss->finish_reason, sizeof(ss->finish_reason), LLM_FINISH_STOP);
-	stream_accum_init(&ss->tc_accum);
-}
-
-static void stream_state_free(struct stream_state *ss)
-{
-	/* Free content: heap if it spilled from arena, or if there was no arena */
-	if (ss->content_heap || !ss->arena)
-		free(ss->content);
-	if (ss->arena) {
-		arena_destroy(ss->arena);
-		ss->arena = NULL;
-	}
-	/* Slot args are always heap-allocated, stream_accum_free handles them */
-	stream_accum_free(&ss->tc_accum);
-}
 
 static void stream_content_append(struct stream_state *ss, const char *delta)
 {
 	if (!delta || !*delta)
 		return;
 	size_t dlen = strlen(delta);
+	size_t need = ss->content_len + dlen + 1;
 
-	if (ss->content_len + dlen + 1 <= ss->content_cap) {
-		/* Fast path: fits in the pre-allocated buffer */
-		memcpy(ss->content + ss->content_len, delta, dlen);
-		ss->content_len += dlen;
-		ss->content[ss->content_len] = '\0';
-		return;
-	}
-
-	/* Slow path: overflow. Compute new capacity. */
-	size_t new_cap = ss->content_cap * 2;
-	while (new_cap < ss->content_len + dlen + 1)
-		new_cap *= 2;
-	if (new_cap > (size_t)MAX_STREAM_BODY)
-		new_cap = MAX_STREAM_BODY;
-
-	if (ss->arena && !ss->content_heap) {
-		/* Content was arena-allocated; transition to a heap buffer */
-		char *new_buf = malloc(new_cap);
-		if (!new_buf)
-			return;
-		memcpy(new_buf, ss->content, ss->content_len);
-		new_buf[ss->content_len] = '\0';
-		ss->content = new_buf;
-		ss->content_cap = new_cap;
-		ss->content_heap = 1;
-	} else {
-		/* No arena, or already spilled to heap: realloc as before */
+	if (need > ss->content_cap) {
+		size_t new_cap = ss->content_cap ? ss->content_cap : 4096;
+		while (new_cap < need)
+			new_cap *= 2;
 		char *tmp = realloc(ss->content, new_cap);
 		if (!tmp)
 			return;
@@ -619,44 +526,57 @@ static void stream_content_append(struct stream_state *ss, const char *delta)
 		ss->content_cap = new_cap;
 	}
 
-	memcpy(ss->content + ss->content_len, delta, dlen);
+	memcpy(ss->content + ss->content_len, delta, dlen + 1);
 	ss->content_len += dlen;
-	ss->content[ss->content_len] = '\0';
 }
 
-static int process_sse_data_line(struct stream_state *ss, const char *data)
+/*
+ * Handle the payload of one "data:" line (not NUL-terminated; len bytes).
+ * Returns 1 when the stream signals [DONE], otherwise 0.
+ */
+static int process_sse_data(struct stream_state *ss, const char *data, size_t len)
 {
-	/* Skip leading whitespace */
-	while (*data == ' ' || *data == '\t')
+	while (len > 0 && (*data == ' ' || *data == '\t')) {
 		data++;
+		len--;
+	}
+	if (len == 0)
+		return 0;
 
-	if (strcmp(data, "[DONE]") == 0)
+	if (len == 6 && memcmp(data, "[DONE]", 6) == 0)
 		return 1;
 
-	struct cJSON *chunk = json_parse(data);
+	struct cJSON *chunk = json_parse_with_len(data, len);
 	if (!chunk) {
-		log_debug("llm: stream: failed to parse chunk JSON (len=%zu)",
-			  strlen(data));
+		log_debug("llm: stream: failed to parse chunk JSON (len=%zu)", len);
 		return 0;
 	}
 
-	struct cJSON *choices = cJSON_GetObjectItemCaseSensitive(chunk,
-								 "choices");
-	if (!choices || !cJSON_IsArray(choices) ||
-	    cJSON_GetArraySize(choices) == 0) {
-		cJSON_Delete(chunk);
-		return 0;
+	struct cJSON *err_obj = cJSON_GetObjectItemCaseSensitive(chunk, "error");
+	if (cJSON_IsObject(err_obj)) {
+		const char *emsg = json_get_str(err_obj, "message");
+		snprintf(ss->error, sizeof(ss->error), "%s",
+			 emsg ? emsg : "(no message)");
 	}
 
-	struct cJSON *choice = cJSON_GetArrayItem(choices, 0);
+	/* Optional: usage, usually in the final chunk */
+	struct cJSON *usage = cJSON_GetObjectItemCaseSensitive(chunk, "usage");
+	if (cJSON_IsObject(usage)) {
+		ss->prompt_tokens = json_get_int(usage, "prompt_tokens", 0);
+		ss->completion_tokens = json_get_int(usage, "completion_tokens", 0);
+	}
+
+	struct cJSON *choices = cJSON_GetObjectItemCaseSensitive(chunk, "choices");
+	struct cJSON *choice = cJSON_IsArray(choices)
+				       ? cJSON_GetArrayItem(choices, 0)
+				       : NULL;
 	if (!choice) {
 		cJSON_Delete(chunk);
 		return 0;
 	}
 
-	/* finish_reason */
 	const char *fr = json_get_str(choice, "finish_reason");
-	if (fr && fr[0] && strcmp(fr, "null") != 0)
+	if (fr && fr[0])
 		snprintf(ss->finish_reason, sizeof(ss->finish_reason), "%s", fr);
 
 	struct cJSON *delta = cJSON_GetObjectItemCaseSensitive(choice, "delta");
@@ -665,51 +585,30 @@ static int process_sse_data_line(struct stream_state *ss, const char *data)
 		return 0;
 	}
 
-	/* Content delta */
-	struct cJSON *content_item = cJSON_GetObjectItemCaseSensitive(
-		delta, "content");
-	if (content_item && !cJSON_IsNull(content_item)) {
-		const char *cstr = cJSON_GetStringValue(content_item);
-		if (cstr)
-			stream_content_append(ss, cstr);
-	}
+	stream_content_append(ss, json_get_str(delta, "content"));
 
 	/* Tool call deltas */
 	struct cJSON *tc_arr = cJSON_GetObjectItemCaseSensitive(delta,
 								"tool_calls");
-	if (tc_arr && cJSON_IsArray(tc_arr)) {
-		struct cJSON *tc_item = NULL;
-		cJSON_ArrayForEach(tc_item, tc_arr)
-		{
-			int index = json_get_int(tc_item, "index", 0);
-			struct stream_tool_slot *slot =
-				stream_accum_slot(&ss->tc_accum, index);
-			if (!slot)
-				continue;
+	struct cJSON *tc_item = NULL;
+	cJSON_ArrayForEach(tc_item, tc_arr)
+	{
+		int index = json_get_int(tc_item, "index", 0);
+		struct stream_tool_slot *slot =
+			stream_accum_slot(&ss->tc_accum, index);
+		if (!slot)
+			continue;
 
-			const char *id = json_get_str(tc_item, "id");
-			if (id && id[0] && !slot->id[0])
-				snprintf(slot->id, sizeof(slot->id), "%s", id);
+		const char *id = json_get_str(tc_item, "id");
+		if (id && id[0] && !slot->id[0])
+			snprintf(slot->id, sizeof(slot->id), "%s", id);
 
-			struct cJSON *fn = cJSON_GetObjectItemCaseSensitive(
-				tc_item, "function");
-			if (fn) {
-				const char *fname = json_get_str(fn, "name");
-				if (fname && fname[0] && !slot->name[0])
-					snprintf(slot->name,
-						 sizeof(slot->name), "%s", fname);
-				const char *fargs = json_get_str(fn, "arguments");
-				if (fargs)
-					stream_slot_append_args(slot, fargs);
-			}
-		}
-	}
-
-	/* Optional: usage in the final chunk */
-	struct cJSON *usage = cJSON_GetObjectItemCaseSensitive(chunk, "usage");
-	if (usage) {
-		ss->prompt_tokens = json_get_int(usage, "prompt_tokens", 0);
-		ss->completion_tokens = json_get_int(usage, "completion_tokens", 0);
+		struct cJSON *fn = cJSON_GetObjectItemCaseSensitive(
+			tc_item, "function");
+		const char *fname = json_get_str(fn, "name");
+		if (fname && fname[0] && !slot->name[0])
+			snprintf(slot->name, sizeof(slot->name), "%s", fname);
+		stream_slot_append_args(slot, json_get_str(fn, "arguments"));
 	}
 
 	cJSON_Delete(chunk);
@@ -719,60 +618,63 @@ static int process_sse_data_line(struct stream_state *ss, const char *data)
 static void parse_streaming(struct llm_response *r, const char *body)
 {
 	struct stream_state ss;
-	stream_state_init(&ss);
+	memset(&ss, 0, sizeof(ss));
+	snprintf(ss.finish_reason, sizeof(ss.finish_reason), LLM_FINISH_STOP);
 
+	/* Walk lines in place: no copying, so no line-length limit. */
 	const char *p = body;
-	char line[8192];
 	int done = 0;
-
 	while (*p && !done) {
-		const char *end = p;
-		while (*end && *end != '\n')
-			end++;
+		const char *end = strchr(p, '\n');
+		if (!end)
+			end = p + strlen(p);
 
 		size_t llen = (size_t)(end - p);
-
-		/* Strip trailing '\r' */
-		while (llen > 0 && (p[llen - 1] == '\r'))
+		while (llen > 0 && p[llen - 1] == '\r')
 			llen--;
 
-		if (llen == 0) {
-			p = (*end == '\n') ? end + 1 : end;
-			continue;
-		}
-
-		if (llen >= sizeof(line))
-			llen = sizeof(line) - 1;
-		memcpy(line, p, llen);
-		line[llen] = '\0';
+		/* Only "data:" lines matter; comments (":") and other SSE
+		 * fields ("event:", "id:") are ignored. */
+		if (llen >= 5 && memcmp(p, "data:", 5) == 0)
+			done = process_sse_data(&ss, p + 5, llen - 5);
 
 		p = (*end == '\n') ? end + 1 : end;
-
-		/* Skip SSE comment lines */
-		if (line[0] == ':')
-			continue;
-
-		/* Process "data: ..." lines */
-		if (strncmp(line, "data:", 5) == 0)
-			done = process_sse_data_line(&ss, line + 5);
 	}
 
-	/* Assemble the llm_response from accumulated state */
-	if (ss.content && ss.content_len > 0) {
-		r->content = strip_thinking(ss.content, &r->thinking);
-		if (r->thinking)
-			log_debug("llm: thinking trace: %.120s...", r->thinking);
-	}
+	if (ss.error[0]) {
+		set_error(r, BORIS_ERROR_LLM, false, "API error: %s", ss.error);
+	} else {
+		/* Assemble the llm_response from accumulated state */
+		if (ss.content_len > 0) {
+			r->content = strip_thinking(ss.content, &r->thinking);
+			if (r->thinking)
+				log_debug("llm: thinking trace: %.120s...", r->thinking);
+		}
 
-	r->tool_calls = stream_accum_to_list(&ss.tc_accum);
+		r->tool_calls = stream_accum_to_list(&ss.tc_accum);
+		snprintf(r->finish_reason, sizeof(r->finish_reason), "%s",
+			 ss.finish_reason);
+		normalise_finish_reason(r);
+	}
 	r->prompt_tokens = ss.prompt_tokens;
 	r->completion_tokens = ss.completion_tokens;
-	snprintf(r->finish_reason, sizeof(r->finish_reason), "%s",
-		 ss.finish_reason);
 
-	normalise_finish_reason(r);
+	free(ss.content);
+	stream_accum_free(&ss.tc_accum);
+}
 
-	stream_state_free(&ss);
+/*
+ * A body is SSE if its first non-blank line is an SSE field. Detection is
+ * by content, not by cfg->stream_responses, because servers that do not
+ * support streaming ignore the flag and reply with plain JSON.
+ */
+static bool body_is_sse(const char *body)
+{
+	while (*body == ' ' || *body == '\t' || *body == '\r' || *body == '\n')
+		body++;
+	return strncmp(body, "data:", 5) == 0 ||
+	       strncmp(body, "event:", 6) == 0 ||
+	       body[0] == ':';
 }
 
 /* -------------------------------------------------------------------------
@@ -785,10 +687,12 @@ struct llm_response *llm_complete(const struct conversation_history *conv,
 				  const struct agent_configuration *config)
 {
 	if (!conv || !config)
-		return error_response("llm_complete: NULL argument");
+		return error_response(BORIS_ERROR_BAD_ARGUMENT, false,
+				      "llm_complete: NULL argument");
 
 	if (!config->model_endpoint)
-		return error_response("No model endpoint configured. "
+		return error_response(BORIS_ERROR_CONFIG, false,
+				      "No model endpoint configured. "
 				      "Run 'boris init' to set up.");
 
 	log_info("Sending request to %s (model: %s)",
@@ -798,7 +702,8 @@ struct llm_response *llm_complete(const struct conversation_history *conv,
 	/* Build request body */
 	char *body = build_request_body(conv, tools, num_tools, config);
 	if (!body)
-		return error_response("Out of memory building request");
+		return error_response(BORIS_ERROR_OUT_OF_MEMORY, false,
+				      "Out of memory building request");
 
 	/* Build URL */
 	char url[640];
@@ -820,63 +725,42 @@ struct llm_response *llm_complete(const struct conversation_history *conv,
 			    (t_end.tv_nsec - t_start.tv_nsec) / 1000000.0;
 	free(body);
 
+	struct llm_response *r = NULL;
+
 	if (http_resp.error) {
-		metrics_record_request(latency_ms, 0, 0, true);
-		struct llm_response *r = error_response("HTTP error: %s",
-							http_resp.error);
-		http_response_free(&http_resp);
-		return r;
-	}
-
-	log_debug("llm: HTTP %ld, body %zu bytes",
-		  http_resp.status_code, http_resp.body_length);
-
-	if (http_resp.status_code < 200 || http_resp.status_code >= 300) {
+		/* Transport failure: timeout, connection refused, DNS... */
+		r = error_response(BORIS_ERROR_HTTP, true, "HTTP error: %s",
+				   http_resp.error);
+	} else if (http_resp.status_code < 200 || http_resp.status_code >= 300) {
 		/* Extract error message from body if possible */
 		char detail[256] = "";
-		if (http_resp.body && http_resp.body_length > 0) {
-			struct cJSON *err = json_parse(http_resp.body);
-			if (err) {
-				struct cJSON *eo = cJSON_GetObjectItemCaseSensitive(
-					err, "error");
-				if (eo) {
-					const char *em = json_get_str(eo,
-								      "message");
-					if (em)
-						snprintf(detail, sizeof(detail),
-							 ": %s", em);
-				}
-				cJSON_Delete(err);
-			}
-		}
-		struct llm_response *r = error_response("HTTP %ld%s",
-							http_resp.status_code, detail);
-		http_response_free(&http_resp);
-		return r;
-	}
-
-	if (!http_resp.body || http_resp.body_length == 0) {
-		http_response_free(&http_resp);
-		return error_response("Empty response from model");
-	}
-
-	/* Allocate result */
-	struct llm_response *r = alloc_response();
-	if (!r) {
-		http_response_free(&http_resp);
-		return NULL;
-	}
-
-	/* Parse - auto-detect SSE vs JSON format */
-	if (config->stream_responses ||
-	    (http_resp.body && http_resp.body_length > 0 &&
-	     strncmp(http_resp.body, "data:", 5) == 0)) {
-		parse_streaming(r, http_resp.body);
+		struct cJSON *err = http_resp.body ? json_parse(http_resp.body) : NULL;
+		const char *em = json_get_str(
+			cJSON_GetObjectItemCaseSensitive(err, "error"), "message");
+		if (em)
+			snprintf(detail, sizeof(detail), ": %s", em);
+		cJSON_Delete(err);
+		r = error_response(BORIS_ERROR_HTTP,
+				   http_status_is_transient(http_resp.status_code),
+				   "HTTP %ld%s", http_resp.status_code, detail);
+	} else if (!http_resp.body || http_resp.body_length == 0) {
+		r = error_response(BORIS_ERROR_LLM, true, "Empty response from model");
 	} else {
-		parse_non_streaming(r, http_resp.body);
+		log_debug("llm: HTTP %ld, body %zu bytes",
+			  http_resp.status_code, http_resp.body_length);
+		r = alloc_response();
+		if (r) {
+			if (body_is_sse(http_resp.body))
+				parse_streaming(r, http_resp.body);
+			else
+				parse_non_streaming(r, http_resp.body);
+		}
 	}
 
 	http_response_free(&http_resp);
+
+	if (!r)
+		return NULL;
 
 	metrics_record_request(latency_ms, r->prompt_tokens,
 			       r->completion_tokens, r->error);
@@ -897,10 +781,6 @@ void llm_response_free(struct llm_response *reply)
 
 	free(reply->content);
 	free(reply->thinking);
-
-	for (size_t i = 0; i < reply->tool_calls.count; i++)
-		free(reply->tool_calls.calls[i].argument_json);
-	free(reply->tool_calls.calls);
-
+	tool_call_list_free(&reply->tool_calls);
 	free(reply);
 }

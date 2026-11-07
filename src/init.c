@@ -10,19 +10,18 @@
 #define _GNU_SOURCE
 
 #include "init.h"
-#include "sandbox.h"
+#include "configuration.h"
+#include "fs.h"
 #include <curl/curl.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <dirent.h>
 #include <errno.h>
 #include <time.h>
-#include <sys/wait.h>
 #include <unistd.h>
-#include <pwd.h>
 #include <termios.h>
 
 #define MAX_USER_INPUT 1024
@@ -136,19 +135,71 @@ static void probe_endpoint(const char *url)
 }
 
 /*
- * Get the home directory of the current user.
+ * Write config.ini into buf. Returns the length, or -1 if it did not fit.
  */
-static const char *get_home_dir(void)
+static int format_config(char *buf, size_t size, const char *companion_name,
+			 const char *user_name, const char *endpoint,
+			 const char *model_name, const char *api_key,
+			 const char *prompt_path, const char *personality,
+			 const char *boris_dir)
 {
-	const char *home = getenv("HOME");
-	if (home && home[0])
-		return home;
+	char date_str[64];
+	time_t now = time(NULL);
+	struct tm tm;
+	localtime_r(&now, &tm);
+	strftime(date_str, sizeof(date_str), "%Y-%m-%d %H:%M:%S", &tm);
 
-	struct passwd *pw = getpwuid(getuid());
-	if (pw && pw->pw_dir && pw->pw_dir[0])
-		return pw->pw_dir;
+	char api_key_line[MAX_USER_INPUT + 16] = "";
+	if (api_key[0])
+		snprintf(api_key_line, sizeof(api_key_line), "api_key = %s\n", api_key);
 
-	return "/";
+	char prompt_line[MAX_USER_INPUT * 4 + 64];
+	if (prompt_path)
+		snprintf(prompt_line, sizeof(prompt_line),
+			 "system_prompt_file = %s\n", prompt_path);
+	else
+		snprintf(prompt_line, sizeof(prompt_line),
+			 "system_prompt = %s\n", personality);
+
+	int n = snprintf(buf, size,
+			 "# %s's configuration\n"
+			 "# Created on %s\n"
+			 "# You are %s. This is who I am.\n"
+			 "#\n"
+			 "# Change anything here. This is yours.\n"
+			 "\n"
+			 "[model]\n"
+			 "endpoint = %s\n"
+			 "name = %s\n"
+			 "%s"
+			 "temperature = 0.7\n"
+			 "# context_window must match your model's context length\n"
+			 "# (llama.cpp -c, Ollama num_ctx); max_tokens must be well below it.\n"
+			 "context_window = 32768\n"
+			 "max_tokens = 8192\n"
+			 "\n"
+			 "[prompt]\n"
+			 "%s"
+			 "\n"
+			 "[agent]\n"
+			 "max_iterations = 16\n"
+			 "\n"
+			 "[logging]\n"
+			 "level = info\n"
+			 "\n"
+			 "[behaviour]\n"
+			 "# Ask before each write / script run\n"
+			 "confirm_writes = false\n"
+			 "confirm_run = false\n"
+			 "\n"
+			 "[tools]\n"
+			 "enabled = read,write,list_dir,memory,run\n"
+			 "sandbox_root = %s/sandbox\n"
+			 "memory_persist = true\n"
+			 "run_timeout = 30\n",
+			 companion_name, date_str, user_name, endpoint, model_name,
+			 api_key_line, prompt_line, boris_dir);
+	return (n < 0 || (size_t)n >= size) ? -1 : n;
 }
 
 /*
@@ -162,13 +213,7 @@ int init_run(void)
 	char model_name[MAX_USER_INPUT];
 	char personality[MAX_USER_INPUT * 4];
 	char api_key[MAX_USER_INPUT];
-	char boris_dir[PATH_MAX];
-	char config_path[PATH_MAX + 64];
-	const char *home;
-	FILE *config_file;
-	time_t now;
-	struct tm *time_info;
-	char date_str[64];
+
 	printf("\n");
 	printf("  ========================================\n");
 	printf("   Boris - First Setup\n");
@@ -191,23 +236,13 @@ int init_run(void)
 	printf("  Nice to meet you, %s.\n\n", user_name);
 
 	/* Question 2: Companion name */
-	if (!ask("What should I call myself? (this becomes your workspace folder) ",
-		 companion_name, sizeof(companion_name))) {
+	if (!ask("What should I call myself? ", companion_name, sizeof(companion_name))) {
 		printf("\n  Setup cancelled.\n\n");
 		return 1;
 	}
 
 	if (companion_name[0] == '\0') {
 		snprintf(companion_name, sizeof(companion_name), "boris-companion");
-	}
-
-	/* Sanitize the companion name for use as a folder name */
-	for (size_t i = 0; companion_name[i]; i++) {
-		char c = companion_name[i];
-		if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-		      (c >= '0' && c <= '9') || c == '-' || c == '_')) {
-			companion_name[i] = '-';
-		}
 	}
 
 	printf("  I like the name %s. That's who I'll be.\n\n", companion_name);
@@ -268,10 +303,8 @@ int init_run(void)
 	}
 
 	if (personality[0] == '\0') {
-		snprintf(personality, sizeof(personality),
-			 "You are a helpful AI companion. You are patient, curious, "
-			 "and enjoy learning alongside your human. You explain things "
-			 "clearly and encourage exploration.");
+		snprintf(personality, sizeof(personality), "%s",
+			 BORIS_DEFAULT_SYSTEM_PROMPT);
 	}
 
 	printf("\n");
@@ -280,91 +313,50 @@ int init_run(void)
 	/* Save the configuration                                               */
 	/* ------------------------------------------------------------------ */
 
-	home = get_home_dir();
-	if (!home) {
+	char *boris_dir = fs_boris_path(NULL);
+	char *config_path = fs_boris_path("config.ini");
+	char *prompt_path = fs_boris_path("system_prompt.txt");
+	char *sandbox_path = fs_boris_path("sandbox");
+	int rc = 1;
+
+	if (!boris_dir || !config_path || !prompt_path || !sandbox_path) {
 		fprintf(stderr, "  Could not determine home directory.\n");
-		return 1;
+		goto out;
 	}
 
-	snprintf(boris_dir, sizeof(boris_dir), "%s/.boris", home);
-	snprintf(config_path, sizeof(config_path), "%s/config.ini", boris_dir);
-
-	if (sandbox_mkdirp(boris_dir, 0755) != 0) {
+	if (fs_mkdirp(boris_dir, 0755) != 0) {
 		fprintf(stderr, "  Could not create %s\n", boris_dir);
-		return 1;
+		goto out;
 	}
 
 	/*
 	 * Write the personality to a separate file so it is not subject to
-	 * the INI parser's 1024-character line limit and is easy to edit.
+	 * the INI parser's line limit and is easy to edit.
 	 */
-	char prompt_path[PATH_MAX + 64];
-	snprintf(prompt_path, sizeof(prompt_path), "%s/system_prompt.txt", boris_dir);
-	int wrote_prompt_file = 0;
-	FILE *prompt_file = fopen(prompt_path, "w");
-	if (prompt_file) {
-		fprintf(prompt_file, "%s\n", personality);
-		fprintf(prompt_file, "The user's name is %s.\n", user_name);
-		fclose(prompt_file);
-		wrote_prompt_file = 1;
-	}
+	char prompt_text[MAX_USER_INPUT * 6];
+	int plen = snprintf(prompt_text, sizeof(prompt_text),
+			    "%s\nThe user's name is %s.\n", personality, user_name);
+	bool wrote_prompt_file =
+		plen > 0 && (size_t)plen < sizeof(prompt_text) &&
+		fs_write_atomic(prompt_path, prompt_text, (size_t)plen, 0644, false) == 0;
 
-	config_file = fopen(config_path, "w");
-	if (!config_file) {
+	char config_text[16384];
+	int clen = format_config(config_text, sizeof(config_text), companion_name,
+				 user_name, endpoint, model_name, api_key,
+				 wrote_prompt_file ? prompt_path : NULL,
+				 personality, boris_dir);
+
+	/* 0600 from the moment it exists: it may hold the API key. */
+	if (clen < 0 ||
+	    fs_write_atomic(config_path, config_text, (size_t)clen, 0600, false) != 0 ||
+	    chmod(config_path, 0600) != 0) {
 		fprintf(stderr, "  Could not write config to %s\n", config_path);
-		return 1;
+		goto out;
 	}
-
-	time(&now);
-	time_info = localtime(&now);
-	strftime(date_str, sizeof(date_str), "%Y-%m-%d %H:%M:%S", time_info);
-
-	fprintf(config_file, "# %s's configuration\n", companion_name);
-	fprintf(config_file, "# Created on %s\n", date_str);
-	fprintf(config_file, "# You are %s. This is who I am.\n", user_name);
-	fprintf(config_file, "#\n");
-	fprintf(config_file, "# Change anything here. This is yours.\n");
-	fprintf(config_file, "\n");
-	fprintf(config_file, "[model]\n");
-	fprintf(config_file, "endpoint = %s\n", endpoint);
-	fprintf(config_file, "name = %s\n", model_name);
-	if (api_key[0] != '\0') {
-		fprintf(config_file, "api_key = %s\n", api_key);
-	}
-	fprintf(config_file, "temperature = 0.7\n");
-	fprintf(config_file, "max_tokens = 32768\n");
-	fprintf(config_file, "\n");
-	fprintf(config_file, "[prompt]\n");
-	if (wrote_prompt_file) {
-		fprintf(config_file, "system_prompt_file = %s/system_prompt.txt\n",
-			boris_dir);
-	} else {
-		fprintf(config_file, "system_prompt = %s\n", personality);
-	}
-	fprintf(config_file, "\n");
-	fprintf(config_file, "[agent]\n");
-	fprintf(config_file, "max_iterations = 16\n");
-	fprintf(config_file, "\n");
-	fprintf(config_file, "[logging]\n");
-	fprintf(config_file, "level = info\n");
-	fprintf(config_file, "\n");
-	fprintf(config_file, "[behaviour]\n");
-	fprintf(config_file, "confirm_writes = false\n");
-	fprintf(config_file, "\n");
-	fprintf(config_file, "[tools]\n");
-	fprintf(config_file, "enabled = read,write,list_dir,memory,run\n");
-	fprintf(config_file, "sandbox_root = %s/sandbox\n", boris_dir);
-	fprintf(config_file, "memory_persist = true\n");
-	fprintf(config_file, "run_timeout = 30\n");
-
-	fclose(config_file);
-	chmod(config_path, 0600);
 
 	printf("  Configuration saved to %s\n", config_path);
 
-	char sandbox_path[PATH_MAX + 16];
-	snprintf(sandbox_path, sizeof(sandbox_path), "%s/sandbox", boris_dir);
-	if (sandbox_mkdirp(sandbox_path, 0755) != 0) {
+	if (fs_mkdirp(sandbox_path, 0755) != 0) {
 		fprintf(stderr, "  Warning: could not create sandbox at %s\n",
 			sandbox_path);
 	} else {
@@ -384,10 +376,16 @@ int init_run(void)
 	printf("\n");
 	printf("  %s, your companion %s is ready.\n", user_name, companion_name);
 	printf("\n");
-	printf("  Run './build/boris chat' to start chatting.\n");
+	printf("  Run './boris chat' to start chatting.\n");
 	printf("\n");
 	printf("  See you there.\n");
 	printf("\n");
+	rc = 0;
 
-	return 0;
+out:
+	free(boris_dir);
+	free(config_path);
+	free(prompt_path);
+	free(sandbox_path);
+	return rc;
 }

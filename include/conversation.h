@@ -119,6 +119,13 @@ int conversation_truncate(struct conversation_history *conv, size_t max_tokens);
 struct cJSON *conversation_to_json(const struct conversation_history *conv);
 
 /*
+ * Parse one OpenAI tool_call object ({"id", "function": {"name",
+ * "arguments"}}) into tc. Missing fields become "" (arguments "{}").
+ * tc->argument_json is heap-allocated. Returns 0, or -1 on OOM.
+ */
+int tool_call_from_json(const struct cJSON *tc_obj, struct tool_call *tc);
+
+/*
  * Return a read-only pointer to the last message, or NULL if empty.
  */
 const struct conversation_message *conversation_last(

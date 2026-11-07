@@ -42,10 +42,10 @@ Add yours at the next available bit:
 #define TOOL_ALL         (0xFF)     /* update this too */
 ```
 
-Also add your tool name to `tools_mask_to_string()` in `src/tools.c` so it appears correctly in `/tools` and `boris status`:
+Also add your tool name to the `TOOL_FLAG_NAMES` table in `src/tools.c`. That one table is used both to parse `--tools` / `tools.enabled` and to display the tool in `/tools` and `boris status`:
 
 ```c
-static const struct { unsigned int flag; const char *name; } kv[] = {
+static const struct { unsigned int flag; const char *name; } TOOL_FLAG_NAMES[] = {
     { TOOL_READ,     "read"     },
     /* ... */
     { TOOL_RUN,      "run"      },
@@ -159,12 +159,32 @@ Keep descriptions precise — they are part of every LLM request.
 
 ## Step 4 — Register the tool
 
-Open `src/tools.c`. Add a forward declaration at the top alongside the others:
+First, give the tool a **formatter**: a one-line summary of a call's arguments. The REPL prints it for every call (`> mytool hello`) and uses it in confirmation prompts. Add it to `src/tools/mytool.c`:
+
+```c
+/* "hello". Display only; never fails. */
+void tool_mytool_format(const char *argument_json, char *buf, size_t size)
+{
+	cJSON *root = json_parse(argument_json);
+	const char *input = json_get_str(root, "input");
+	snprintf(buf, size, "%s", input ? input : "(invalid arguments)");
+	cJSON_Delete(root);
+}
+```
+
+Rules for formatters:
+- One short line; the tool name is printed separately, so leave it out.
+- Read argument strings in place. Never copy large values (file content) just to describe them; report a length instead, like the `write` formatter does.
+- You don't need to escape anything: the registry runs the result through `term_sanitize()`, which strips control characters before anything reaches the terminal.
+- A formatter is optional. Pass `NULL` and displays fall back to the raw argument JSON.
+
+Open `src/tools.c`. Add forward declarations at the top alongside the others:
 
 ```c
 struct tool_result tool_mytool_fn(const char *arguments_json,
 				  const struct agent_configuration *cfg,
 				  struct memory_arena *scratch);
+void tool_mytool_format(const char *argument_json, char *buf, size_t size);
 ```
 
 Then add a `register_one()` call inside `tools_register_builtins()`:
@@ -172,15 +192,17 @@ Then add a `register_one()` call inside `tools_register_builtins()`:
 ```c
 void tools_register_builtins(void)
 {
-    register_one("read",   "...", SCHEMA_READ,   tool_read_fn,   TOOL_READ);
+    register_one("read", "...", SCHEMA_READ, tool_read_fn, tool_read_format, TOOL_READ);
     /* ... existing tools ... */
     register_one("mytool",
         "One sentence describing what this tool does and when to use it.",
-        SCHEMA_MYTOOL, tool_mytool_fn, TOOL_MYTOOL);
+        SCHEMA_MYTOOL, tool_mytool_fn, tool_mytool_format, TOOL_MYTOOL);
 }
 ```
 
 The description is shown to the model. Be specific: describe the primary use case, not just the name.
+
+Tools registered at runtime with `tools_register()` set the same field: `struct tool_definition` has a `format_call` member next to `fn`.
 
 ---
 
@@ -265,25 +287,21 @@ If it requires configuration (API keys, endpoints, etc.), add the relevant keys 
 
 ---
 
-## Step 8 — Wire up `--tools` and env var
+## Step 8 — `--tools` and the environment variable
 
-The `--tools` CLI flag and `BORIS_TOOLS` environment variable both go through `configuration_parse_tools_mask()` in `src/configuration.c`. Add your tool name there:
-
-```c
-else if (strcmp(tok, "mytool") == 0)  mask |= TOOL_MYTOOL;
-```
+Nothing to do. The `--tools` flag, `tools.enabled` and `BORIS_TOOLS` all look tool names up in the `TOOL_FLAG_NAMES` table you extended in Step 1.
 
 ---
 
 ## Checklist
 
 - [ ] `TOOL_MYTOOL` flag added to `boris_types.h`, `TOOL_ALL` updated
-- [ ] Flag name added to `tools_mask_to_string()` in `tools.c`
+- [ ] Name added to `TOOL_FLAG_NAMES` in `tools.c`
 - [ ] `src/tools/mytool.c` created with correct function signature
+- [ ] `tool_mytool_format()` written (or `NULL` passed)
 - [ ] `SCHEMA_MYTOOL` written in `tools.c`
-- [ ] Forward declaration added to `tools.c`
+- [ ] Forward declarations of `tool_mytool_fn` and `tool_mytool_format` added to `tools.c`
 - [ ] `register_one()` call added to `tools_register_builtins()`
 - [ ] Forward declaration added to `tests/test_tools.c`
 - [ ] Tests written and passing under `make test`
-- [ ] `configuration_parse_tools_mask()` updated for `--tools`/`BORIS_TOOLS`
 - [ ] `boris.ini.example` updated if needed

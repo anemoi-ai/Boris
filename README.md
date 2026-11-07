@@ -11,7 +11,7 @@
 
 ## What This Is
 
-Boris is a complete AI agent in ~10,000 lines of C across 21 source files. It compiles clean under `-Wall -Wextra -Werror`, passes 400+ tests, and runs leak-free under Valgrind. It connects to any OpenAI-compatible API — OpenAI, Ollama, LM Studio, vLLM, llama.cpp — maintains conversation history, calls tools, manages its own context window, and persists sessions to disk.
+Boris is a complete AI agent in ~10,000 lines of C across 23 source files. It compiles clean under `-Wall -Wextra -Werror`, passes 400+ tests, and runs leak-free under Valgrind. It connects to any OpenAI-compatible API — OpenAI, Ollama, LM Studio, vLLM, llama.cpp — maintains conversation history, calls tools, manages its own context window, and persists sessions to disk.
 
 It is built around two ideas:
 
@@ -68,11 +68,11 @@ The system prompt is extended automatically with an explanation of `<system-remi
 
 **Memory management without a GC.** The arena allocator (`src/arena.c`, ~200 lines) hands out bump-allocated memory for a single request and resets in one call. Long-lived conversation messages are individually `malloc`'d and `free`'d. The ownership model is visible end-to-end.
 
-**Real HTTP in C.** `src/http_client.c` is libcurl with retry, exponential backoff, streaming, SSL verification, and connection reuse. `tests/mock_http.c` substitutes the same interface at link time, so the production binary carries no test infrastructure but the full agent loop is testable without an API key.
+**Real HTTP in C.** `src/http_client.c` is libcurl with SSL verification, a response size cap, and cancellation: Ctrl+C aborts an in-flight request through a progress callback. Retry with exponential backoff lives one layer up in `src/agent.c`, driven by a `recoverable` flag that `src/llm.c` sets per error (timeouts, 429 and 5xx retry; 4xx and bad configuration do not). `tests/mock_http.c` substitutes the same interface at link time, so the production binary carries no test infrastructure but the full agent loop is testable without an API key.
 
 **JSON without magic.** cJSON is 1,400 lines. The conversation serialiser in `src/conversation.c` builds and parses the OpenAI wire format manually — you can read the protocol, line by line, in the code.
 
-**Sandboxing as a real problem.** `src/sandbox.c` shows why naive prefix-checking fails (symlinks, `../`, absolute paths in arguments) and why `realpath()` before every tool call is the right answer. 380 lines of careful code.
+**Sandboxing as a real problem.** `src/sandbox.c` shows why naive prefix-checking fails (symlinks, `../`, absolute paths in arguments) and why `realpath()` before every tool call is the right answer, including the subtle case of `..` after a directory that does not exist yet. About 350 lines of careful code.
 
 **Error propagation without exceptions.** Every function that can fail returns `enum boris_error`. Every caller checks it. There are no unchecked paths. This is what makes the agent actually reliable.
 
@@ -131,9 +131,10 @@ src/
 ├── agent.c           The ReAct loop, self-correction, retry
 ├── llm.c             HTTP to the LLM API, response parsing, streaming
 ├── conversation.c    Message history, serialisation, truncation
-├── http_client.c     libcurl wrapper with retry/backoff
+├── http_client.c     libcurl wrapper: POST, cancellation, size cap
 ├── tools.c           Registry, dispatch, JSON schemas
 ├── sandbox.c         Path validation via realpath()
+├── fs.c              mkdir -p, atomic file replacement, ~/.boris paths
 ├── configuration.c   INI + env + flags, layered overrides
 ├── arena.c           Per-request bump allocator
 ├── repl.c            Interactive loop, slash commands, session restore
@@ -204,7 +205,7 @@ Boris speaks standard OpenAI chat completions. Any provider with the same wire f
 
 Change `model_endpoint` in `~/.boris/config.ini` or set `BORIS_MODEL_ENDPOINT`. That's it.
 
-**Text tool fallback.** Models that don't support native `tool_calls` often emit tool invocations as JSON inside markdown code fences or `<tool_call>` XML tags. Boris detects both and handles them identically to native tool calls (`agent.text_tool_fallback = true`, on by default).
+**Text tool fallback.** Models that don't support native `tool_calls` often emit tool invocations as JSON inside markdown code fences or `<tool_call>` XML tags. Boris detects both and handles them identically to native tool calls (`agent.text_tool_fallback = true`, on by default). It also reminds the model that the native channel is preferred; set `agent.native_tool_reminder = false` for models that can only emit text tool calls.
 
 ---
 
@@ -218,7 +219,7 @@ Common knobs:
 ./boris chat --tools read,write,list_dir   # comma list, or 'all' / 'none'
 ./boris chat --sandbox ./project           # restrict filesystem access
 ./boris chat --max-iterations 16           # ReAct loop budget
-./boris chat --stream                      # streaming responses
+./boris chat --stream                      # request SSE (reply shown when complete)
 ./boris chat --show-metrics                # token + timing summary on exit
 ./boris chat --set model.temperature=0.3   # override any config key
 ```

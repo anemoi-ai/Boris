@@ -78,18 +78,19 @@ static void log_message(enum log_level level, const char *format, va_list argume
 	if (level < current_log_level)
 		return;
 
-	if (!log_output)
-		return;
+	/* Before logger_initialize() (or after logger_close()), messages at or
+	 * above the default ERROR level still reach stderr. */
+	FILE *out = log_output ? log_output : stderr;
 
-	write_timestamp(log_output);
+	write_timestamp(out);
 	if (level < 0 || level >= (int)(sizeof(level_labels) / sizeof(level_labels[0])))
-		fprintf(log_output, "%-5s ", "?????");
+		fprintf(out, "%-5s ", "?????");
 	else
-		fprintf(log_output, "%-5s ", level_labels[level]);
-	vfprintf(log_output, format, arguments);
-	fprintf(log_output, "\n");
+		fprintf(out, "%-5s ", level_labels[level]);
+	vfprintf(out, format, arguments);
+	fprintf(out, "\n");
 
-	fflush(log_output);
+	fflush(out);
 }
 
 void log_debug(const char *format, ...)

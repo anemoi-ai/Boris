@@ -1,13 +1,14 @@
 /*
  * test_sandbox.c - Tests for path sandboxing.
  *
- * Exercises sandbox_resolve(), sandbox_mkdirp(), and sandbox_contains()
+ * Exercises sandbox_resolve() and fs_mkdirp()
  * with real filesystem operations against a temporary sandbox directory.
  */
 
 #define _POSIX_C_SOURCE 200809L
 
 #include "sandbox.h"
+#include "fs.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -175,15 +176,28 @@ static void test_resolve_dotdot_stays_inside(void)
 	ASSERT(strncmp(out, g_sandbox, strlen(g_sandbox)) == 0);
 }
 
-/* Test: sandbox_mkdirp creates a nested directory tree */
+/* Test: ".." after a non-existent component is rejected (it would escape
+ * once the missing directories were created) */
+static void test_resolve_dotdot_in_missing_tail_blocked(void)
+{
+	printf("  Test: .. after a non-existent component is blocked\n");
+
+	char out[PATH_MAX];
+	ASSERT(sandbox_resolve(g_sandbox, "missing/../../escaped.txt",
+			       out, sizeof(out)) != 0);
+	ASSERT(sandbox_resolve(g_sandbox, "missing/../inside.txt",
+			       out, sizeof(out)) != 0);
+}
+
+/* Test: fs_mkdirp creates a nested directory tree */
 static void test_mkdirp_nested(void)
 {
-	printf("  Test: sandbox_mkdirp creates nested directories\n");
+	printf("  Test: fs_mkdirp creates nested directories\n");
 
 	char nested[512];
 	snprintf(nested, sizeof(nested), "%s/a/b/c", g_sandbox);
 
-	int rc = sandbox_mkdirp(nested, 0755);
+	int rc = fs_mkdirp(nested, 0755);
 	ASSERT(rc == 0);
 
 	struct stat st;
@@ -191,63 +205,28 @@ static void test_mkdirp_nested(void)
 	ASSERT(S_ISDIR(st.st_mode));
 }
 
-/* Test: sandbox_mkdirp on existing path is idempotent */
+/* Test: fs_mkdirp on existing path is idempotent */
 static void test_mkdirp_idempotent(void)
 {
-	printf("  Test: sandbox_mkdirp on existing path is idempotent\n");
+	printf("  Test: fs_mkdirp on existing path is idempotent\n");
 
 	char dir[512];
 	snprintf(dir, sizeof(dir), "%s/existing", g_sandbox);
 	mkdir(dir, 0755);
 
-	int rc = sandbox_mkdirp(dir, 0755);
+	int rc = fs_mkdirp(dir, 0755);
 	ASSERT(rc == 0);
 }
 
-/* Test: sandbox_mkdirp with NULL returns error */
+/* Test: fs_mkdirp with NULL returns error */
 static void test_mkdirp_null(void)
 {
-	printf("  Test: sandbox_mkdirp NULL returns error\n");
+	printf("  Test: fs_mkdirp NULL returns error\n");
 
-	int rc = sandbox_mkdirp(NULL, 0755);
+	int rc = fs_mkdirp(NULL, 0755);
 	ASSERT(rc != 0);
 }
 
-/* Test: sandbox_contains returns 1 for a path inside the sandbox */
-static void test_contains_true(void)
-{
-	printf("  Test: sandbox_contains true for path inside\n");
-
-	char inside[512];
-	snprintf(inside, sizeof(inside), "%s/some/deep/path", g_sandbox);
-
-	ASSERT(sandbox_contains(g_sandbox, inside) == 1);
-}
-
-/* Test: sandbox_contains returns 0 for a path outside the sandbox */
-static void test_contains_false(void)
-{
-	printf("  Test: sandbox_contains false for path outside\n");
-
-	ASSERT(sandbox_contains(g_sandbox, "/etc/passwd") == 0);
-}
-
-/* Test: sandbox_contains returns 0 if path equals root (no trailing slash) */
-static void test_contains_root_itself(void)
-{
-	printf("  Test: sandbox_contains false when path equals root\n");
-
-	ASSERT(sandbox_contains(g_sandbox, g_sandbox) == 0);
-}
-
-/* Test: sandbox_contains with NULL arguments is safe */
-static void test_contains_null(void)
-{
-	printf("  Test: sandbox_contains NULL arguments are safe\n");
-
-	ASSERT(sandbox_contains(NULL, "/tmp/foo") == 0);
-	ASSERT(sandbox_contains(g_sandbox, NULL) == 0);
-}
 
 int main(void)
 {
@@ -265,13 +244,10 @@ int main(void)
 	test_resolve_empty_path_rejected();
 	test_resolve_no_sandbox();
 	test_resolve_dotdot_stays_inside();
+	test_resolve_dotdot_in_missing_tail_blocked();
 	test_mkdirp_nested();
 	test_mkdirp_idempotent();
 	test_mkdirp_null();
-	test_contains_true();
-	test_contains_false();
-	test_contains_root_itself();
-	test_contains_null();
 
 	teardown_sandbox();
 

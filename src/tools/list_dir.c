@@ -1,8 +1,8 @@
 /*
  * tools/list_dir.c - List directory contents within the sandbox.
  *
- * Shows files and directories with type, size, and modification date.
- * Supports recursive listing (depth limited) and hidden files.
+ * Shows the entries of one directory with type, size, and modification
+ * date. Hidden entries are skipped unless show_hidden is set.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -41,17 +41,10 @@ static int parse_list_dir_args(const char *json, struct list_dir_args *args)
 	if (!root)
 		return -1;
 
-	const char *path = json_get_str(root, "path");
-	if (!path) {
+	if (tools_arg_path(root, args->path, sizeof(args->path)) != 0) {
 		cJSON_Delete(root);
 		return -1;
 	}
-
-	if (strlen(path) >= sizeof(args->path)) {
-		cJSON_Delete(root);
-		return -1;
-	}
-	snprintf(args->path, sizeof(args->path), "%s", path);
 
 	if (json_get_bool(root, "show_hidden", 0))
 		args->show_hidden = 1;
@@ -81,8 +74,12 @@ static void format_size(size_t size, char *buf, size_t buf_size)
 
 static void format_time(time_t t, char *buf, size_t buf_size)
 {
-	struct tm *tm = localtime(&t);
-	strftime(buf, buf_size, "%Y-%m-%d", tm);
+	struct tm tm;
+	if (!localtime_r(&t, &tm)) {
+		snprintf(buf, buf_size, "?");
+		return;
+	}
+	strftime(buf, buf_size, "%Y-%m-%d", &tm);
 }
 
 static int list_one_dir(const char *dir_path, int show_hidden,
@@ -180,8 +177,12 @@ struct tool_result tool_list_dir_fn(const char *arguments_json,
 
 	out_size += (size_t)snprintf(output, cap, "%s/\n", resolved);
 
-	list_one_dir(resolved, args.show_hidden,
-		     &output, &out_size, &cap, &count, LIST_DIR_MAX_ENTRIES);
+	if (list_one_dir(resolved, args.show_hidden,
+			 &output, &out_size, &cap, &count, LIST_DIR_MAX_ENTRIES) != 0) {
+		free(output);
+		return tool_result_errorf("list_dir", "Cannot read directory: %s",
+					  args.path);
+	}
 
 	if (count >= LIST_DIR_MAX_ENTRIES) {
 		if (out_size + 50 >= cap) {
@@ -199,4 +200,17 @@ struct tool_result tool_list_dir_fn(const char *arguments_json,
 	}
 
 	return tool_result_ok("list_dir", output);
+}
+
+/* "src" or "src (including hidden)". */
+void tool_list_dir_format(const char *argument_json, char *buf, size_t size)
+{
+	cJSON *root = json_parse(argument_json);
+	const char *path = json_get_str(root, "path");
+	if (!root)
+		snprintf(buf, size, "(invalid arguments)");
+	else
+		snprintf(buf, size, "%s%s", path && path[0] ? path : ".",
+			 json_get_bool(root, "show_hidden", 0) ? " (including hidden)" : "");
+	cJSON_Delete(root);
 }

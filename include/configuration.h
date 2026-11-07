@@ -3,7 +3,7 @@
  *
  * Settings are applied in priority order:
  *   1. compiled-in defaults
- *   2. INI file (~/.boris/config.ini)
+ *   2. INI file (~/.boris/config.ini, then --config FILE)
  *   3. environment variables
  *   4. command-line flags (applied by the caller)
  */
@@ -12,6 +12,12 @@
 #define CONFIGURATION_H
 
 #include "boris_types.h"
+
+/* System prompt used when none is configured. */
+#define BORIS_DEFAULT_SYSTEM_PROMPT                                  \
+	"You are Boris, a helpful AI companion. You are patient, "   \
+	"curious, and enjoy learning alongside your human. You "      \
+	"explain things clearly and encourage exploration."
 
 /*
  * Populate config with compiled-in defaults.
@@ -39,7 +45,9 @@ void configuration_apply_environment(struct agent_configuration *config);
  *
  * Key format is "section.key" (e.g., "model.temperature").
  * Used by CLI --set and internally by the INI loader.
- * Returns BORIS_OK if the key is recognized, BORIS_ERROR_BAD_ARGUMENT otherwise.
+ * Returns BORIS_OK if the key is recognized and the value valid, otherwise
+ * BORIS_ERROR_BAD_ARGUMENT (the field keeps its previous value). Path keys
+ * (sandbox_root, system_prompt_file, logging.file) expand a leading ~.
  */
 enum boris_error configuration_set_key(struct agent_configuration *config,
 				       const char *key, const char *value);
@@ -52,7 +60,8 @@ void configuration_destroy(struct agent_configuration *config);
 
 /*
  * Parse a comma-separated tool list into a tools_enabled bitmask.
- * Recognizes: read, write, bash, web, list_dir, memory, run, all, none.
+ * Recognizes: read, write, list_dir, memory, run, all, none. Unknown
+ * names are ignored with a warning.
  * Returns TOOL_NONE if value is NULL or empty.
  */
 unsigned int configuration_parse_tools_mask(const char *value);

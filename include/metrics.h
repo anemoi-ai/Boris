@@ -43,9 +43,6 @@ void metrics_record_request(double latency_ms, int prompt_tokens,
 /* Record a tool call */
 void metrics_record_tool_call(void);
 
-/* Record an error */
-void metrics_record_error(void);
-
 /* Record a retry attempt */
 void metrics_record_retry(void);
 

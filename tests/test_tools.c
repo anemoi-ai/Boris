@@ -3,7 +3,8 @@
  *
  * Tests each tool function (read, write, list_dir, memory) directly,
  * plus tools_mask_to_string(). Uses a real temporary sandbox directory
- * and controls the memory tool's storage path via XDG_DATA_HOME.
+ * and points HOME at a temporary directory so the memory tool never touches
+ * the real ~/.boris.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -12,12 +13,14 @@
 #include "arena.h"
 #include "configuration.h"
 #include "boris_types.h"
+#include "terminal.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <limits.h>
+#include <time.h>
 
 /* Forward declarations - tool implementations are not exposed in tools.h */
 struct tool_result tool_read_fn(const char *arguments_json,
@@ -53,7 +56,8 @@ static struct memory_arena *g_scratch;
 	} while (0)
 
 static char g_sandbox[256];
-static char g_mem_xdg[256];
+static char g_home[256];
+static char g_saved_home[1024];
 
 static void setup(void)
 {
@@ -61,11 +65,12 @@ static void setup(void)
 		 "/tmp/boris_tools_test_%d", (int)getpid());
 	mkdir(g_sandbox, 0755);
 
-	/* Redirect memory tool storage to a controlled temp dir */
-	snprintf(g_mem_xdg, sizeof(g_mem_xdg),
-		 "/tmp/boris_mem_xdg_%d", (int)getpid());
-	mkdir(g_mem_xdg, 0755);
-	setenv("XDG_DATA_HOME", g_mem_xdg, 1);
+	/* The memory tool stores under $HOME/.boris: use a throwaway HOME */
+	const char *home = getenv("HOME");
+	snprintf(g_saved_home, sizeof(g_saved_home), "%s", home ? home : "");
+	snprintf(g_home, sizeof(g_home), "/tmp/boris_tools_home_%d", (int)getpid());
+	mkdir(g_home, 0755);
+	setenv("HOME", g_home, 1);
 
 	g_scratch = arena_create(32768);
 }
@@ -73,9 +78,10 @@ static void setup(void)
 static void teardown(void)
 {
 	char cmd[PATH_MAX * 2 + 16];
-	snprintf(cmd, sizeof(cmd), "rm -rf %s %s", g_sandbox, g_mem_xdg);
+	snprintf(cmd, sizeof(cmd), "rm -rf %s %s", g_sandbox, g_home);
 	system(cmd);
-	unsetenv("XDG_DATA_HOME");
+	if (g_saved_home[0])
+		setenv("HOME", g_saved_home, 1);
 	arena_destroy(g_scratch);
 	g_scratch = NULL;
 }
@@ -408,6 +414,65 @@ static void test_write_traversal_blocked(void)
 	configuration_destroy(&cfg);
 }
 
+static void test_write_large_content_via_dispatch(void)
+{
+	printf("  Test: write - content larger than the dispatch arena block\n");
+
+	struct agent_configuration cfg = make_cfg();
+	cfg.tools_enabled = TOOL_ALL;
+	tools_register_builtins();
+	size_t n = 100000;
+	char *json = malloc(n + 64);
+	ASSERT(json != NULL);
+	if (!json)
+		return;
+	int p = snprintf(json, 64, "{\"path\":\"big.txt\",\"content\":\"");
+	memset(json + p, 'A', n);
+	snprintf(json + p + n, 8, "\"}");
+
+	struct tool_call tc;
+	memset(&tc, 0, sizeof(tc));
+	snprintf(tc.id, sizeof(tc.id), "c1");
+	snprintf(tc.name, sizeof(tc.name), "write");
+	tc.argument_json = json;
+	struct tool_result r = tools_dispatch(&tc, &cfg);
+
+	char path[512];
+	snprintf(path, sizeof(path), "%s/big.txt", g_sandbox);
+	struct stat st;
+	ASSERT(r.is_error == false);
+	ASSERT(stat(path, &st) == 0 && (size_t)st.st_size == n);
+
+	unlink(path);
+	free(json);
+	tool_result_free(&r);
+	configuration_destroy(&cfg);
+}
+
+static void test_write_create_dirs_escape_blocked(void)
+{
+	printf("  Test: write - create_dirs cannot escape via ..\n");
+
+	struct agent_configuration cfg = make_cfg();
+	char json[256], outside[512], created[512];
+	snprintf(json, sizeof(json),
+		 "{\"path\":\"x/../../boris_escape_%d.txt\",\"content\":\"evil\","
+		 "\"create_dirs\":true}", (int)getpid());
+	snprintf(outside, sizeof(outside), "/tmp/boris_escape_%d.txt", (int)getpid());
+	snprintf(created, sizeof(created), "%s/x", g_sandbox);
+
+	struct tool_result r = tool_write_fn(json, &cfg, g_scratch);
+
+	struct stat st;
+	ASSERT(r.is_error == true);
+	ASSERT(stat(outside, &st) != 0);
+	ASSERT(stat(created, &st) != 0);
+
+	unlink(outside);
+	tool_result_free(&r);
+	configuration_destroy(&cfg);
+}
+
 /* -------------------------------------------------------------------------
  * List dir tool
  * ---------------------------------------------------------------------- */
@@ -658,15 +723,6 @@ static void test_memory_no_persist(void)
 {
 	printf("  Test: memory - memory_persist=false returns error\n");
 
-	/* Remove all path env vars so memory can't resolve its file */
-	char *saved_home = getenv("HOME");
-	char saved_home_buf[1024] = "";
-	if (saved_home)
-		snprintf(saved_home_buf, sizeof(saved_home_buf), "%s", saved_home);
-
-	unsetenv("HOME");
-	unsetenv("XDG_DATA_HOME");
-
 	struct agent_configuration cfg;
 	configuration_set_defaults(&cfg);
 	cfg.memory_persist = false;
@@ -678,10 +734,365 @@ static void test_memory_no_persist(void)
 	tool_result_free(&r);
 	configuration_destroy(&cfg);
 
-	/* Restore env */
-	if (saved_home_buf[0])
-		setenv("HOME", saved_home_buf, 1);
-	setenv("XDG_DATA_HOME", g_mem_xdg, 1);
+}
+
+static void test_memory_keys_case_sensitive(void)
+{
+	printf("  Test: memory - keys are case-sensitive\n");
+
+	struct agent_configuration cfg = make_cfg();
+	cfg.memory_persist = true;
+
+	struct tool_result r = tool_memory_fn(
+		"{\"action\":\"set\",\"key\":\"apple\",\"value\":\"red\"}", &cfg, g_scratch);
+	tool_result_free(&r);
+	r = tool_memory_fn(
+		"{\"action\":\"set\",\"key\":\"APPLE\",\"value\":\"green\"}", &cfg, g_scratch);
+	ASSERT(r.content && strstr(r.content, "\"created\":true"));
+	tool_result_free(&r);
+
+	r = tool_memory_fn("{\"action\":\"get\",\"key\":\"apple\"}", &cfg, g_scratch);
+	ASSERT(r.content && strstr(r.content, "\"value\":\"red\""));
+	tool_result_free(&r);
+
+	r = tool_memory_fn("{\"action\":\"delete\",\"key\":\"APPLE\"}", &cfg, g_scratch);
+	tool_result_free(&r);
+	r = tool_memory_fn("{\"action\":\"get\",\"key\":\"apple\"}", &cfg, g_scratch);
+	ASSERT(r.content && strstr(r.content, "\"found\":true"));
+	tool_result_free(&r);
+
+	/* The store lives under the test HOME, not the developer's */
+	char path[512];
+	snprintf(path, sizeof(path), "%s/.boris/memory/memory.json", g_home);
+	struct stat st;
+	ASSERT(stat(path, &st) == 0);
+
+	configuration_destroy(&cfg);
+}
+
+static void test_memory_empty_file(void)
+{
+	printf("  Test: memory - an empty store file is treated as empty\n");
+
+	struct agent_configuration cfg = make_cfg();
+	cfg.memory_persist = true;
+
+	char path[512];
+	snprintf(path, sizeof(path), "%s/.boris/memory/memory.json", g_home);
+	FILE *f = fopen(path, "w");
+	if (f)
+		fclose(f);
+
+	struct tool_result r = tool_memory_fn(
+		"{\"action\":\"set\",\"key\":\"k\",\"value\":\"v\"}", &cfg, g_scratch);
+	ASSERT(r.is_error == false);
+	tool_result_free(&r);
+	configuration_destroy(&cfg);
+}
+
+static int g_confirm_calls;
+static bool g_confirm_answer;
+static char g_confirm_summary[256];
+
+static bool test_confirm_cb(const struct tool_call *call, const char *summary,
+			    void *ctx)
+{
+	(void)call;
+	(void)ctx;
+	g_confirm_calls++;
+	snprintf(g_confirm_summary, sizeof(g_confirm_summary), "%s", summary);
+	return g_confirm_answer;
+}
+
+static const struct tool_observer g_confirm_observer = {.confirm = test_confirm_cb};
+
+static void test_confirm_writes(void)
+{
+	printf("  Test: confirm_writes asks before writing\n");
+
+	struct agent_configuration cfg = make_cfg();
+	cfg.tools_enabled = TOOL_ALL;
+	tools_register_builtins();
+
+	struct tool_call tc;
+	memset(&tc, 0, sizeof(tc));
+	snprintf(tc.id, sizeof(tc.id), "c1");
+	snprintf(tc.name, sizeof(tc.name), "write");
+	tc.argument_json = "{\"path\":\"confirm.txt\",\"content\":\"x\"}";
+
+	char path[512];
+	snprintf(path, sizeof(path), "%s/confirm.txt", g_sandbox);
+	struct stat st;
+
+	/* Off: no prompt */
+	g_confirm_calls = 0;
+	tools_set_observer(&g_confirm_observer);
+	struct tool_result r = tools_dispatch(&tc, &cfg);
+	ASSERT(g_confirm_calls == 0 && r.is_error == false);
+	tool_result_free(&r);
+	unlink(path);
+
+	/* On, declined: nothing written */
+	cfg.confirm_writes = true;
+	g_confirm_answer = false;
+	r = tools_dispatch(&tc, &cfg);
+	ASSERT(g_confirm_calls == 1 && r.is_error == true);
+	ASSERT(strcmp(g_confirm_summary, "confirm.txt (overwrite, 1 bytes)") == 0);
+	ASSERT(stat(path, &st) != 0);
+	tool_result_free(&r);
+
+	/* On, accepted */
+	g_confirm_answer = true;
+	r = tools_dispatch(&tc, &cfg);
+	ASSERT(g_confirm_calls == 2 && r.is_error == false);
+	ASSERT(stat(path, &st) == 0);
+	tool_result_free(&r);
+
+	/* On, no callback registered: refused */
+	tools_set_observer(NULL);
+	r = tools_dispatch(&tc, &cfg);
+	ASSERT(r.is_error == true);
+	tool_result_free(&r);
+
+	unlink(path);
+	configuration_destroy(&cfg);
+}
+
+/* -------------------------------------------------------------------------
+ * Tool call display (based on upstream PR #3 by @ilmich)
+ * ---------------------------------------------------------------------- */
+
+static void format_call(const char *name, const char *args, char *buf, size_t size)
+{
+	struct tool_call tc;
+	memset(&tc, 0, sizeof(tc));
+	snprintf(tc.name, sizeof(tc.name), "%s", name);
+	tc.argument_json = (char *)args;
+	tools_format_call(&tc, buf, size);
+}
+
+static void test_format_call_summaries(void)
+{
+	printf("  Test: tools_format_call summaries for each tool\n");
+	tools_register_builtins();
+	char buf[256];
+
+	format_call("read", "{\"path\":\"notes.md\"}", buf, sizeof(buf));
+	ASSERT(strcmp(buf, "notes.md") == 0);
+	format_call("read", "{\"path\":\"notes.md\",\"offset\":4096}", buf, sizeof(buf));
+	ASSERT(strcmp(buf, "notes.md (from byte 4096)") == 0);
+	format_call("list_dir", "{\"path\":\"\",\"show_hidden\":true}", buf, sizeof(buf));
+	ASSERT(strcmp(buf, ". (including hidden)") == 0);
+	format_call("memory", "{\"action\":\"set\",\"key\":\"colour\",\"value\":\"x\"}", buf, sizeof(buf));
+	ASSERT(strcmp(buf, "set colour") == 0);
+	format_call("run", "{\"path\":\"b.sh\",\"args\":[\"-v\",\"x\"],\"stdin\":\"abc\"}", buf, sizeof(buf));
+	ASSERT(strcmp(buf, "b.sh -v x (stdin: 3 bytes)") == 0);
+	format_call("read", "not json", buf, sizeof(buf));
+	ASSERT(strcmp(buf, "(invalid arguments)") == 0);
+
+	/* write measures 100 KB of content in place (the PR copied it into a
+	 * 4 KB arena, overflowing the heap) */
+	size_t n = 100000;
+	char *json = malloc(n + 64);
+	ASSERT(json != NULL);
+	if (json) {
+		int p = snprintf(json, 64, "{\"path\":\"big.txt\",\"mode\":\"append\",\"content\":\"");
+		memset(json + p, 'A', n);
+		snprintf(json + p + n, 8, "\"}");
+		format_call("write", json, buf, sizeof(buf));
+		ASSERT(strcmp(buf, "big.txt (append, 100000 bytes)") == 0);
+		free(json);
+	}
+
+	/* Unknown tools fall back to the raw arguments */
+	format_call("mystery", "{\"a\":1}", buf, sizeof(buf));
+	ASSERT(strcmp(buf, "{\"a\":1}") == 0);
+
+	/* Model-written escape sequences never reach the terminal */
+	format_call("read", "{\"path\":\"x\u001b]0;pwned\u0007\u001b[2J.md\"}", buf, sizeof(buf));
+	ASSERT(strchr(buf, '\x1b') == NULL && strchr(buf, '\x07') == NULL);
+}
+
+static void test_term_sanitize(void)
+{
+	printf("  Test: term_sanitize strips controls and cuts on UTF-8 boundaries\n");
+	char buf[64];
+
+	term_sanitize("a\x1b[2Jb\tc\nd\x7f", buf, sizeof(buf));
+	ASSERT(strcmp(buf, "a [2Jb\tc d ") == 0);
+
+	/* C1 control (U+009B, 8-bit CSI) and a raw invalid 0x9B byte */
+	term_sanitize("x\xc2\x9by\x9bz", buf, sizeof(buf));
+	ASSERT(strcmp(buf, "x  y?z") == 0);
+
+	/* Valid multi-byte text passes through */
+	term_sanitize("caf\xc3\xa9 \xe2\x82\xac", buf, sizeof(buf));
+	ASSERT(strcmp(buf, "caf\xc3\xa9 \xe2\x82\xac") == 0);
+
+	/* Truncation never splits a character (the euro sign is 3 bytes) */
+	char small[10];
+	term_sanitize("ab\xe2\x82\xac\xe2\x82\xac\xe2\x82\xac", small, sizeof(small));
+	ASSERT(strcmp(small, "ab\xe2\x82\xac...") == 0);
+	term_sanitize("ab\xe2\x82\xac\xe2\x82\xac", small, 8);
+	ASSERT(strcmp(small, "ab...") == 0);
+	term_sanitize("ab\xe2\x82\xac\xe2\x82\xac", small, 9); /* fits exactly */
+	ASSERT(strcmp(small, "ab\xe2\x82\xac\xe2\x82\xac") == 0);
+
+	term_sanitize(NULL, buf, sizeof(buf));
+	ASSERT(buf[0] == '\0');
+}
+
+static int g_result_calls;
+static int g_result_errors;
+
+static void count_results(const struct tool_call *call, const char *summary,
+			  const struct tool_result *result, void *ctx)
+{
+	(void)call;
+	(void)summary;
+	(void)ctx;
+	g_result_calls++;
+	if (result->is_error)
+		g_result_errors++;
+}
+
+static bool decline_all(const struct tool_call *call, const char *summary, void *ctx)
+{
+	(void)call;
+	(void)summary;
+	(void)ctx;
+	return false;
+}
+
+static void test_observer_sees_every_outcome(void)
+{
+	printf("  Test: observer is told about unknown, disabled, declined and successful calls\n");
+
+	struct agent_configuration cfg = make_cfg();
+	cfg.tools_enabled = TOOL_READ | TOOL_WRITE | TOOL_LIST_DIR;
+	cfg.confirm_writes = true;
+	tools_register_builtins();
+	const struct tool_observer obs = {.confirm = decline_all, .on_result = count_results};
+	tools_set_observer(&obs);
+	g_result_calls = g_result_errors = 0;
+
+	struct tool_call tc;
+	memset(&tc, 0, sizeof(tc));
+	const struct {
+		const char *name, *args;
+	} calls[] = {
+		{"mystery", "{}"},                                     /* unknown  */
+		{"memory", "{\"action\":\"list\"}"},                   /* disabled */
+		{"write", "{\"path\":\"no.txt\",\"content\":\"x\"}"}, /* declined */
+		{"list_dir", "{\"path\":\".\"}"},                      /* success  */
+	};
+	for (size_t i = 0; i < sizeof(calls) / sizeof(calls[0]); i++) {
+		snprintf(tc.name, sizeof(tc.name), "%s", calls[i].name);
+		tc.argument_json = (char *)calls[i].args;
+		struct tool_result r = tools_dispatch(&tc, &cfg);
+		tool_result_free(&r);
+	}
+
+	ASSERT(g_result_calls == 4);
+	ASSERT(g_result_errors == 3);
+
+	tools_set_observer(NULL);
+	configuration_destroy(&cfg);
+}
+
+static void test_write_preserves_mode_and_validates(void)
+{
+	printf("  Test: write - overwrite keeps file mode; bad mode rejected\n");
+
+	struct agent_configuration cfg = make_cfg();
+	char path[512];
+	snprintf(path, sizeof(path), "%s/script.sh", g_sandbox);
+	FILE *f = fopen(path, "w");
+	if (f) {
+		fputs("#!/bin/sh\n", f);
+		fclose(f);
+	}
+	chmod(path, 0755);
+
+	struct tool_result r = tool_write_fn(
+		"{\"path\":\"script.sh\",\"content\":\"#!/bin/sh\\necho hi\\n\"}",
+		&cfg, g_scratch);
+	struct stat st;
+	ASSERT(r.is_error == false);
+	ASSERT(stat(path, &st) == 0 && (st.st_mode & 0777) == 0755);
+	tool_result_free(&r);
+
+	r = tool_write_fn("{\"path\":\"x.txt\",\"content\":\"x\",\"mode\":\"bogus\"}",
+			  &cfg, g_scratch);
+	ASSERT(r.is_error == true);
+	tool_result_free(&r);
+
+	unlink(path);
+	configuration_destroy(&cfg);
+}
+
+static void write_script(const char *name, const char *body)
+{
+	char path[512];
+	snprintf(path, sizeof(path), "%s/%s", g_sandbox, name);
+	FILE *f = fopen(path, "w");
+	if (f) {
+		fputs(body, f);
+		fclose(f);
+	}
+}
+
+static void test_run_script_ignores_stdin(void)
+{
+	printf("  Test: run - script that exits without reading stdin\n");
+
+	write_script("nostdin.sh", "#!/bin/sh\nexit 0\n");
+	struct agent_configuration cfg = make_cfg();
+
+	char json[9000];
+	int p = snprintf(json, sizeof(json), "{\"path\":\"nostdin.sh\",\"stdin\":\"");
+	memset(json + p, 'x', 8000);
+	snprintf(json + p + 8000, sizeof(json) - (size_t)p - 8000, "\"}");
+
+	/* Without SIGPIPE handling this would kill the test process */
+	struct tool_result r = tool_run_fn(json, &cfg, g_scratch);
+	ASSERT(r.content && strstr(r.content, "Exit code: 0"));
+	tool_result_free(&r);
+	configuration_destroy(&cfg);
+}
+
+static void test_run_timeout_after_stdout_closed(void)
+{
+	printf("  Test: run - timeout applies after the script closes stdout\n");
+
+	write_script("detach.sh",
+		     "#!/bin/sh\nexec >/dev/null 2>&1\nsleep 30 &\nsleep 30\n");
+	struct agent_configuration cfg = make_cfg();
+
+	time_t start = time(NULL);
+	struct tool_result r = tool_run_fn(
+		"{\"path\":\"detach.sh\",\"timeout_seconds\":1}", &cfg, g_scratch);
+	ASSERT(time(NULL) - start < 5);
+	ASSERT(r.content && strstr(r.content, "Timed out"));
+	tool_result_free(&r);
+	configuration_destroy(&cfg);
+}
+
+static void test_run_timeout_keeps_python_output(void)
+{
+	printf("  Test: run - a Python script killed at the timeout keeps its output\n");
+
+	/* Found in a live eval: the model's script printed results, then hung;
+	 * block-buffered stdout meant the tool reported nothing. */
+	write_script("hang.py", "import time\nprint('before the hang')\ntime.sleep(30)\n");
+	struct agent_configuration cfg = make_cfg();
+
+	struct tool_result r = tool_run_fn(
+		"{\"path\":\"hang.py\",\"timeout_seconds\":2}", &cfg, g_scratch);
+	ASSERT(r.content && strstr(r.content, "Timed out"));
+	ASSERT(r.content && strstr(r.content, "before the hang"));
+	tool_result_free(&r);
+	configuration_destroy(&cfg);
 }
 
 static void test_memory_set_missing_key(void)
@@ -807,6 +1218,8 @@ int main(void)
 	test_write_create_new_fails_if_exists();
 	test_write_create_dirs();
 	test_write_traversal_blocked();
+	test_write_create_dirs_escape_blocked();
+	test_write_large_content_via_dispatch();
 
 	printf("\n--- List Dir ---\n");
 	test_list_dir_basic();
@@ -823,6 +1236,16 @@ int main(void)
 	test_memory_unknown_action();
 	test_memory_no_persist();
 	test_memory_set_missing_key();
+	test_memory_keys_case_sensitive();
+	test_memory_empty_file();
+	test_confirm_writes();
+	test_format_call_summaries();
+	test_term_sanitize();
+	test_observer_sees_every_outcome();
+	test_write_preserves_mode_and_validates();
+	test_run_script_ignores_stdin();
+	test_run_timeout_after_stdout_closed();
+	test_run_timeout_keeps_python_output();
 
 	printf("\n--- Run ---\n");
 	test_run_output_truncation();

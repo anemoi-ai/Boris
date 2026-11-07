@@ -12,6 +12,10 @@
 
 #include <stddef.h>
 #include <stdbool.h>
+#include <signal.h>
+
+/* Responses larger than this are aborted with an error. */
+#define HTTP_MAX_RESPONSE_BYTES (32 * 1024 * 1024)
 
 /* Result of an HTTP request. Caller must call http_response_free(). */
 struct http_response {
@@ -42,6 +46,13 @@ struct http_response http_post(const char *url,
 			       const char *api_key,
 			       int timeout_secs,
 			       bool verify_ssl);
+
+/*
+ * Register a flag that aborts in-flight requests when it becomes non-zero
+ * (typically set from a SIGINT handler). Pass NULL to clear it. An aborted
+ * request returns with error set.
+ */
+void http_set_cancel_flag(const volatile sig_atomic_t *flag);
 
 /* Free body and error strings inside the response. */
 void http_response_free(struct http_response *response);

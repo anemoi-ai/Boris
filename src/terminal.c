@@ -62,50 +62,8 @@ bool term_supports_color(void)
 }
 
 /* -------------------------------------------------------------------------
- * Cursor movement
+ * Cursor visibility
  * ---------------------------------------------------------------------- */
-
-void term_cursor_up(int n)
-{
-	if (n > 0 && term_is_tty())
-		printf("\033[%dA", n);
-}
-
-void term_cursor_down(int n)
-{
-	if (n > 0 && term_is_tty())
-		printf("\033[%dB", n);
-}
-
-void term_cursor_left(int n)
-{
-	if (n > 0 && term_is_tty())
-		printf("\033[%dD", n);
-}
-
-void term_cursor_right(int n)
-{
-	if (n > 0 && term_is_tty())
-		printf("\033[%dC", n);
-}
-
-void term_cursor_move(int row, int col)
-{
-	if (term_is_tty())
-		printf("\033[%d;%dH", row, col);
-}
-
-void term_cursor_save(void)
-{
-	if (term_is_tty())
-		printf("\033[s");
-}
-
-void term_cursor_restore(void)
-{
-	if (term_is_tty())
-		printf("\033[u");
-}
 
 void term_cursor_hide(void)
 {
@@ -120,27 +78,13 @@ void term_cursor_show(void)
 }
 
 /* -------------------------------------------------------------------------
- * Erasing
+ * Screen
  * ---------------------------------------------------------------------- */
-
-void term_erase_line(void)
-{
-	if (term_is_tty())
-		printf("\033[K");
-}
 
 void term_erase_screen(void)
 {
 	if (term_is_tty())
 		printf("\033[2J\033[H");
-}
-
-void term_erase_lines_above(int n)
-{
-	if (!term_is_tty() || n <= 0)
-		return;
-	for (int i = 0; i < n; i++)
-		printf("\033[A\033[K");
 }
 
 /* -------------------------------------------------------------------------
@@ -192,4 +136,62 @@ void term_print_separator(void)
 		       TERM_DIM, TERM_RESET);
 	else
 		printf("\n");
+}
+
+/* Length of the valid UTF-8 sequence starting at s (1-4), or 0 if invalid. */
+static size_t utf8_seq_len(const unsigned char *s)
+{
+	size_t len = s[0] < 0x80	   ? 1
+		     : (s[0] & 0xE0) == 0xC0 ? 2
+		     : (s[0] & 0xF0) == 0xE0 ? 3
+		     : (s[0] & 0xF8) == 0xF0 ? 4
+					     : 0;
+	for (size_t i = 1; i < len; i++)
+		if ((s[i] & 0xC0) != 0x80)
+			return 0;
+	return len;
+}
+
+void term_sanitize(const char *text, char *buf, size_t size)
+{
+	if (!buf || size == 0)
+		return;
+	buf[0] = '\0';
+	if (!text)
+		return;
+
+	static const char ellipsis[] = "...";
+	size_t out = 0;
+	const unsigned char *p = (const unsigned char *)text;
+
+	while (*p) {
+		size_t len = utf8_seq_len(p);
+		size_t emit = len ? len : 1;
+		/* Room for this character, and for "..." if more text follows */
+		size_t reserve = p[emit] ? sizeof(ellipsis) : 1;
+		if (out + emit + reserve > size) {
+			/* Every accepted character left room for "..." whenever more
+			 * text followed, so this always fits (given size >= 4). */
+			if (size >= sizeof(ellipsis)) {
+				memcpy(buf + out, ellipsis, sizeof(ellipsis));
+				return;
+			}
+			break;
+		}
+
+		if (len == 1) {
+			/* C0 controls (incl. ESC) and DEL become spaces; tab stays */
+			buf[out++] = (*p < 0x20 && *p != '\t') || *p == 0x7F ? ' ' : (char)*p;
+		} else if (len == 0) {
+			buf[out++] = '?'; /* invalid byte, e.g. a raw 0x9B (8-bit CSI) */
+		} else if (len == 2 && p[0] == 0xC2 && p[1] < 0xA0) {
+			buf[out++] = ' '; /* C1 control U+0080..U+009F */
+			buf[out++] = ' ';
+		} else {
+			memcpy(buf + out, p, len);
+			out += len;
+		}
+		p += emit;
+	}
+	buf[out] = '\0';
 }

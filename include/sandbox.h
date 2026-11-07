@@ -12,8 +12,6 @@
 #define SANDBOX_H
 
 #include <stddef.h>
-#include <sys/types.h>
-#include <sys/stat.h>
 
 /*
  * sandbox_resolve - canonicalise path and verify it falls within root.
@@ -29,17 +27,6 @@
 int sandbox_resolve(const char *root, const char *path,
 		    char *out, size_t out_size);
 
-/*
- * sandbox_mkdirp - create directory tree within a resolved path.
- * dir_path must already be sandbox-resolved.
- */
-int sandbox_mkdirp(const char *dir_path, mode_t mode);
-
-/*
- * sandbox_contains - check whether a canonical path is inside the sandbox.
- * Both root and resolved_path must be canonical absolute paths.
- */
-int sandbox_contains(const char *root, const char *resolved_path);
 
 
 #endif /* SANDBOX_H */

@@ -44,6 +44,12 @@ void mock_http_queue_response(const char *json_body, long status_code);
 void mock_http_queue_error(const char *error_msg);
 
 /*
+ * Queue a call that raises SIGINT while "in flight", simulating Ctrl+C
+ * during a model request. The call returns a cancellation error.
+ */
+void mock_http_queue_interrupt(void);
+
+/*
  * Enable the mock HTTP layer.
  *
  * After this call, all http_post() calls will use queued responses

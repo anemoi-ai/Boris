@@ -12,6 +12,7 @@
 #define TERMINAL_H
 
 #include <stdbool.h>
+#include <stddef.h>
 
 /* 4-bit SGR foreground colours */
 #define TERM_FG_BLACK	"\033[30m"
@@ -44,21 +45,12 @@
 bool term_is_tty(void);
 bool term_supports_color(void);
 
-/* Cursor movement */
-void term_cursor_up(int n);
-void term_cursor_down(int n);
-void term_cursor_left(int n);
-void term_cursor_right(int n);
-void term_cursor_move(int row, int col);
-void term_cursor_save(void);
-void term_cursor_restore(void);
+/* Cursor visibility */
 void term_cursor_hide(void);
 void term_cursor_show(void);
 
-/* Erasing */
-void term_erase_line(void);
+/* Clear the whole screen and home the cursor */
 void term_erase_screen(void);
-void term_erase_lines_above(int n);
 
 /* High-level print helpers (these check term_is_tty / term_supports_color) */
 void term_print_color(const char *fg, const char *text);
@@ -66,5 +58,15 @@ void term_print_bold(const char *text);
 void term_print_dim(const char *text);
 void term_printf_color(const char *fg, const char *fmt, ...);
 void term_print_separator(void);
+
+/*
+ * Copy untrusted text (file contents, tool output, model-written arguments)
+ * into buf so it is safe to print on one terminal line: control characters
+ * other than tab, including ESC, become spaces (no cursor moves, screen
+ * clears or OSC sequences), and the result is cut to fit buf on a UTF-8
+ * character boundary, ending in "..." when shortened. buf is always
+ * NUL-terminated.
+ */
+void term_sanitize(const char *text, char *buf, size_t size);
 
 #endif /* TERMINAL_H */

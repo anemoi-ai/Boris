@@ -49,17 +49,10 @@ static int parse_read_args(const char *json, struct read_args *args)
 	if (!root)
 		return -1;
 
-	const char *path = json_get_str(root, "path");
-	if (!path) {
+	if (tools_arg_path(root, args->path, sizeof(args->path)) != 0) {
 		cJSON_Delete(root);
 		return -1;
 	}
-
-	if (strlen(path) >= sizeof(args->path)) {
-		cJSON_Delete(root);
-		return -1;
-	}
-	snprintf(args->path, sizeof(args->path), "%s", path);
 
 	cJSON *offset_node = cJSON_GetObjectItemCaseSensitive(root, "offset");
 	if (offset_node && cJSON_IsNumber(offset_node)) {
@@ -129,6 +122,12 @@ struct tool_result tool_read_fn(const char *arguments_json,
 					  "Path is a directory: %s", args.path);
 	}
 
+	/* FIFOs and devices would block or never end */
+	if (!S_ISREG(st.st_mode)) {
+		return tool_result_errorf("read",
+					  "Not a regular file: %s", args.path);
+	}
+
 	size_t total_size = (size_t)st.st_size;
 	if (args.offset > (long)total_size) {
 		return tool_result_errorf("read", "Offset exceeds file size");
@@ -171,15 +170,32 @@ struct tool_result tool_read_fn(const char *arguments_json,
 	}
 
 	/* Append truncation note in-place — no realloc needed */
-	if ((size_t)args.offset + (size_t)n < total_size) {
+	size_t next = (size_t)args.offset + (size_t)n;
+	if (next < total_size) {
 		int note_len = snprintf(buf + n, READ_TRUNCATION_NOTE_MAX,
-					"\n[File truncated at %ld bytes. Total: %zu bytes. "
-					"Use offset to read further.]",
-					args.length, total_size);
+					"\n[File truncated: showing bytes %ld-%zu of %zu. "
+					"Use offset=%zu to read further.]",
+					args.offset, next, total_size, next);
 		if (note_len > 0)
-			n += note_len;
+			n += note_len < READ_TRUNCATION_NOTE_MAX ? note_len
+								 : READ_TRUNCATION_NOTE_MAX - 1;
 		buf[n] = '\0';
 	}
 
 	return tool_result_ok("read", buf);
+}
+
+/* "notes.md" or "notes.md (from byte 4096)". Display only; never fails. */
+void tool_read_format(const char *argument_json, char *buf, size_t size)
+{
+	cJSON *root = json_parse(argument_json);
+	const char *path = json_get_str(root, "path");
+	int offset = json_get_int(root, "offset", 0);
+	if (!path)
+		snprintf(buf, size, "(invalid arguments)");
+	else if (offset > 0)
+		snprintf(buf, size, "%s (from byte %d)", path, offset);
+	else
+		snprintf(buf, size, "%s", path);
+	cJSON_Delete(root);
 }

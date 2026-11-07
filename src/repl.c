@@ -3,7 +3,8 @@
  *
  * Uses the line editor for cursor movement, history, and tab completion.
  * Colours every prompt and response via the terminal abstraction layer.
- * Sessions are auto-loaded on start and saved on /quit or SIGINT.
+ * The last session is auto-loaded on start and saved on any exit (/quit,
+ * Ctrl+D, Ctrl+C) if the conversation changed.
  */
 #define _POSIX_C_SOURCE 200809L
 
@@ -14,6 +15,8 @@
 #include "logger.h"
 #include "terminal.h"
 #include "editor.h"
+#include "configuration.h"
+#include "fs.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,6 +34,7 @@ struct repl_state {
 	struct conversation_history *conv;
 	const struct agent_configuration *cfg;
 	int should_exit;
+	bool changed; /* conversation modified since start (or last load) */
 };
 
 static volatile sig_atomic_t g_sigint = 0;
@@ -80,7 +84,7 @@ static void spinner_handler(int sig)
 static void spinner_start(void)
 {
 	if (!term_is_tty()) {
-		printf("  Boris is thinking...");
+		printf("  Boris is thinking...\n");
 		fflush(stdout);
 		return;
 	}
@@ -133,6 +137,75 @@ static bool confirm_action(const char *message)
 	while (c != '\n' && c != EOF)
 		c = getchar();
 	return ok;
+}
+
+/*
+ * Tool confirmation hook (behaviour.confirm_writes / confirm_run).
+ * Shows what the model wants to do and asks the user. With no terminal to
+ * ask on, the call is refused rather than consuming piped input.
+ */
+static bool confirm_tool_call(const struct tool_call *call, const char *summary,
+			      void *ctx)
+{
+	(void)ctx;
+	if (!isatty(STDIN_FILENO)) {
+		log_warning("repl: refusing '%s' - confirmation needs a terminal",
+			    call->name);
+		return false;
+	}
+
+	bool spinning = g_spinner_active;
+	spinner_stop();
+
+	char name[64];
+	term_sanitize(call->name, name, sizeof(name));
+	char message[384];
+	snprintf(message, sizeof(message), "Allow %s %s?", name, summary);
+
+	bool ok = confirm_action(message);
+	if (spinning)
+		spinner_start();
+	return ok;
+}
+
+/* Bytes of a tool result shown under each call */
+#define TOOL_PREVIEW_MAX 100
+
+/*
+ * Print one line per tool call and one for its outcome, e.g.
+ *
+ *     > write notes.md (overwrite, 812 bytes)
+ *       ok: Written 812 bytes to /home/sam/.boris/sandbox/notes.md
+ *
+ * Everything shown comes from the model or from files and scripts, so it is
+ * sanitised (no escape sequences) and printed as plain text, never through
+ * the markdown renderer. Based on upstream PR #3 by @ilmich.
+ */
+static void show_tool_result(const struct tool_call *call, const char *summary,
+			     const struct tool_result *result, void *ctx)
+{
+	const struct repl_state *st = ctx;
+	if (!st->cfg->show_tool_calls)
+		return;
+
+	bool spinning = g_spinner_active;
+	spinner_stop();
+
+	char name[64], preview[TOOL_PREVIEW_MAX + 1];
+	term_sanitize(call->name, name, sizeof(name));
+	term_sanitize(result->content ? result->content : "", preview, sizeof(preview));
+
+	term_printf_color(TERM_FG_BRIGHT_CYAN, "    > %s", name);
+	printf(" %s\n", summary);
+	if (result->is_error)
+		term_printf_color(TERM_FG_BRIGHT_RED, "      error: %s\n", preview);
+	else
+		term_printf_color(TERM_FG_BRIGHT_BLACK, "      ok: %s\n",
+				  preview[0] ? preview : "(no output)");
+	fflush(stdout);
+
+	if (spinning)
+		spinner_start();
 }
 
 /* -------------------------------------------------------------------------
@@ -293,6 +366,7 @@ static void cmd_clear(struct repl_state *st, const char *arg)
 		return;
 	}
 	conversation_clear(st->conv);
+	st->changed = true;
 	term_print_color(TERM_FG_BRIGHT_GREEN, "  Conversation cleared. System prompt preserved.\n\n");
 }
 
@@ -310,8 +384,9 @@ static void cmd_reset(struct repl_state *st, const char *arg)
 	conversation_clear(conv);
 	const char *np = (cfg->system_prompt && cfg->system_prompt[0])
 				 ? cfg->system_prompt
-				 : "You are Boris, a helpful AI companion.";
+				 : BORIS_DEFAULT_SYSTEM_PROMPT;
 	conversation_replace_system_prompt(conv, np);
+	st->changed = true;
 	term_print_color(TERM_FG_BRIGHT_GREEN,
 			 "  Conversation reset. System prompt reloaded from config.\n\n");
 }
@@ -336,7 +411,7 @@ static void cmd_save(struct repl_state *st, const char *arg)
 {
 	char *path = (arg && arg[0]) ? strdup(arg) : conversation_session_path();
 	if (!path) {
-		printf("  Cannot determine save path. Set HOME or XDG_DATA_HOME.\n\n");
+		printf("  Cannot determine save path. Set HOME.\n\n");
 		return;
 	}
 	if (st->conv && conversation_save(st->conv, path) == BORIS_OK)
@@ -350,7 +425,7 @@ static void cmd_load(struct repl_state *st, const char *arg)
 {
 	char *path = (arg && arg[0]) ? strdup(arg) : conversation_session_path();
 	if (!path) {
-		printf("  Cannot determine load path. Set HOME or XDG_DATA_HOME.\n\n");
+		printf("  Cannot determine load path. Set HOME.\n\n");
 		return;
 	}
 	struct conversation_history *loaded = conversation_load(path);
@@ -364,6 +439,7 @@ static void cmd_load(struct repl_state *st, const char *arg)
 			}
 		}
 		conversation_destroy(loaded);
+		st->changed = true;
 		printf("  Loaded %zu messages from %s\n\n",
 		       st->conv ? st->conv->count : 0, path);
 	} else {
@@ -375,18 +451,7 @@ static void cmd_load(struct repl_state *st, const char *arg)
 static void cmd_quit(struct repl_state *st, const char *arg)
 {
 	(void)arg;
-	if (st->conv && st->conv->count > 1) {
-		char *session = conversation_session_path();
-		if (session) {
-			if (conversation_save(st->conv, session) == BORIS_OK)
-				printf("  Conversation saved to %s\n", session);
-			free(session);
-		}
-	}
-	printf("\n");
-	term_print_color(TERM_FG_BRIGHT_GREEN, "  Goodbye for now.\n");
-	printf("\n");
-	st->should_exit = 1;
+	st->should_exit = 1; /* session is saved on the way out of repl_run */
 }
 
 /* -------------------------------------------------------------------------
@@ -589,14 +654,26 @@ static void print_session_header(struct conversation_history *conv,
 
 static char *history_path(void)
 {
-	const char *home = getenv("HOME");
-	if (!home)
-		return NULL;
-	char *p = malloc(strlen(home) + 32);
-	if (!p)
-		return NULL;
-	snprintf(p, strlen(home) + 32, "%s/.boris/history.txt", home);
-	return p;
+	return fs_boris_path("history.txt");
+}
+
+/*
+ * Save the conversation to the default session file if it changed during
+ * this run. Starting Boris and leaving straight away (or after a failed
+ * session load) must not overwrite the previous session.
+ */
+static void save_session(const struct repl_state *st)
+{
+	if (!st->conv || !st->changed)
+		return;
+	char *session = conversation_session_path();
+	if (!session)
+		return;
+	if (conversation_save(st->conv, session) == BORIS_OK)
+		printf("  Session saved to %s\n", session);
+	else
+		printf("  Could not save session to %s\n", session);
+	free(session);
 }
 
 /* -------------------------------------------------------------------------
@@ -637,15 +714,11 @@ void repl_run(struct conversation_history *conv,
 	}
 
 	/* Install SIGINT handler */
-#ifndef _WIN32
 	struct sigaction sa;
 	memset(&sa, 0, sizeof(sa));
 	sa.sa_handler = sigint_handler;
 	sigemptyset(&sa.sa_mask);
 	sigaction(SIGINT, &sa, NULL);
-#else
-	signal(SIGINT, sigint_handler);
-#endif
 
 	/* Load history */
 	char *hist_file = history_path();
@@ -654,6 +727,12 @@ void repl_run(struct conversation_history *conv,
 		free(hist_file);
 	}
 	editor_set_completion(slash_completion, NULL);
+	const struct tool_observer observer = {
+		.confirm = confirm_tool_call,
+		.on_result = show_tool_result,
+		.ctx = &state,
+	};
+	tools_set_observer(&observer);
 
 	/* Hints */
 	term_print_dim("  Type your message and press Enter to send, /help for commands.\n");
@@ -753,6 +832,7 @@ void repl_run(struct conversation_history *conv,
 		printf("\n");
 		spinner_start();
 		conversation_add_user(conv, user_input);
+		state.changed = true;
 		editor_history_add(user_input);
 		free(user_input);
 		user_input = NULL;
@@ -783,17 +863,14 @@ repl_done:
 		}
 	}
 
-	/* Ctrl+C path */
-	if (g_sigint) {
-		char *session = conversation_session_path();
-		if (session) {
-			if (conversation_save(conv, session) == BORIS_OK)
-				printf("\n  Interrupted. Session saved to %s\n\n", session);
-			else
-				printf("\n  Interrupted. (Session save failed.)\n\n");
-			free(session);
-		} else {
-			printf("\n  Interrupted.\n\n");
-		}
-	}
+	tools_set_observer(NULL);
+
+	/* Every way out (/quit, Ctrl+D, Ctrl+C) saves the session the same way */
+	printf("\n");
+	if (g_sigint)
+		printf("  Interrupted.\n");
+	save_session(&state);
+	printf("\n");
+	term_print_color(TERM_FG_BRIGHT_GREEN, "  Goodbye for now.\n");
+	printf("\n");
 }
