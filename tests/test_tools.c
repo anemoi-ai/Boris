@@ -899,8 +899,11 @@ static void test_format_call_summaries(void)
 	format_call("mystery", "{\"a\":1}", buf, sizeof(buf));
 	ASSERT(strcmp(buf, "{\"a\":1}") == 0);
 
-	/* Model-written escape sequences never reach the terminal */
-	format_call("read", "{\"path\":\"x\u001b]0;pwned\u0007\u001b[2J.md\"}", buf, sizeof(buf));
+	/* Model-written escape sequences never reach the terminal. They arrive
+	 * JSON-escaped, which cJSON decodes to the raw control bytes. (The
+	 * backslash is doubled: C11 rejects universal character names below
+	 * U+00A0, so a single one does not compile on older compilers.) */
+	format_call("read", "{\"path\":\"x\\u001b]0;pwned\\u0007\\u001b[2J.md\"}", buf, sizeof(buf));
 	ASSERT(strchr(buf, '\x1b') == NULL && strchr(buf, '\x07') == NULL);
 }
 
