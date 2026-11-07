@@ -33,7 +33,7 @@
 
 static bool g_quiet = false;
 
-#define BORIS_VERSION "1.0.0"
+#define BORIS_VERSION "1.1.0"
 
 /* Upper bound on configuration-changing flags in one invocation. */
 #define MAX_CLI_SETTINGS 64
