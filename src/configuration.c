@@ -252,6 +252,8 @@ enum boris_error configuration_set_key(struct agent_configuration *config,
 		return set_string(&config->sandbox_root, value, true);
 	if (strcmp(key, "tools.run_timeout") == 0)
 		return set_int(&config->run_timeout_seconds, key, value);
+	if (strcmp(key, "tools.run_env") == 0)
+		return set_string(&config->run_env, value, false);
 	if (strcmp(key, "tools.memory_persist") == 0)
 		return set_bool(&config->memory_persist, key, value);
 
@@ -424,5 +426,6 @@ void configuration_destroy(struct agent_configuration *config)
 	FREE_AND_NULL(config->system_prompt);
 	FREE_AND_NULL(config->system_prompt_file);
 	FREE_AND_NULL(config->sandbox_root);
+	FREE_AND_NULL(config->run_env);
 	FREE_AND_NULL(config->log_file);
 }

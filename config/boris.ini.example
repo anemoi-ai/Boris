@@ -28,6 +28,10 @@ native_tool_reminder = true
 enabled = read,write,list_dir,memory,run
 sandbox_root = ~/.boris/sandbox
 memory_persist = true
+# Extra environment variables passed to scripts started by run (comma list).
+# Scripts get only PATH, HOME, USER, LOGNAME, LANG, LC_*, TERM, TMPDIR, TZ
+# otherwise; BORIS_* variables are never passed.
+# run_env = VIRTUAL_ENV
 
 [behaviour]
 # Ask before each write / script run (needs an interactive terminal)

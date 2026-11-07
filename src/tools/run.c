@@ -12,6 +12,11 @@
  *   - Extension-based fallback uses a fixed allowlist; no arbitrary commands
  *   - Combined output is capped at RUN_MAX_OUTPUT bytes
  *   - Hard timeout enforced with SIGKILL
+ *   - The child gets an allowlisted environment, not Boris's own: secrets
+ *     such as BORIS_API_KEY are never visible to the script
+ *
+ * The script itself still runs with the user's permissions; the sandbox
+ * only constrains which script is started and its working directory.
  */
 #define _POSIX_C_SOURCE 200809L
 
@@ -37,6 +42,8 @@
 #include <signal.h>
 #include <time.h>
 
+extern char **environ;
+
 #define RUN_MAX_OUTPUT	    65536
 #define RUN_MAX_ARGV	    40	 /* interpreter parts + script + user args + NULL */
 #define RUN_DEFAULT_TIMEOUT 30	 /* seconds */
@@ -44,6 +51,84 @@
 #define RUN_MAX_STDIN	    8192 /* max stdin bytes accepted */
 #define USER_ARGS_MAX	    16
 #define USER_ARG_LEN	    512
+#define RUN_ENV_MAX	    64	 /* entries in the child's environment */
+
+/* -------------------------------------------------------------------------
+ * Child environment
+ * ---------------------------------------------------------------------- */
+
+/* Variables passed through to scripts. Everything else, including every
+ * BORIS_* variable, is dropped. tools.run_env adds names to this list. */
+static const char *const RUN_ENV_ALLOW[] = {
+	"PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE",
+	"TERM", "TMPDIR", "TZ",
+};
+
+#define RUN_DEFAULT_PATH "/usr/local/bin:/usr/bin:/bin"
+
+static bool env_has(char *const *envp, size_t count, const char *name)
+{
+	size_t len = strlen(name);
+	for (size_t i = 0; i < count; i++)
+		if (strncmp(envp[i], name, len) == 0 && envp[i][len] == '=')
+			return true;
+	return false;
+}
+
+static void env_add(char **envp, size_t *count, const char *name,
+		    const char *value, struct memory_arena *scratch)
+{
+	if (*count >= RUN_ENV_MAX - 1 || env_has(envp, *count, name))
+		return;
+	size_t len = strlen(name) + 1 + strlen(value) + 1;
+	char *entry = arena_allocate(scratch, len);
+	if (!entry)
+		return;
+	snprintf(entry, len, "%s=%s", name, value);
+	envp[(*count)++] = entry;
+}
+
+static void env_pass(char **envp, size_t *count, const char *name,
+		     struct memory_arena *scratch)
+{
+	const char *value = getenv(name);
+	if (value)
+		env_add(envp, count, name, value, scratch);
+}
+
+/*
+ * Fill envp (RUN_ENV_MAX entries) with the child's environment, NULL
+ * terminated. Built in the parent so the child does no allocation.
+ */
+static void build_child_env(const struct agent_configuration *cfg,
+			    char **envp, struct memory_arena *scratch)
+{
+	size_t count = 0;
+	for (size_t i = 0; i < sizeof(RUN_ENV_ALLOW) / sizeof(RUN_ENV_ALLOW[0]); i++)
+		env_pass(envp, &count, RUN_ENV_ALLOW[i], scratch);
+
+	if (cfg->run_env && cfg->run_env[0]) {
+		char names[1024];
+		snprintf(names, sizeof(names), "%s", cfg->run_env);
+		char *save = NULL;
+		for (char *tok = strtok_r(names, ", \t", &save); tok;
+		     tok = strtok_r(NULL, ", \t", &save)) {
+			if (strncmp(tok, "BORIS_", 6) == 0) {
+				log_warning("run: tools.run_env: refusing to pass %s "
+					    "to scripts", tok);
+				continue;
+			}
+			env_pass(envp, &count, tok, scratch);
+		}
+	}
+
+	if (!env_has(envp, count, "PATH"))
+		env_add(envp, &count, "PATH", RUN_DEFAULT_PATH, scratch);
+	/* Python block-buffers stdout when it is a pipe, so a script killed at
+	 * the timeout would report no output at all, hiding where it hung. */
+	env_add(envp, &count, "PYTHONUNBUFFERED", "1", scratch);
+	envp[count] = NULL;
+}
 
 /* -------------------------------------------------------------------------
  * Interpreter resolution
@@ -208,17 +293,13 @@ static long elapsed_ms(const struct timespec *start)
 /* Longest a single poll() waits, so timeouts and Ctrl+C are noticed promptly. */
 #define RUN_POLL_SLICE_MS 200
 
-static _Noreturn void exec_in_child(char *const argv[], const char *cwd,
-			  int out_fd, int in_fd)
+static _Noreturn void exec_in_child(char *const argv[], char **envp,
+				    const char *cwd, int out_fd, int in_fd)
 {
 	/* Own process group, so a timeout can kill everything the script
 	 * started, not just the script itself. */
 	setpgid(0, 0);
 	signal(SIGPIPE, SIG_DFL);
-
-	/* Python block-buffers stdout when it is a pipe, so a script killed at
-	 * the timeout would report no output at all, hiding where it hung. */
-	setenv("PYTHONUNBUFFERED", "1", 1);
 
 	dup2(out_fd, STDOUT_FILENO);
 	dup2(out_fd, STDERR_FILENO);
@@ -236,6 +317,8 @@ static _Noreturn void exec_in_child(char *const argv[], const char *cwd,
 		_exit(127);
 	}
 
+	/* execvp searches the PATH of the new environment. */
+	environ = envp;
 	execvp(argv[0], argv);
 	fprintf(stderr, "run: cannot execute '%s': %s\n", argv[0], strerror(errno));
 	_exit(127);
@@ -322,7 +405,7 @@ static bool wait_for_exit(pid_t pid, const struct timespec *start,
  * cwd is the working directory for the child (may be NULL to inherit).
  * Returns a heap-allocated result string, or NULL on internal failure.
  */
-static char *exec_child(char *const argv[], const char *cwd,
+static char *exec_child(char *const argv[], char **envp, const char *cwd,
 			const char *stdin_data, size_t stdin_len,
 			int timeout_seconds)
 {
@@ -350,7 +433,7 @@ static char *exec_child(char *const argv[], const char *cwd,
 		close(out_pipe[0]);
 		if (has_stdin)
 			close(in_pipe[1]);
-		exec_in_child(argv, cwd, out_pipe[1], in_pipe[0]);
+		exec_in_child(argv, envp, cwd, out_pipe[1], in_pipe[0]);
 	}
 
 	close(out_pipe[1]);
@@ -496,7 +579,10 @@ struct tool_result tool_run_fn(const char *arguments_json,
 	log_info("run: %s (interpreter=%s, timeout=%ds)",
 		 resolved, exec_argv[0], timeout);
 
-	char *output = exec_child((char *const *)exec_argv, dir_buf,
+	char *envp[RUN_ENV_MAX];
+	build_child_env(cfg, envp, scratch);
+
+	char *output = exec_child((char *const *)exec_argv, envp, dir_buf,
 				  args.stdin_data, args.stdin_len, timeout);
 	if (!output)
 		return tool_result_errorf("run", "Failed to launch process");

@@ -1061,6 +1061,40 @@ static void test_run_script_ignores_stdin(void)
 	configuration_destroy(&cfg);
 }
 
+static void test_run_environment_allowlist(void)
+{
+	printf("  Test: run - scripts do not see BORIS_* variables\n");
+
+	setenv("BORIS_API_KEY", "sk-secret-test-key", 1);
+	setenv("BORIS_EXTRA", "also-secret", 1);
+	setenv("RUN_ENV_TEST_VAR", "passed-through", 1);
+	setenv("RUN_ENV_HIDDEN_VAR", "not-listed", 1);
+	write_script("env.sh", "#!/bin/sh\nenv\n");
+
+	struct agent_configuration cfg = make_cfg();
+	struct tool_result r = tool_run_fn("{\"path\":\"env.sh\"}", &cfg, g_scratch);
+	ASSERT(r.content && strstr(r.content, "Exit code: 0"));
+	ASSERT(r.content && !strstr(r.content, "sk-secret-test-key"));
+	ASSERT(r.content && !strstr(r.content, "RUN_ENV_TEST_VAR"));
+	ASSERT(r.content && strstr(r.content, "PATH="));
+	ASSERT(r.content && strstr(r.content, "PYTHONUNBUFFERED=1"));
+	tool_result_free(&r);
+
+	/* tools.run_env adds names, but never BORIS_* ones */
+	cfg.run_env = strdup("RUN_ENV_TEST_VAR, BORIS_EXTRA");
+	r = tool_run_fn("{\"path\":\"env.sh\"}", &cfg, g_scratch);
+	ASSERT(r.content && strstr(r.content, "RUN_ENV_TEST_VAR=passed-through"));
+	ASSERT(r.content && !strstr(r.content, "also-secret"));
+	ASSERT(r.content && !strstr(r.content, "RUN_ENV_HIDDEN_VAR"));
+	tool_result_free(&r);
+	configuration_destroy(&cfg);
+
+	unsetenv("BORIS_API_KEY");
+	unsetenv("BORIS_EXTRA");
+	unsetenv("RUN_ENV_TEST_VAR");
+	unsetenv("RUN_ENV_HIDDEN_VAR");
+}
+
 static void test_run_timeout_after_stdout_closed(void)
 {
 	printf("  Test: run - timeout applies after the script closes stdout\n");
@@ -1244,6 +1278,7 @@ int main(void)
 	test_observer_sees_every_outcome();
 	test_write_preserves_mode_and_validates();
 	test_run_script_ignores_stdin();
+	test_run_environment_allowlist();
 	test_run_timeout_after_stdout_closed();
 	test_run_timeout_keeps_python_output();
 

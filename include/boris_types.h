@@ -53,6 +53,7 @@ struct agent_configuration {
 	unsigned int tools_enabled; /* Bitmask of enabled tools (TOOL_* constants) */
 	char *sandbox_root;
 	int run_timeout_seconds;
+	char *run_env; /* extra environment variable names passed to run scripts */
 
 	bool verify_ssl;
 

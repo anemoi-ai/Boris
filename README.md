@@ -165,7 +165,9 @@ Dependency direction is strict: `main` → `repl/init` → `agent` → `llm/tool
 | `write` | Write files safely | Atomic: temp + `rename()`; overwrite / append / create_new |
 | `list_dir` | List directory contents | Names, types, sizes; hidden files excluded by default |
 | `memory` | Persistent key-value store | JSON on disk, file-locked; get / set / delete / list |
-| `run` | Execute a script in the sandbox | Detects interpreter from shebang or extension; fork/exec, never `system()`; SIGKILL timeout |
+| `run` | Execute a script in the sandbox | Shebang or extension; fork/exec, never `system()`; SIGKILL timeout; allowlisted environment |
+
+Scripts started by `run` see only an allowlisted environment (`PATH`, `HOME`, locale and a few others), never `BORIS_API_KEY`. They still run with your permissions, so `behaviour.confirm_run = true` is the safeguard if you need one.
 
 ---
 
