@@ -1439,6 +1439,116 @@ static void test_exec_error_status(void)
 	configuration_destroy(&cfg);
 }
 
+/* Queue n tool turns (call i gets args_fmt with %d = i), then a stop. */
+static void queue_tool_turns(int n, const char *tool, const char *args_fmt)
+{
+	for (int i = 0; i < n; i++) {
+		char id[32], args[256];
+		snprintf(id, sizeof(id), "call_%d", i);
+		snprintf(args, sizeof(args), args_fmt, i);
+		char *tc = make_tool_response(NULL, id, tool, args);
+		mock_http_queue_response(tc, 200);
+		free(tc);
+	}
+	char *stop = make_stop_response("done");
+	mock_http_queue_response(stop, 200);
+	free(stop);
+}
+
+static void test_progress_is_not_nagged(void)
+{
+	printf("  Test: productive tool turns get no stall reminder\n");
+	mock_http_reset();
+	/* Eight turns, each a different plan update: real progress */
+	queue_tool_turns(8, "plan", "{\"action\":\"update\",\"steps\":[{\"step\":\"step %d\","
+				    "\"status\":\"in_progress\"}]}");
+	struct agent_configuration cfg = make_test_config();
+	cfg.max_iterations = 12;
+	cfg.tools_enabled = TOOL_PLAN;
+	tools_register_builtins();
+	struct conversation_history *conv = conversation_create();
+	conversation_add_user(conv, "go");
+	struct agent_result r = agent_run_conv(conv, &cfg);
+
+	ASSERT(r.finish_reason == FINISHED_NATURALLY, "finishes");
+	ASSERT(!conv_contains(conv, "have not changed anything"), "no stall reminder");
+	ASSERT(!conv_contains(conv, "<system-reminder>"), "no reminder of any kind");
+	agent_result_free(&r);
+	conversation_destroy(conv);
+	configuration_destroy(&cfg);
+	tool_plan_reset();
+}
+
+static void test_stall_is_reminded(void)
+{
+	printf("  Test: tool turns that only repeat earlier calls get the stall reminder\n");
+	mock_http_reset();
+	/* Alternate two lookups: never the same as the previous turn (so no
+	 * repeat reminder), but nothing new after the first two turns. */
+	char sandbox[64];
+	snprintf(sandbox, sizeof(sandbox), "/tmp/boris_e2e_stall_%d", (int)getpid());
+	mkdir(sandbox, 0755);
+	for (int i = 0; i < 6; i++) {
+		char id[32];
+		snprintf(id, sizeof(id), "call_%d", i);
+		char *tc = make_tool_response(NULL, id, "list_dir",
+					      i % 2 ? "{\"path\":\".\",\"show_hidden\":true}"
+						    : "{\"path\":\".\"}");
+		mock_http_queue_response(tc, 200);
+		free(tc);
+	}
+	char *stop = make_stop_response("done");
+	mock_http_queue_response(stop, 200);
+	free(stop);
+
+	struct agent_configuration cfg = make_test_config();
+	cfg.max_iterations = 12;
+	cfg.sandbox_root = strdup(sandbox);
+	cfg.tools_enabled = TOOL_LIST_DIR;
+	tools_register_builtins();
+	struct conversation_history *conv = conversation_create();
+	conversation_add_user(conv, "go");
+	struct agent_result r = agent_run_conv(conv, &cfg);
+
+	ASSERT(conv_contains(conv, "have not changed anything"), "stall reminder injected");
+	ASSERT(!conv_contains(conv, "same tool call(s) as the previous turn"), "not a repeat");
+	/* Turns 3, 4 and 5 stall: the reminder follows turn 5, i.e. it is in
+	 * the 6th request, not the 5th */
+	ASSERT(mock_http_request_body(4) && !strstr(mock_http_request_body(4), "have not changed"),
+	       "not before three stalled turns");
+	ASSERT(mock_http_request_body(5) && strstr(mock_http_request_body(5), "have not changed"),
+	       "after three stalled turns");
+	rmdir(sandbox);
+	agent_result_free(&r);
+	conversation_destroy(conv);
+	configuration_destroy(&cfg);
+}
+
+static void test_budget_reminder(void)
+{
+	printf("  Test: two iterations before max_iterations, the model is told to wrap up\n");
+	mock_http_reset();
+	queue_tool_turns(8, "plan", "{\"action\":\"update\",\"steps\":[{\"step\":\"s%d\","
+				    "\"status\":\"pending\"}]}");
+	struct agent_configuration cfg = make_test_config();
+	cfg.max_iterations = 6;
+	cfg.tools_enabled = TOOL_PLAN;
+	tools_register_builtins();
+	struct conversation_history *conv = conversation_create();
+	conversation_add_user(conv, "go");
+	struct agent_result r = agent_run_conv(conv, &cfg);
+
+	ASSERT(mock_http_request_body(3) && !strstr(mock_http_request_body(3), "iterations left"),
+	       "not too early");
+	ASSERT(mock_http_request_body(4) && strstr(mock_http_request_body(4), "2 iterations left"),
+	       "fires with two iterations left");
+	ASSERT(r.finish_reason == FINISHED_MAX_ITERATIONS, "the scripted model ignores it");
+	agent_result_free(&r);
+	conversation_destroy(conv);
+	configuration_destroy(&cfg);
+	tool_plan_reset();
+}
+
 static void test_garbled_response_is_retried(void)
 {
 	printf("  Test: a 200 response that does not parse is retried\n");
@@ -1592,6 +1702,9 @@ int main(void)
 	test_exec_error_status();
 	test_exec_session_round_trip();
 	test_garbled_response_is_retried();
+	test_progress_is_not_nagged();
+	test_stall_is_reminded();
+	test_budget_reminder();
 	test_trace_file();
 
 	printf("\n--- E2E Results ---\n");

@@ -55,7 +55,8 @@ The loop is instrumented. Boris watches the model's behaviour turn by turn and i
 |---|---|
 | 3 consecutive tool errors | Stop and rethink — re-read errors, check assumptions |
 | Repeated identical tool calls | The previous result already answered your question, or the call is wrong |
-| 6+ tool turns with no summary | Pause and state what you have learned before continuing |
+| 3 tool turns in a row with no progress (only repeats or failures) | Check earlier results and take a different approach, or finish |
+| 2 iterations left before `max_iterations` | Finish the current step and summarise what is done and left |
 | Response cut off by `max_tokens` | Continue from where you left off (up to 3 continuations) |
 | Context full, history truncated | Earlier results no longer visible — re-fetch via tools if needed |
 | Model uses text tool calls instead of native | Prefer the native channel, it's more reliable |
@@ -76,7 +77,7 @@ The system prompt is extended automatically with an explanation of `<system-remi
 
 **Error propagation without exceptions.** Every function that can fail returns `enum boris_error`. Every caller checks it. There are no unchecked paths. This is what makes the agent actually reliable.
 
-**Agentic self-correction.** `src/agent.c` shows how to monitor a ReAct loop in real time — tracking consecutive errors, repeated calls, context drift — and recover the model without terminating the session.
+**Agentic self-correction.** `src/agent.c` shows how to monitor a ReAct loop in real time — tracking consecutive errors, repeated calls, turns that make no progress — and recover the model without terminating the session.
 
 ---
 

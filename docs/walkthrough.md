@@ -60,8 +60,10 @@ struct loop_state {
 	int completion_tokens;
 	int continuation_count;
 	int consecutive_tool_errors;
-	int consecutive_toolcall_turns;
+	int stalled_turns;
 	uint64_t last_tool_fingerprint;
+	uint64_t seen_calls[SEEN_CALLS_MAX];
+	size_t seen_count;
 	int last_reminder_iter[REMIND_COUNT];
 	char *last_response;
 };
@@ -83,7 +85,7 @@ Each of those counters also has a story. Let me give you the short version.
 
 `consecutive_tool_errors` is reset to zero on every successful tool call, incremented on every failed one. When it hits three, we inject a reminder telling the model to stop and rethink.
 
-`consecutive_toolcall_turns` counts how many turns in a row the model has only called tools, without producing a text response. Used to detect drift — an agent that's busy doing things but has stopped checking in.
+`stalled_turns` counts tool turns in a row that made no progress. A turn makes progress when any call succeeds and either changes something (`write`, `edit`, `move`, `delete`, a memory or plan update) or is new in this run; `seen_calls` holds the fingerprints of every call made so far. This replaced an earlier rule that fired after any six tool turns: an eval audit (`evals/reminder_audit.py`) found 87% of those reminders interrupted an agent that was making steady progress, and its "pause and summarise" wording sometimes ended the run, because a text-only reply is the loop's signal to stop.
 
 `last_reminder_iter[kind]` is the iteration each kind of reminder last fired on. `maybe_remind()` uses `iterations - last_reminder_iter[kind] >= REMINDER_COOLDOWN_ITERS` as a "is it OK to fire this again yet?" check. Five iterations of cooldown means we can't double-nudge the model. (This is one of those numbers that came from staring at logs. Three felt like nagging. Seven let the agent drift for too long. Five turned out right.)
 
@@ -286,23 +288,27 @@ for (size_t i = 0; i < calls->count; i++) {
 
 A successful tool call resets `consecutive_tool_errors` to zero. A failed one increments it. The counter is global to the *run*, not to a single turn — three errors across three turns trigger the reminder just as readily as three in one turn. That's deliberate; if the model is consistently misusing one tool, we want to nudge it regardless of pacing.
 
-After the loop, we increment `consecutive_toolcall_turns`, reset `continuation_count` (a completed tool turn means the last cut-off was recovered from), and then we decide whether to inject a reminder. Three independent checks, each going through `maybe_remind()`, which handles the cooldown:
+Inside the loop, each call is also checked for progress: it succeeded, and it either changes state or is a call this run has not made before (`remember_call()` looks its fingerprint up in `seen_calls`). After the loop, `stalled_turns` is reset if any call made progress and incremented if none did, `continuation_count` is reset (a completed tool turn means the last cut-off was recovered from), and then we decide whether to inject a reminder. The checks run in order and at most one fires, each going through `maybe_remind()`, which handles the cooldown:
 
 ```c
-if (st->consecutive_tool_errors >= TOOL_ERROR_THRESHOLD &&
+int left = cfg->max_iterations - st->iterations;
+if (cfg->max_iterations >= BUDGET_MIN_ITERATIONS && left == BUDGET_WARN_LEFT &&
+    maybe_remind(conv, st, REMIND_BUDGET)) {
+    /* the end is near: that matters more than anything below */
+} else if (st->consecutive_tool_errors >= TOOL_ERROR_THRESHOLD &&
     maybe_remind(conv, st, REMIND_TOOL_ERRORS)) {
     st->consecutive_tool_errors = 0;
 } else if (repeated && maybe_remind(conv, st, REMIND_REPEATED_CALLS)) {
     /* nothing else */
-} else if (st->consecutive_toolcall_turns >= DRIFT_STUCK_THRESHOLD &&
-           maybe_remind(conv, st, REMIND_DRIFT)) {
-    st->consecutive_toolcall_turns = 0;
+} else if (st->stalled_turns >= STALL_THRESHOLD &&
+           maybe_remind(conv, st, REMIND_STALLED)) {
+    st->stalled_turns = 0;
 } else if (from_text) {
     maybe_remind(conv, st, REMIND_TEXT_FALLBACK);
 }
 ```
 
-Three reminders, three different reset behaviours. The error reminder resets the error counter — we've nudged, we'll wait to see if it improves. The repeat reminder doesn't reset anything; the fingerprint check naturally suppresses itself once the model changes behaviour. The drift reminder resets the drift counter — same logic as the error reminder. These three reset patterns came out of watching the loop run, not from designing them up front. The naive "reset everything" version was annoying in different ways for different kinds of agent stuckness.
+The budget reminder comes first because nothing else matters if the run is about to stop: two iterations before `max_iterations` it asks the model to finish its step and summarise, so the user gets an answer rather than whatever the model last said mid-task. After that, three reminders, three different reset behaviours. The error reminder resets the error counter — we've nudged, we'll wait to see if it improves. The repeat reminder doesn't reset anything; the fingerprint check naturally suppresses itself once the model changes behaviour. The stall reminder resets the stall counter — same logic as the error reminder. These three reset patterns came out of watching the loop run, not from designing them up front. The naive "reset everything" version was annoying in different ways for different kinds of agent stuckness.
 
 They're also `else if`, not three independent `if`s. We inject at most one reminder per turn. Stacking three reminders on top of each other into a single user message confuses the model and makes it harder to debug what fired.
 

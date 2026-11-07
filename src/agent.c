@@ -183,8 +183,14 @@ static int parse_text_tool_calls(const char *text,
 
 #define MAX_CONTINUATIONS	3
 #define REMINDER_COOLDOWN_ITERS 5
-#define DRIFT_STUCK_THRESHOLD	6
 #define TOOL_ERROR_THRESHOLD	3
+/* Tool turns in a row without progress before the stall reminder. */
+#define STALL_THRESHOLD		3
+/* Distinct calls remembered per run, to tell new calls from repeats. */
+#define SEEN_CALLS_MAX		256
+/* Iterations left when the budget reminder fires (runs this long or more). */
+#define BUDGET_WARN_LEFT	2
+#define BUDGET_MIN_ITERATIONS	6
 
 static const char SYSTEM_REMINDER_DECLARATION[] =
 	"\n\nUser messages may contain <system-reminder> blocks. "
@@ -209,7 +215,8 @@ static void agent_sigint_handler(int sig)
 enum reminder_kind {
 	REMIND_TOOL_ERRORS,
 	REMIND_REPEATED_CALLS,
-	REMIND_DRIFT,
+	REMIND_STALLED,
+	REMIND_BUDGET,
 	REMIND_TRUNCATION,
 	REMIND_TEXT_FALLBACK,
 	REMIND_COUNT,
@@ -228,12 +235,18 @@ static const char *const REMINDER_TEXT[REMIND_COUNT] = {
 		"answers your question (in which case use it) or "
 		"the call is wrong and repeating it won't change "
 		"the outcome (in which case adjust your approach).",
-	[REMIND_DRIFT] =
-		"You have been executing tools for several turns "
-		"without summarising findings. Pause: state what "
-		"you have learned so far, what still needs to be "
-		"done, and whether the current approach is working. "
-		"Then continue.",
+	/* Worded so the model keeps working: a text-only reply ends the run,
+	 * so this must not ask it to stop and report. */
+	[REMIND_STALLED] =
+		"Your last few tool calls have not changed anything or "
+		"found anything new: they repeated earlier calls or "
+		"failed. Check what earlier results already told you, "
+		"then take a different approach. If the task is "
+		"already done, give the final answer.",
+	[REMIND_BUDGET] =
+		"You have 2 iterations left in this run. Finish the "
+		"step you are on, then reply with a short summary of "
+		"what is done and what is left.",
 	[REMIND_TRUNCATION] =
 		"The conversation was truncated to free context "
 		"space. Earlier tool results and messages may no "
@@ -254,8 +267,10 @@ struct loop_state {
 	int completion_tokens;
 	int continuation_count;
 	int consecutive_tool_errors;
-	int consecutive_toolcall_turns;
+	int stalled_turns; /* tool turns in a row that made no progress */
 	uint64_t last_tool_fingerprint;
+	uint64_t seen_calls[SEEN_CALLS_MAX]; /* fingerprints of calls made this run */
+	size_t seen_count;
 	int last_reminder_iter[REMIND_COUNT];
 	char *last_response; /* most recent non-empty content, heap */
 };
@@ -374,9 +389,40 @@ static uint64_t turn_fingerprint(const struct tool_call_list *calls)
 	return h;
 }
 
+/* Record a call; true if this run has not made it before. */
+static bool remember_call(struct loop_state *st, uint64_t fp)
+{
+	for (size_t i = 0; i < st->seen_count; i++)
+		if (st->seen_calls[i] == fp)
+			return false;
+	if (st->seen_count < SEEN_CALLS_MAX)
+		st->seen_calls[st->seen_count++] = fp;
+	return true;
+}
+
+/* Does this call change state (files, memory, the plan)? Lookups do not. */
+static bool changes_state(const struct tool_call *tc)
+{
+	static const char *const writers[] = {"write", "edit", "move", "delete"};
+	for (size_t i = 0; i < sizeof(writers) / sizeof(writers[0]); i++)
+		if (strcmp(tc->name, writers[i]) == 0)
+			return true;
+	if (strcmp(tc->name, "memory") != 0 && strcmp(tc->name, "plan") != 0)
+		return false;
+	cJSON *args = json_parse(tc->argument_json ? tc->argument_json : "");
+	const char *action = json_get_str(args, "action");
+	bool lookup = action && (strcmp(action, "get") == 0 || strcmp(action, "list") == 0);
+	cJSON_Delete(args);
+	return !lookup;
+}
+
 /*
  * Run every call in a turn, append the results, then inject at most one
- * corrective reminder. The assistant message carrying the calls must
+ * corrective reminder.
+ *
+ * A turn makes progress when any call succeeds and either changes state or
+ * is new in this run. Busy, productive work is left alone; only turns that
+ * repeat themselves or fail count towards the stall reminder. The assistant message carrying the calls must
  * already be in conv: tool results have to follow it directly, so
  * reminders are only added after all results.
  */
@@ -389,6 +435,7 @@ static void dispatch_tool_turn(struct conversation_history *conv,
 	uint64_t fp = turn_fingerprint(calls);
 	bool repeated = (st->last_tool_fingerprint == fp);
 	st->last_tool_fingerprint = fp;
+	bool progress = false;
 
 	for (size_t i = 0; i < calls->count; i++) {
 		const struct tool_call *tc = &calls->calls[i];
@@ -400,6 +447,9 @@ static void dispatch_tool_turn(struct conversation_history *conv,
 		st->consecutive_tool_errors = result.is_error
 						      ? st->consecutive_tool_errors + 1
 						      : 0;
+		bool fresh = remember_call(st, tool_call_fingerprint(tc));
+		if (!result.is_error && (fresh || changes_state(tc)))
+			progress = true;
 
 		log_debug("agent: tool '%s' %s: %.120s", tc->name,
 			  result.is_error ? "ERROR" : "OK",
@@ -410,17 +460,21 @@ static void dispatch_tool_turn(struct conversation_history *conv,
 		tool_result_free(&result);
 	}
 
-	st->consecutive_toolcall_turns++;
+	st->stalled_turns = progress ? 0 : st->stalled_turns + 1;
 	st->continuation_count = 0;
 
-	if (st->consecutive_tool_errors >= TOOL_ERROR_THRESHOLD &&
-	    maybe_remind(conv, st, REMIND_TOOL_ERRORS)) {
+	int left = cfg->max_iterations - st->iterations;
+	if (cfg->max_iterations >= BUDGET_MIN_ITERATIONS && left == BUDGET_WARN_LEFT &&
+	    maybe_remind(conv, st, REMIND_BUDGET)) {
+		/* the end is near: that matters more than anything below */
+	} else if (st->consecutive_tool_errors >= TOOL_ERROR_THRESHOLD &&
+		   maybe_remind(conv, st, REMIND_TOOL_ERRORS)) {
 		st->consecutive_tool_errors = 0;
 	} else if (repeated && maybe_remind(conv, st, REMIND_REPEATED_CALLS)) {
 		/* nothing else */
-	} else if (st->consecutive_toolcall_turns >= DRIFT_STUCK_THRESHOLD &&
-		   maybe_remind(conv, st, REMIND_DRIFT)) {
-		st->consecutive_toolcall_turns = 0;
+	} else if (st->stalled_turns >= STALL_THRESHOLD &&
+		   maybe_remind(conv, st, REMIND_STALLED)) {
+		st->stalled_turns = 0;
 	} else if (from_text && cfg->native_tool_reminder) {
 		maybe_remind(conv, st, REMIND_TEXT_FALLBACK);
 	}
@@ -619,8 +673,8 @@ static struct agent_result run_loop(struct conversation_history *conv,
 			continue;
 		}
 
-		/* Any non-tool_calls turn resets the drift counter. */
-		st.consecutive_toolcall_turns = 0;
+		/* A non-tool turn is not a stalled tool turn. */
+		st.stalled_turns = 0;
 
 		/* LENGTH: either max_tokens response cap or context window full */
 		if (strcmp(resp->finish_reason, LLM_FINISH_LENGTH) == 0) {
