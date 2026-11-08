@@ -667,6 +667,155 @@ static void parse_streaming(struct llm_response *r, const char *body)
 	stream_accum_free(&ss.tc_accum);
 }
 
+/* -------------------------------------------------------------------------
+ * Live streaming display
+ *
+ * While a streamed reply arrives, each complete SSE line is parsed and its
+ * content delta passed to the text observer. The full body is still parsed
+ * afterwards (parse_streaming) for tool calls, usage and the stored reply;
+ * this path only decides what the user sees, and when.
+ * ---------------------------------------------------------------------- */
+
+#define LIVE_LINE_MAX (8 * 1024 * 1024)
+
+static llm_text_fn g_text_fn = NULL;
+static void *g_text_ctx = NULL;
+
+void llm_set_text_observer(llm_text_fn fn, void *ctx)
+{
+	g_text_fn = fn;
+	g_text_ctx = ctx;
+}
+
+struct live_stream {
+	char *line; /* the SSE line being assembled */
+	size_t len, cap;
+	bool overflow;	 /* current line too long: skip it */
+	bool in_think;	 /* inside <think>...</think> */
+	bool skip_space; /* drop whitespace before the first visible text */
+	char tail[16];	 /* text that may be the start of a tag */
+	size_t tail_len;
+};
+
+static void live_emit(struct live_stream *ls, const char *s, size_t n)
+{
+	while (ls->skip_space && n > 0 && (*s == ' ' || *s == '\n' || *s == '\r' || *s == '\t')) {
+		s++;
+		n--;
+	}
+	if (n == 0)
+		return;
+	ls->skip_space = false;
+	g_text_fn(s, n, g_text_ctx);
+}
+
+/* Longest suffix of s[0..n) that is a proper prefix of tag. */
+static size_t partial_tag(const char *s, size_t n, const char *tag)
+{
+	size_t tl = strlen(tag);
+	for (size_t k = n < tl - 1 ? n : tl - 1; k > 0; k--)
+		if (memcmp(s + n - k, tag, k) == 0)
+			return k;
+	return 0;
+}
+
+/* Show text minus <think> blocks; tags may be split across deltas. */
+static void live_text(struct live_stream *ls, const char *text)
+{
+	size_t tlen = strlen(text);
+	char *buf = malloc(ls->tail_len + tlen + 1);
+	if (!buf)
+		return;
+	memcpy(buf, ls->tail, ls->tail_len);
+	memcpy(buf + ls->tail_len, text, tlen + 1);
+	size_t left = ls->tail_len + tlen;
+	ls->tail_len = 0;
+
+	const char *p = buf;
+	while (left > 0) {
+		const char *tag = ls->in_think ? "</think>" : "<think>";
+		const char *hit = strstr(p, tag);
+		if (hit) {
+			if (!ls->in_think)
+				live_emit(ls, p, (size_t)(hit - p));
+			else
+				ls->skip_space = true; /* no blank lines where it was */
+			ls->in_think = !ls->in_think;
+			left -= (size_t)(hit - p) + strlen(tag);
+			p = hit + strlen(tag);
+			continue;
+		}
+		size_t keep = partial_tag(p, left, tag);
+		if (!ls->in_think)
+			live_emit(ls, p, left - keep);
+		memcpy(ls->tail, p + left - keep, keep);
+		ls->tail_len = keep;
+		break;
+	}
+	free(buf);
+}
+
+static void live_line(struct live_stream *ls, const char *line, size_t n)
+{
+	if (n > 0 && line[n - 1] == '\r')
+		n--;
+	if (n < 5 || memcmp(line, "data:", 5) != 0)
+		return;
+	line += 5;
+	n -= 5;
+	while (n > 0 && *line == ' ') {
+		line++;
+		n--;
+	}
+	if (n == 6 && memcmp(line, "[DONE]", 6) == 0)
+		return;
+	cJSON *root = cJSON_ParseWithLength(line, n);
+	cJSON *choices = cJSON_GetObjectItemCaseSensitive(root, "choices");
+	cJSON *delta = cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(choices, 0), "delta");
+	const char *content = json_get_str(delta, "content");
+	if (content && content[0])
+		live_text(ls, content);
+	cJSON_Delete(root);
+}
+
+/* http_chunk_fn: assemble SSE lines from arbitrary pieces. */
+static void live_chunk(const char *data, size_t len, void *ctx)
+{
+	struct live_stream *ls = ctx;
+	for (size_t i = 0; i < len; i++) {
+		char c = data[i];
+		if (c == '\n') {
+			if (!ls->overflow)
+				live_line(ls, ls->line ? ls->line : "", ls->len);
+			ls->len = 0;
+			ls->overflow = false;
+			continue;
+		}
+		if (ls->overflow)
+			continue;
+		if (ls->len + 1 >= ls->cap) {
+			size_t cap = ls->cap ? ls->cap * 2 : 4096;
+			char *grown = cap <= LIVE_LINE_MAX ? realloc(ls->line, cap) : NULL;
+			if (!grown) {
+				ls->overflow = true; /* only the display misses it */
+				continue;
+			}
+			ls->line = grown;
+			ls->cap = cap;
+		}
+		ls->line[ls->len++] = c;
+	}
+}
+
+static void live_finish(struct live_stream *ls)
+{
+	if (ls->len > 0 && !ls->overflow)
+		live_line(ls, ls->line, ls->len);
+	if (ls->tail_len > 0 && !ls->in_think)
+		live_emit(ls, ls->tail, ls->tail_len); /* a lone "<" was just text */
+	free(ls->line);
+}
+
 /*
  * A body is SSE if its first non-blank line is an SSE field. Detection is
  * by content, not by cfg->stream_responses, because servers that do not
@@ -719,11 +868,19 @@ struct llm_response *llm_complete(const struct conversation_history *conv,
 	struct timespec t_start, t_end;
 	clock_gettime(CLOCK_MONOTONIC, &t_start);
 
-	struct http_response http_resp = http_post(
-		url, body, "application/json",
-		config->api_key,
-		config->request_timeout_seconds > 0 ? config->request_timeout_seconds : 120,
-		config->verify_ssl);
+	int timeout = config->request_timeout_seconds > 0 ? config->request_timeout_seconds : 120;
+	struct http_response http_resp;
+	if (config->stream_responses && g_text_fn) {
+		struct live_stream live;
+		memset(&live, 0, sizeof(live));
+		live.skip_space = true;
+		http_resp = http_post_stream(url, body, "application/json", config->api_key,
+					     timeout, config->verify_ssl, live_chunk, &live);
+		live_finish(&live);
+	} else {
+		http_resp = http_post(url, body, "application/json", config->api_key,
+				      timeout, config->verify_ssl);
+	}
 
 	clock_gettime(CLOCK_MONOTONIC, &t_end);
 	double latency_ms = (t_end.tv_sec - t_start.tv_sec) * 1000.0 +

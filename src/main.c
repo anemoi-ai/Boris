@@ -26,6 +26,7 @@
 #include "version.h"
 #include "exec.h"
 #include "trace.h"
+#include "instructions.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,6 +35,7 @@
 #include <signal.h>
 #include <stdbool.h>
 #include <ctype.h>
+#include <limits.h>
 #include <unistd.h>
 
 static bool g_quiet = false;
@@ -179,6 +181,27 @@ static void load_system_prompt_file(struct agent_configuration *config)
 
 /* Long-only option codes (no short form). */
 #define OPT_SESSION 1001
+
+/*
+ * Fold the project's BORIS.md / AGENTS.md into the system prompt (see
+ * instructions.h). Returns the source name to show the user, or NULL.
+ */
+static const char *apply_project_instructions(struct agent_configuration *config)
+{
+	static char source[PATH_MAX];
+	char *text = instructions_load(config, source, sizeof(source));
+	if (!text)
+		return NULL;
+	char *composed = instructions_compose(
+		config->system_prompt ? config->system_prompt : BORIS_DEFAULT_SYSTEM_PROMPT,
+		text, source);
+	free(text);
+	if (!composed)
+		return NULL;
+	free(config->system_prompt);
+	config->system_prompt = composed;
+	return source;
+}
 
 /* Options that are not configuration keys. */
 struct cli_flags {
@@ -328,6 +351,7 @@ static int cmd_chat(int argc, char *argv[])
 	logger_initialize((enum log_level)config.log_level, config.log_file);
 
 	load_system_prompt_file(&config);
+	const char *instructions = apply_project_instructions(&config);
 
 	log_info("Boris v%s starting chat", BORIS_VERSION);
 
@@ -362,6 +386,9 @@ static int cmd_chat(int argc, char *argv[])
 		term_erase_screen();
 		print_banner();
 	}
+	if (instructions && !g_quiet)
+		term_printf_color(TERM_FG_BRIGHT_BLACK,
+				  "  Using project instructions from %s\n\n", instructions);
 
 	/* A script that exits without reading its stdin, or a server that
 	 * drops the connection, must not kill the process with SIGPIPE. */
@@ -471,6 +498,7 @@ static int cmd_exec(int argc, char *argv[])
 	configuration_load_layers(&config, &cli);
 	logger_initialize((enum log_level)config.log_level, config.log_file);
 	load_system_prompt_file(&config);
+	apply_project_instructions(&config);
 
 	int status = EXEC_EXIT_ERROR;
 	struct conversation_history *conv = NULL;
@@ -582,6 +610,12 @@ static int cmd_status(int argc, char *argv[])
 		printf("  Trace file      : %s\n", config.trace_file);
 	printf("  Show metrics    : %s\n", config.show_metrics ? "yes" : "no");
 
+	{
+		char source[PATH_MAX];
+		char *text = instructions_load(&config, source, sizeof(source));
+		printf("  Instructions    : %s\n", text ? source : "(none)");
+		free(text);
+	}
 	if (config.system_prompt_file)
 		printf("\n  System prompt   : (from %s)\n", config.system_prompt_file);
 	else if (config.system_prompt)

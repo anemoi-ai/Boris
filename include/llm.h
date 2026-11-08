@@ -28,6 +28,16 @@
  * llm_response_free(). Returns NULL only on catastrophic OOM - all other
  * errors are reported via llm_response.error = true.
  */
+/*
+ * Receives reply text as it streams in, <think> blocks removed. Text from
+ * every model call is passed on, including the remarks a model makes
+ * before calling tools. Only used when streaming is on (model.stream).
+ */
+typedef void (*llm_text_fn)(const char *text, size_t len, void *ctx);
+
+/* Install (or clear, with NULL) the streaming text observer. */
+void llm_set_text_observer(llm_text_fn fn, void *ctx);
+
 struct llm_response *llm_complete(const struct conversation_history *conv,
 				  const struct tool_definition *tools,
 				  size_t num_tools,

@@ -235,6 +235,8 @@ enum boris_error configuration_set_key(struct agent_configuration *config,
 		return set_string(&config->system_prompt_file, value, true);
 	if (strcmp(key, "prompt.system_prompt") == 0)
 		return set_string(&config->system_prompt, value, false);
+	if (strcmp(key, "prompt.instructions") == 0)
+		return set_string(&config->instructions_file, value, true);
 
 	/* [agent] */
 	if (strcmp(key, "agent.max_iterations") == 0)
@@ -439,6 +441,7 @@ void configuration_destroy(struct agent_configuration *config)
 	FREE_AND_NULL(config->api_key);
 	FREE_AND_NULL(config->system_prompt);
 	FREE_AND_NULL(config->system_prompt_file);
+	FREE_AND_NULL(config->instructions_file);
 	FREE_AND_NULL(config->sandbox_root);
 	FREE_AND_NULL(config->run_env);
 	FREE_AND_NULL(config->log_file);

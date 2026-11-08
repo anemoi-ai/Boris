@@ -49,6 +49,7 @@ struct agent_configuration {
 
 	char *system_prompt;
 	char *system_prompt_file;
+	char *instructions_file; /* prompt.instructions: NULL/"auto", "none" or a path */
 
 	unsigned int tools_enabled; /* Bitmask of enabled tools (TOOL_* constants) */
 	char *sandbox_root;

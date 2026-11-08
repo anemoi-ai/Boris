@@ -157,6 +157,24 @@ struct http_response http_post(const char *url,
 	return resp;
 }
 
+/* Streaming POST: the next queued response, fed to on_chunk in small
+ * pieces (so callers must cope with splits anywhere), then returned whole. */
+struct http_response http_post_stream(const char *url, const char *body,
+				      const char *content_type, const char *api_key,
+				      int timeout_secs, bool verify_ssl,
+				      http_chunk_fn on_chunk, void *chunk_ctx)
+{
+	struct http_response resp = http_post(url, body, content_type, api_key,
+					      timeout_secs, verify_ssl);
+	if (!resp.error && resp.body && on_chunk) {
+		for (size_t i = 0; i < resp.body_length; i += 5) {
+			size_t n = resp.body_length - i < 5 ? resp.body_length - i : 5;
+			on_chunk(resp.body + i, n, chunk_ctx);
+		}
+	}
+	return resp;
+}
+
 /* GET (the fetch tool) takes the next queued response too; the recorded
  * "request body" is "GET <url>". Content-Type is always text/plain. */
 struct http_response http_get(const char *url, const struct http_get_options *opts)

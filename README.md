@@ -191,7 +191,7 @@ Scripts started by `run` see only an allowlisted environment (`PATH`, `HOME`, lo
 ## Tests
 
 ```bash
-make test       # all 8 suites, no API key required
+make test       # all 9 suites, no API key required
 make memcheck   # all tests under Valgrind
 ```
 
@@ -202,17 +202,18 @@ make memcheck   # all tests under Valgrind
 --- test_tools ---         every tool, sandbox escapes, result cap, registry
 --- test_configuration --- INI, env vars, validation, defaults
 --- test_logger ---        levels, file output, rotation
+--- test_instructions ---  BORIS.md / AGENTS.md loading, symlink refusal, limits
 --- test_markdown ---      headings, lists, inline stripping, fences
---- test_e2e ---           full agent loop, exec reports, tracing (mock HTTP)
+--- test_e2e ---           full agent loop, streaming, exec, tracing (mock HTTP)
 
-Results: 8 passed, 0 failed
+Results: 9 passed, 0 failed
 ```
 
 The end-to-end tests run without a real LLM. `tests/mock_http.c` provides a link-level substitute for `src/http_client.c` that returns pre-queued responses, so the complete agent loop — tool calls, self-correction nudges, retry, context overflow — can be exercised without an API key.
 
 ### Evals
 
-`make test` uses a mock model; `evals/` measures Boris against a real one. Every trial runs in a throwaway `HOME` with a secret canary, is graded on what actually happened (files, hidden tests, tools called, the request trace), and fails if anything outside the sandbox changed or the canary reached the model. 58 cases cover tools, real project tasks, sessions and limits, long contexts, injected network faults and attacks; results come with confidence intervals, efficiency metrics and run-to-run comparison.
+`make test` uses a mock model; `evals/` measures Boris against a real one. Every trial runs in a throwaway `HOME` with a secret canary, is graded on what actually happened (files, hidden tests, tools called, the request trace), and fails if anything outside the sandbox changed or the canary reached the model. 60 cases cover tools, real project tasks, sessions and limits, long contexts, injected network faults and attacks; results come with confidence intervals, efficiency metrics and run-to-run comparison.
 
 ```bash
 python3 evals/run_evals.py --endpoint http://localhost:11434 --model qwen3:8b --repeat 3
@@ -249,11 +250,21 @@ Common knobs:
 ./boris chat --tools read,write,edit       # comma list, or 'default' / 'all' / 'none'
 ./boris chat --sandbox ./project           # restrict filesystem access
 ./boris chat --max-iterations 16           # ReAct loop budget
-./boris chat --stream                      # request SSE (reply shown when complete)
+./boris chat --stream                      # show replies as they arrive
 ./boris chat --show-metrics                # token + timing summary on exit
 ./boris chat --set model.temperature=0.3   # override any config key
 ./boris chat --trace requests.jsonl        # record every model request/response
 ```
+
+### Project instructions
+
+Put standing instructions for a project in `BORIS.md` (or `AGENTS.md`, the name several agents share) at the root of the sandbox: coding conventions, how to run the tests, files to leave alone. Boris reads it at startup, appends it to the system prompt for every turn, and says so (`Using project instructions from BORIS.md`). `prompt.instructions` chooses the file: `auto` (the default), `none`, or a path anywhere. In `auto` mode the file must really be inside the sandbox; a symlink pointing elsewhere is ignored, so a link planted by a script cannot pull a private file into the prompt. Files over 32 KB are cut. `boris status` shows which file is in use.
+
+The model can edit files in the sandbox, including `BORIS.md`, and a change takes effect in the next session; `behaviour.confirm_writes = true` makes every write ask first.
+
+### Streaming
+
+With `model.stream = true` (or `--stream`), `boris chat` shows replies as they arrive, including what the model says before it calls tools; reasoning in `<think>` blocks is hidden. Streamed text is shown plain; with streaming off, each reply is rendered as Markdown once it is complete. `boris exec` prints only the final answer either way.
 
 ### Non-interactive use
 

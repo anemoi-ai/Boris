@@ -65,6 +65,27 @@ struct http_response http_post(const char *url,
 			       bool verify_ssl);
 
 /*
+ * Called with each piece of a response body as it arrives. The bytes are
+ * not NUL-terminated and pieces can split anywhere, even inside a UTF-8
+ * character or an SSE line.
+ */
+typedef void (*http_chunk_fn)(const char *data, size_t len, void *ctx);
+
+/*
+ * http_post(), but on_chunk sees the body as it arrives (true streaming).
+ * The whole body is still buffered and returned as usual, so callers parse
+ * the complete response exactly as they would from http_post().
+ */
+struct http_response http_post_stream(const char *url,
+				      const char *body,
+				      const char *content_type,
+				      const char *api_key,
+				      int timeout_secs,
+				      bool verify_ssl,
+				      http_chunk_fn on_chunk,
+				      void *chunk_ctx);
+
+/*
  * Send a GET request for the fetch tool.
  *
  * Only http and https are allowed, including across redirects (at most 5).

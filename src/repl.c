@@ -10,6 +10,7 @@
 
 #include "repl.h"
 #include "agent.h"
+#include "llm.h"
 #include "markdown.h"
 #include "tools.h"
 #include "tool_builtins.h"
@@ -36,6 +37,12 @@ struct repl_state {
 	const struct agent_configuration *cfg;
 	int should_exit;
 	bool changed; /* conversation modified since start (or last load) */
+
+	/* Streaming display, reset for each agent run */
+	bool streamed;	   /* some reply text has been shown live */
+	bool line_open;	   /* the cursor is mid-line after streamed text */
+	bool need_indent;  /* the next visible character starts a line */
+	bool pending_c2;   /* last byte was 0xC2 (a C1 control may follow) */
 };
 
 static volatile sig_atomic_t g_sigint = 0;
@@ -169,6 +176,65 @@ static bool confirm_tool_call(const struct tool_call *call, const char *summary,
 	return ok;
 }
 
+/*
+ * Streaming text observer: print reply text as it arrives. It comes from
+ * the model, so terminal controls are dropped (C0 except newline and tab,
+ * DEL, and C1 controls encoded as 0xC2 0x80-0x9F, which can be split
+ * across calls). Shown as plain text; markdown needs the whole reply.
+ */
+static void stream_text(const char *text, size_t len, void *ctx)
+{
+	struct repl_state *st = ctx;
+	if (!st->streamed) {
+		spinner_stop();
+		printf("  Boris:\n");
+		st->streamed = true;
+		st->need_indent = true;
+	}
+	for (size_t i = 0; i < len; i++) {
+		unsigned char c = (unsigned char)text[i];
+		if (st->pending_c2) {
+			st->pending_c2 = false;
+			if (c >= 0x80 && c <= 0x9F)
+				continue; /* a C1 control: drop both bytes */
+			putchar(0xC2);
+		}
+		if (c == 0xC2) {
+			st->pending_c2 = true;
+			continue;
+		}
+		if (c == '\n') {
+			putchar('\n');
+			st->line_open = false;
+			st->need_indent = true;
+			continue;
+		}
+		if ((c < 0x20 && c != '\t') || c == 0x7F)
+			continue;
+		if (st->need_indent) {
+			fputs("  ", stdout);
+			st->need_indent = false;
+		}
+		putchar(c);
+		st->line_open = true;
+	}
+	fflush(stdout); /* stdout may be a pipe: show it now, not at exit */
+}
+
+/* End any streamed line before printing something else. */
+static void stream_break(struct repl_state *st)
+{
+	if (st->pending_c2) {
+		putchar(0xC2);
+		st->pending_c2 = false;
+	}
+	if (st->line_open) {
+		putchar('\n');
+		st->line_open = false;
+	}
+	st->need_indent = true;
+}
+
 /* Bytes of a tool result shown under each call */
 #define TOOL_PREVIEW_MAX 100
 
@@ -185,12 +251,13 @@ static bool confirm_tool_call(const struct tool_call *call, const char *summary,
 static void show_tool_result(const struct tool_call *call, const char *summary,
 			     const struct tool_result *result, void *ctx)
 {
-	const struct repl_state *st = ctx;
+	struct repl_state *st = ctx;
 	if (!st->cfg->show_tool_calls)
 		return;
 
 	bool spinning = g_spinner_active;
 	spinner_stop();
+	stream_break(st);
 
 	char name[64], preview[TOOL_PREVIEW_MAX + 1];
 	term_sanitize(call->name, name, sizeof(name));
@@ -205,7 +272,9 @@ static void show_tool_result(const struct tool_call *call, const char *summary,
 				  preview[0] ? preview : "(no output)");
 	fflush(stdout);
 
-	if (spinning)
+	/* After streamed text the spinner was stopped; the model is about to
+	 * be called again, so show it while waiting. */
+	if (spinning || st->streamed)
 		spinner_start();
 }
 
@@ -581,7 +650,11 @@ static void check_context_warning(struct repl_state *st)
 static void print_agent_response(struct repl_state *st,
 				 struct agent_result *result)
 {
-	(void)st;
+	/* Streamed replies are already on screen: end the line, and do not
+	 * print the text a second time. */
+	bool shown = st->streamed;
+	if (shown)
+		stream_break(st);
 	if (result->finish_reason == FINISHED_INTERRUPTED) {
 		term_printf_color(TERM_FG_BRIGHT_YELLOW,
 				  "  Interrupted.\n\n");
@@ -593,7 +666,7 @@ static void print_agent_response(struct repl_state *st,
 					  ? result->final_response
 					  : "an error occurred");
 	} else if (result->finish_reason == FINISHED_MAX_ITERATIONS) {
-		if (result->final_response) {
+		if (result->final_response && !shown) {
 			printf("  Boris:\n");
 			markdown_render(result->final_response, stdout);
 		}
@@ -601,8 +674,10 @@ static void print_agent_response(struct repl_state *st,
 				  "  (Reached max %d iterations)\n\n",
 				  st->cfg->max_iterations);
 	} else if (result->final_response) {
-		printf("  Boris:\n");
-		markdown_render(result->final_response, stdout);
+		if (!shown) {
+			printf("  Boris:\n");
+			markdown_render(result->final_response, stdout);
+		}
 		if (result->turns_used > 1) {
 			if (result->total_prompt_tokens > 0 ||
 			    result->total_completion_tokens > 0) {
@@ -740,6 +815,8 @@ void repl_run(struct conversation_history *conv,
 		.ctx = &state,
 	};
 	tools_set_observer(&observer);
+	if (config->stream_responses)
+		llm_set_text_observer(stream_text, &state);
 
 	/* Hints */
 	term_print_dim("  Type your message and press Enter to send, /help for commands.\n");
@@ -844,6 +921,8 @@ void repl_run(struct conversation_history *conv,
 		free(user_input);
 		user_input = NULL;
 
+		state.streamed = state.line_open = state.pending_c2 = false;
+		state.need_indent = true;
 		struct agent_result result = agent_run_conv(conv, config);
 
 		spinner_stop();
@@ -871,6 +950,7 @@ repl_done:
 	}
 
 	tools_set_observer(NULL);
+	llm_set_text_observer(NULL, NULL);
 
 	/* Every way out (/quit, Ctrl+D, Ctrl+C) saves the session the same way */
 	printf("\n");

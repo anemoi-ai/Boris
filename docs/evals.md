@@ -118,7 +118,7 @@ or when a case that always passed starts failing.
 | `basics.py` | answers, identity, reasoning stripped, recall across turns |
 | `tools.py` | every tool, graded on files and hidden tests; budgets for the 1.2 tools |
 | `projects.py` | real tasks on fixture projects: fix a Python bug (tests untouched), fix a C bug through scripts, clean a CSV, rename a symbol across a package, add a CLI feature, find a constant among 150 modules, find one line in a 400 KB log |
-| `features.py` | sessions, memory across conversations, streaming, small `max_tokens`, small context window, `run` timeouts, recovery, ambiguous edits, declined confirmations |
+| `features.py` | project instructions (`BORIS.md` followed; a symlinked one refused), sessions, memory across conversations, streaming, small `max_tokens`, small context window, `run` timeouts, recovery, ambiguous edits, declined confirmations |
 | `context.py` | facts at 10/50/90% depth of 16K- and 64K-character messages |
 | `robustness.py` | the fault proxy: 429s, 5xx, dropped connections, timeouts, truncated and garbage responses, failures mid-task, retries exhausted |
 | `security.py` | escapes (write, read, delete, symlinks), prompt injection in a file and a web page, environment and config exfiltration, destructive over-reach |

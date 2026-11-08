@@ -1549,6 +1549,84 @@ static void test_budget_reminder(void)
 	tool_plan_reset();
 }
 
+struct live_capture {
+	char text[4096];
+	size_t len;
+	int calls;
+};
+
+static void capture_text(const char *text, size_t len, void *ctx)
+{
+	struct live_capture *c = ctx;
+	if (c->len + len < sizeof(c->text)) {
+		memcpy(c->text + c->len, text, len);
+		c->len += len;
+		c->text[c->len] = '\0';
+	}
+	c->calls++;
+}
+
+/* An SSE body whose content deltas are the given pieces. */
+static char *sse_body(const char *const *pieces, int n)
+{
+	static char body[8192];
+	size_t pos = 0;
+	for (int i = 0; i < n; i++) {
+		cJSON *root = cJSON_CreateObject();
+		cJSON *choices = cJSON_AddArrayToObject(root, "choices");
+		cJSON *choice = cJSON_CreateObject();
+		cJSON *delta = cJSON_AddObjectToObject(choice, "delta");
+		cJSON_AddStringToObject(delta, "content", pieces[i]);
+		cJSON_AddItemToArray(choices, choice);
+		char *json = cJSON_PrintUnformatted(root);
+		pos += (size_t)snprintf(body + pos, sizeof(body) - pos, "data: %s\n\n", json);
+		cJSON_free(json);
+		cJSON_Delete(root);
+	}
+	snprintf(body + pos, sizeof(body) - pos,
+		 "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n");
+	return body;
+}
+
+static void test_true_streaming(void)
+{
+	printf("  Test: streamed text reaches the observer as it arrives, <think> removed\n");
+	/* The tag and a multi-byte character are split across deltas, and the
+	 * mock feeds the body in 5-byte pieces on top of that. */
+	const char *pieces[] = {"<thi", "nk>secret reasoning</th", "ink>\n\nHello ", "w\xc3",
+				"\xa9rld <b>ok</b>", " done."};
+	mock_http_reset();
+	mock_http_queue_response(sse_body(pieces, 6), 200);
+
+	struct agent_configuration cfg = make_test_config();
+	cfg.stream_responses = true;
+	struct live_capture cap;
+	memset(&cap, 0, sizeof(cap));
+	llm_set_text_observer(capture_text, &cap);
+	struct agent_result r = agent_run("hi", &cfg);
+	llm_set_text_observer(NULL, NULL);
+
+	ASSERT(r.finish_reason == FINISHED_NATURALLY, "finishes");
+	ASSERT(strcmp(cap.text, "Hello w\xc3\xa9rld <b>ok</b> done.") == 0,
+	       "live text is the reply without the reasoning");
+	ASSERT(cap.calls > 1, "delivered in several pieces, not at the end");
+	ASSERT(r.final_response && strcmp(r.final_response, cap.text) == 0,
+	       "matches the stored reply");
+	agent_result_free(&r);
+
+	/* Without streaming the observer is not used */
+	mock_http_reset();
+	mock_http_queue_response(sse_body(pieces, 6), 200);
+	memset(&cap, 0, sizeof(cap));
+	cfg.stream_responses = false;
+	llm_set_text_observer(capture_text, &cap);
+	r = agent_run("hi", &cfg);
+	llm_set_text_observer(NULL, NULL);
+	ASSERT(cap.calls == 0, "no live text when streaming is off");
+	agent_result_free(&r);
+	configuration_destroy(&cfg);
+}
+
 static void test_garbled_response_is_retried(void)
 {
 	printf("  Test: a 200 response that does not parse is retried\n");
@@ -1702,6 +1780,7 @@ int main(void)
 	test_exec_error_status();
 	test_exec_session_round_trip();
 	test_garbled_response_is_retried();
+	test_true_streaming();
 	test_progress_is_not_nagged();
 	test_stall_is_reminded();
 	test_budget_reminder();

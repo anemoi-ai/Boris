@@ -12,6 +12,7 @@ temperature = 0.7
 context_window = 32768
 max_tokens = 8192
 timeout_seconds = 120
+# Show replies as they arrive (plain text); off renders Markdown when complete
 stream = true
 verify_ssl = true
 
@@ -59,3 +60,6 @@ show_metrics = true
 
 [prompt]
 system_prompt_file = ~/.boris/system_prompt.txt
+# Project instructions appended to the system prompt: auto (BORIS.md, else
+# AGENTS.md, at the sandbox root), none, or a path to a file
+instructions = auto

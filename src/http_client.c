@@ -30,6 +30,8 @@ struct response_buffer {
 	size_t length;
 	size_t capacity;
 	bool too_large; /* set when HTTP_MAX_RESPONSE_BYTES was exceeded */
+	http_chunk_fn on_chunk; /* optional: sees each chunk as it arrives */
+	void *chunk_ctx;
 };
 
 /* Global initialisation state */
@@ -116,6 +118,9 @@ static size_t write_callback(void *contents, size_t size, size_t nmemb,
 	buf->length = new_length;
 	buf->data[buf->length] = '\0'; /* Null-terminate for safety */
 
+	if (buf->on_chunk)
+		buf->on_chunk((const char *)contents, chunk_size, buf->chunk_ctx);
+
 	return chunk_size;
 }
 
@@ -140,15 +145,43 @@ static void curl_setup_common(CURL *curl, const char *url, int timeout_secs,
 	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, verify_ssl ? 2L : 0L);
 }
 
-/*
- * Send a POST request with arbitrary content type.
- */
+static struct http_response post_impl(const char *url, const char *body,
+				      const char *content_type, const char *api_key,
+				      int timeout_secs, bool verify_ssl,
+				      http_chunk_fn on_chunk, void *chunk_ctx);
+
 struct http_response http_post(const char *url,
 			       const char *body,
 			       const char *content_type,
 			       const char *api_key,
 			       int timeout_secs,
 			       bool verify_ssl)
+{
+	return post_impl(url, body, content_type, api_key, timeout_secs, verify_ssl,
+			 NULL, NULL);
+}
+
+struct http_response http_post_stream(const char *url,
+				      const char *body,
+				      const char *content_type,
+				      const char *api_key,
+				      int timeout_secs,
+				      bool verify_ssl,
+				      http_chunk_fn on_chunk,
+				      void *chunk_ctx)
+{
+	return post_impl(url, body, content_type, api_key, timeout_secs, verify_ssl,
+			 on_chunk, chunk_ctx);
+}
+
+/*
+ * Send a POST request with arbitrary content type; on_chunk (optional)
+ * sees the body as it arrives.
+ */
+static struct http_response post_impl(const char *url, const char *body,
+				      const char *content_type, const char *api_key,
+				      int timeout_secs, bool verify_ssl,
+				      http_chunk_fn on_chunk, void *chunk_ctx)
 {
 	CURL *curl;
 	CURLcode result;
@@ -179,6 +212,8 @@ struct http_response http_post(const char *url,
 	buf.length = 0;
 	buf.capacity = 4096;
 	buf.too_large = false;
+	buf.on_chunk = on_chunk;
+	buf.chunk_ctx = chunk_ctx;
 	if (!buf.data) {
 		response.error = strdup("Out of memory");
 		curl_easy_cleanup(curl);
