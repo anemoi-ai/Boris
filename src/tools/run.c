@@ -114,6 +114,38 @@ static void env_pass(char **envp, size_t *count, const char *name,
 		env_add(envp, count, name, value, scratch);
 }
 
+static const char *env_get(char *const *envp, const char *name)
+{
+	size_t len = strlen(name);
+	for (; *envp; envp++)
+		if (env_name_equal(*envp, name, len) && (*envp)[len] == '=')
+			return *envp + len + 1;
+	return NULL;
+}
+
+/* Set name in a finished (NULL terminated) envp, replacing any old value. */
+static void env_set(char **envp, const char *name, const char *value,
+		    struct memory_arena *scratch)
+{
+	size_t len = strlen(name) + 1 + strlen(value) + 1;
+	char *entry = arena_allocate(scratch, len);
+	if (!entry)
+		return;
+	snprintf(entry, len, "%s=%s", name, value);
+
+	size_t name_len = strlen(name), count = 0;
+	for (; envp[count]; count++) {
+		if (env_name_equal(envp[count], name, name_len) && envp[count][name_len] == '=') {
+			envp[count] = entry;
+			return;
+		}
+	}
+	if (count < RUN_ENV_MAX - 1) {
+		envp[count] = entry;
+		envp[count + 1] = NULL;
+	}
+}
+
 /*
  * Fill envp (RUN_ENV_MAX entries) with the child's environment, NULL
  * terminated. Built in the parent so the child does no allocation.
@@ -360,7 +392,8 @@ static long elapsed_ms(const struct timespec *start)
 #define RUN_POLL_SLICE_MS 200
 
 static _Noreturn void exec_in_child(char *const argv[], char **envp,
-				    const char *cwd, int out_fd, int in_fd)
+				    const char *cwd, int out_fd, int in_fd,
+				    const struct run_confinement *confinement)
 {
 	/* Own process group, so a timeout can kill everything the script
 	 * started, not just the script itself. */
@@ -381,6 +414,13 @@ static _Noreturn void exec_in_child(char *const argv[], char **envp,
 	if (cwd && chdir(cwd) != 0) {
 		fprintf(stderr, "run: cannot chdir to '%s': %s\n", cwd, strerror(errno));
 		_exit(127);
+	}
+
+	/* From here on the process, and whatever it starts, can only touch
+	 * what the confinement allows. Never start the script without it. */
+	if (run_confine_child(confinement) != 0) {
+		fprintf(stderr, "run: cannot confine the script: %s\n", strerror(errno));
+		_exit(126);
 	}
 
 	/* execvp searches the PATH of the new environment. */
@@ -467,7 +507,7 @@ static bool wait_for_exit(pid_t pid, const struct timespec *start,
  */
 static char *exec_child(char *const argv[], char **envp, const char *cwd,
 			const char *stdin_data, size_t stdin_len,
-			int timeout_seconds)
+			int timeout_seconds, const struct run_confinement *confinement)
 {
 	int out_pipe[2]; /* parent reads [0], child writes [1] */
 	int in_pipe[2] = {-1, -1}; /* parent writes [1], child reads [0] */
@@ -493,7 +533,7 @@ static char *exec_child(char *const argv[], char **envp, const char *cwd,
 		close(out_pipe[0]);
 		if (has_stdin)
 			close(in_pipe[1]);
-		exec_in_child(argv, envp, cwd, out_pipe[1], in_pipe[0]);
+		exec_in_child(argv, envp, cwd, out_pipe[1], in_pipe[0], confinement);
 	}
 
 	close(out_pipe[1]);
@@ -616,24 +656,66 @@ struct tool_result tool_run_fn(const char *arguments_json,
 	char *envp[RUN_ENV_MAX];
 	build_child_env(cfg, envp, scratch);
 
+	/* The sandbox root as the system names it, for the confinement rules */
+	char sandbox_root[PATH_MAX];
+	if (tools_sandbox_resolve(cfg, ".", sandbox_root, sizeof(sandbox_root),
+				  &sandbox_err) != 0)
+		return sandbox_err;
+
 #ifdef _WIN32
+	char tmp_dir[PATH_MAX];
+	bool confined = cfg->run_confine &&
+			run_win32_confine_prepare(sandbox_root, tmp_dir, sizeof(tmp_dir));
+	if (confined) {
+		env_set(envp, "TEMP", tmp_dir, scratch);
+		env_set(envp, "TMP", tmp_dir, scratch);
+	}
+	(void)env_get;
+
 	char problem[512];
 	char *output = run_win32_script(resolved, (char *const *)user_argv, args.user_argc,
 					envp, dir_buf, args.stdin_data, args.stdin_len,
-					timeout, problem, sizeof(problem));
+					timeout, confined, problem, sizeof(problem));
 	if (!output)
 		return tool_result_errorf("run", "%s", problem);
 #else
-	log_info("run: %s (interpreter=%s, timeout=%ds)",
-		 resolved, exec_argv[0], timeout);
+	struct run_confinement confinement;
+	run_confine_prepare(cfg, sandbox_root, exec_argv[0], env_get(envp, "PATH"),
+			    &confinement);
+	if (confinement.active)
+		env_set(envp, "TMPDIR", confinement.tmp_dir, scratch);
+
+	log_info("run: %s (interpreter=%s, timeout=%ds%s)",
+		 resolved, exec_argv[0], timeout, confinement.active ? ", confined" : "");
 
 	char *output = exec_child((char *const *)exec_argv, envp, dir_buf,
-				  args.stdin_data, args.stdin_len, timeout);
+				  args.stdin_data, args.stdin_len, timeout, &confinement);
+	run_confine_release(&confinement);
 	if (!output)
 		return tool_result_errorf("run", "Failed to launch process");
 #endif
 
 	return tool_result_ok("run", output);
+}
+
+bool tool_run_confinement_available(bool *reads)
+{
+#ifdef _WIN32
+	if (reads)
+		*reads = false; /* low integrity stops writes, not reads */
+	return true;
+#else
+	struct agent_configuration probe;
+	memset(&probe, 0, sizeof(probe));
+	probe.run_confine = true;
+	struct run_confinement c;
+	run_confine_prepare(&probe, "/", "sh", NULL, &c);
+	bool available = c.active;
+	run_confine_release(&c);
+	if (reads)
+		*reads = available;
+	return available;
+#endif
 }
 
 /* "build.sh --fast (stdin: 120 bytes)". */

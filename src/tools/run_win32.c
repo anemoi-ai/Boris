@@ -18,6 +18,12 @@
  *   instruction runs. Terminating the job kills the script and everything
  *   it started, which is what kill(-pgid) does on POSIX.
  *
+ *   Confining it. The child runs at low integrity: Windows refuses to let
+ *   such a process modify anything that is not itself marked low, whatever
+ *   the file permissions say. Only the sandbox root and a temporary
+ *   directory are so marked. (This limits what a script can change, not
+ *   what it can read; Linux, with Landlock, limits both.)
+ *
  * On other systems this file compiles to nothing.
  */
 
@@ -25,6 +31,8 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <aclapi.h>
+#include <sddl.h>
 
 #include "run_internal.h"
 #include "logger.h"
@@ -325,6 +333,132 @@ static bool safe_for_cmd(const char *s)
 }
 
 /* ------------------------------------------------------------------------
+ * Confinement: low integrity
+ * --------------------------------------------------------------------- */
+
+#define LOW_INTEGRITY_RID 0x1000
+
+/* Is path already labelled as writable from low integrity? */
+static bool has_low_label(const wchar_t *path)
+{
+	PACL sacl = NULL;
+	PSECURITY_DESCRIPTOR sd = NULL;
+	if (GetNamedSecurityInfoW(path, SE_FILE_OBJECT, LABEL_SECURITY_INFORMATION, NULL, NULL,
+				  NULL, &sacl, &sd) != ERROR_SUCCESS)
+		return false;
+	bool low = false;
+	SYSTEM_MANDATORY_LABEL_ACE *ace = NULL;
+	if (sacl && sacl->AceCount > 0 && GetAce(sacl, 0, (LPVOID *)&ace) &&
+	    ace->Header.AceType == SYSTEM_MANDATORY_LABEL_ACE_TYPE) {
+		PSID sid = (PSID)&ace->SidStart;
+		DWORD rid = *GetSidSubAuthority(sid, *GetSidSubAuthorityCount(sid) - 1);
+		low = rid <= LOW_INTEGRITY_RID;
+	}
+	LocalFree(sd);
+	return low;
+}
+
+/* Label path low, inherited by everything in it now and later. */
+static bool set_low_label(const wchar_t *path)
+{
+	if (has_low_label(path))
+		return true;
+	/* ML = mandatory label; OICI = files and directories inherit it;
+	 * NW = no write-up (the default policy); LW = low integrity. */
+	PSECURITY_DESCRIPTOR sd = NULL;
+	if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+		    L"S:(ML;OICI;NW;;;LW)", SDDL_REVISION_1, &sd, NULL))
+		return false;
+	PACL sacl = NULL;
+	BOOL present = FALSE, defaulted = FALSE;
+	bool ok = GetSecurityDescriptorSacl(sd, &present, &sacl, &defaulted) && present &&
+		  SetNamedSecurityInfoW((LPWSTR)path, SE_FILE_OBJECT, LABEL_SECURITY_INFORMATION,
+					NULL, NULL, NULL, sacl) == ERROR_SUCCESS;
+	LocalFree(sd);
+	return ok;
+}
+
+bool run_win32_confine_prepare(const char *sandbox_root, char *tmp_dir, size_t tmp_size)
+{
+	static bool warned = false;
+	wchar_t wroot[4096], wtmp[4096];
+	const char *problem = NULL;
+
+	/* %USERPROFILE%\AppData\LocalLow is where Windows itself has low-
+	 * integrity programs keep their files; a directory made there is
+	 * labelled low from birth. */
+	DWORD n = ExpandEnvironmentStringsW(L"%USERPROFILE%\\AppData\\LocalLow\\Boris", wtmp,
+					    4000);
+	if (n == 0 || n > 4000) {
+		problem = "cannot locate a low-integrity temporary directory";
+	} else {
+		CreateDirectoryW(wtmp, NULL);
+		wcscat_s(wtmp, 4096, L"\\tmp");
+		CreateDirectoryW(wtmp, NULL);
+		if (GetFileAttributesW(wtmp) == INVALID_FILE_ATTRIBUTES || !set_low_label(wtmp))
+			problem = "cannot create a low-integrity temporary directory";
+	}
+
+	if (!problem && !to_wide(sandbox_root, wroot, 4096))
+		problem = "bad sandbox path";
+	if (!problem && !has_low_label(wroot)) {
+		log_info("run: marking %s as writable by low-integrity processes, so "
+			 "confined scripts can work in it", sandbox_root);
+		if (!set_low_label(wroot))
+			problem = "cannot mark the sandbox root as writable by "
+				  "low-integrity processes";
+	}
+
+	if (problem) {
+		if (!warned)
+			log_warning("run: %s, so scripts are not confined: they can change "
+				    "anything you can. Keep behaviour.confirm_run on.",
+				    problem);
+		warned = true;
+		return false;
+	}
+	if (!to_utf8(wtmp, tmp_dir, (int)tmp_size))
+		return false;
+	for (char *p = tmp_dir; *p; p++)
+		if (*p == '\\')
+			*p = '/';
+	return true;
+}
+
+/* A copy of our own token, lowered to low integrity. NULL on failure. */
+static HANDLE low_integrity_token(void)
+{
+	HANDLE own = NULL, token = NULL;
+	if (!OpenProcessToken(GetCurrentProcess(),
+			      TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ADJUST_DEFAULT |
+				      TOKEN_ASSIGN_PRIMARY,
+			      &own))
+		return NULL;
+	BOOL ok = DuplicateTokenEx(own, 0, NULL, SecurityImpersonation, TokenPrimary, &token);
+	CloseHandle(own);
+	if (!ok)
+		return NULL;
+
+	PSID low = NULL;
+	TOKEN_MANDATORY_LABEL label;
+	memset(&label, 0, sizeof(label));
+	if (ConvertStringSidToSidW(L"S-1-16-4096", &low)) {
+		label.Label.Sid = low;
+		label.Label.Attributes = SE_GROUP_INTEGRITY;
+		ok = SetTokenInformation(token, TokenIntegrityLevel, &label,
+					 sizeof(label) + GetLengthSid(low));
+		LocalFree(low);
+	} else {
+		ok = FALSE;
+	}
+	if (!ok) {
+		CloseHandle(token);
+		return NULL;
+	}
+	return token;
+}
+
+/* ------------------------------------------------------------------------
  * Starting and stopping the process
  * --------------------------------------------------------------------- */
 
@@ -385,8 +519,9 @@ static void close_handle(HANDLE *h)
 /* Start the process, suspended inside a new job, then let it run. */
 static bool spawn(const wchar_t *program, wchar_t *command_line, const wchar_t *environment,
 		  const wchar_t *cwd, const char *stdin_data, size_t stdin_len,
-		  struct child *child)
+		  bool low_integrity, struct child *child)
 {
+	HANDLE token = NULL;
 	SECURITY_ATTRIBUTES inheritable = {sizeof(inheritable), NULL, TRUE};
 	HANDLE out_read = NULL, out_write = NULL, in_read = NULL, in_write = NULL;
 	LPPROC_THREAD_ATTRIBUTE_LIST attributes = NULL;
@@ -450,8 +585,19 @@ static bool spawn(const wchar_t *program, wchar_t *command_line, const wchar_t *
 	 * decide what that means. */
 	DWORD flags = CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT |
 		      EXTENDED_STARTUPINFO_PRESENT;
-	if (!CreateProcessW(program, command_line, NULL, NULL, TRUE, flags,
-			    (LPVOID)environment, cwd, &startup.StartupInfo, &pi))
+	BOOL created;
+	if (low_integrity) {
+		/* Never fall back to full rights here: the caller was promised a
+		 * confined script, and has told the user so. */
+		token = low_integrity_token();
+		created = token && CreateProcessAsUserW(token, program, command_line, NULL, NULL,
+							TRUE, flags, (LPVOID)environment, cwd,
+							&startup.StartupInfo, &pi);
+	} else {
+		created = CreateProcessW(program, command_line, NULL, NULL, TRUE, flags,
+					 (LPVOID)environment, cwd, &startup.StartupInfo, &pi);
+	}
+	if (!created)
 		goto done;
 
 	if (child->job)
@@ -470,6 +616,7 @@ static bool spawn(const wchar_t *program, wchar_t *command_line, const wchar_t *
 
 done:;
 	DWORD error = GetLastError(); /* CreateProcess's, for the caller's message */
+	close_handle(&token);
 	if (!started)
 		close_handle(&child->job);
 	if (attributes) {
@@ -535,8 +682,8 @@ static bool wait_for_exit(HANDLE process, ULONGLONG deadline)
 
 char *run_win32_script(const char *script, char *const *user_args, int user_argc,
 		       char *const *envp, const char *cwd, const char *stdin_data,
-		       size_t stdin_len, int timeout_seconds, char *problem,
-		       size_t problem_size)
+		       size_t stdin_len, int timeout_seconds, bool low_integrity,
+		       char *problem, size_t problem_size)
 {
 	char *result = NULL;
 	wchar_t *path_var = NULL, *environment = NULL;
@@ -647,11 +794,12 @@ char *run_win32_script(const char *script, char *const *user_args, int user_argc
 	char program_utf8[PROGRAM_MAX * 3];
 	if (!to_utf8(program, program_utf8, (int)sizeof(program_utf8)))
 		program_utf8[0] = '\0';
-	log_info("run: %s (interpreter=%s, timeout=%ds)", script, program_utf8,
-		 timeout_seconds);
+	log_info("run: %s (interpreter=%s, timeout=%ds%s)", script, program_utf8,
+		 timeout_seconds, low_integrity ? ", confined" : "");
 
 	struct child child;
-	if (!spawn(program, cmd.text, environment, wcwd, stdin_data, stdin_len, &child)) {
+	if (!spawn(program, cmd.text, environment, wcwd, stdin_data, stdin_len, low_integrity,
+		   &child)) {
 		snprintf(problem, problem_size, "Failed to launch '%s' (Windows error %lu)",
 			 program_utf8, (unsigned long)GetLastError());
 		goto done;

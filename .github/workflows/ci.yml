@@ -43,3 +43,32 @@ jobs:
 
       - name: Eval harness self-test
         run: python evals/run_evals.py selftest
+
+  # One self-contained boris.exe: static libcurl, static C runtime.
+  windows-binary:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: vcpkg install curl:x64-windows-static
+
+      - name: Configure
+        run: cmake -B build -DVCPKG_TARGET_TRIPLET=x64-windows-static -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Check it needs no extra DLLs
+        shell: pwsh
+        run: |
+          if (Get-ChildItem build/Release -Filter *.dll) { throw "DLLs were copied next to boris.exe" }
+          build/Release/boris.exe --version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: boris-windows-x64
+          path: build/Release/boris.exe

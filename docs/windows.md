@@ -17,7 +17,17 @@ ctest --test-dir build -C Release --output-on-failure
 ```
 
 The result is `build\Release\boris.exe`, with the libcurl and zlib DLLs
-copied next to it. The code compiles clean under `/W4 /WX`. MinGW is not
+copied next to it. For a single file with no DLLs, use the static triplet:
+
+```powershell
+vcpkg install curl:x64-windows-static
+cmake -B build-static -DVCPKG_TARGET_TRIPLET=x64-windows-static `
+      -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake
+cmake --build build-static --config Release
+```
+
+CI builds that one on every run and keeps it as a downloadable artifact
+(`boris-windows-x64`). The code compiles clean under `/W4 /WX`. MinGW is not
 supported: it brings half of POSIX with it, and that half would collide with
 the shims.
 
@@ -80,6 +90,17 @@ tools then use contains no `..`.
   matched without regard to case), exactly three inherited handles, and no
   console. It runs in a job object, so a timeout or Ctrl+C kills the script
   and everything it started.
+- **Confinement** (`tools.run_confine`, on by default). The child runs at
+  low integrity. Windows does not let a low-integrity process modify
+  anything that is not itself labelled low, whatever the file permissions
+  say, so the script can write only two places: the sandbox root, which
+  Boris labels (once, and inherited by everything in it) the first time a
+  script runs, and `%USERPROFILE%\AppData\LocalLow\Boris\tmp`, which
+  becomes its `TEMP`. It can still *read* whatever you can; on Linux,
+  Landlock restricts reading too. The label is the one side effect outside
+  Boris's own files: other low-integrity programs (a sandboxed browser
+  tab, say) could then write to the sandbox directory as well. Remove it
+  with `icacls <dir> /setintegritylevel (OI)(CI)M`.
 - `PYTHONUTF8=1` is set so Python scripts read and write UTF-8, as they do
   on Linux.
 
@@ -99,8 +120,10 @@ classic console, or run it as `winpty boris chat`.
 ## What is different
 
 - `~` and `~/.boris` are under `%USERPROFILE%` (or `%HOME%` if set).
-- There are no permission bits. `config.ini`, which may hold the API key, is
-  protected by the ACL of your profile directory rather than mode 0600.
+- There are no permission bits, so `boris init` stores the API key
+  encrypted with DPAPI (`api_key = dpapi:...`): only your Windows account,
+  on this machine, can read it back. A key typed into `config.ini` by hand
+  as plain text still works.
 - Creating symbolic links needs Developer Mode; tests that need file links
   skip themselves without it. Junctions need nothing and are tested.
 - The eval suite's cases use `sh` scripts and need Git for Windows.

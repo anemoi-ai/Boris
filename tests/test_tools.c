@@ -2065,6 +2065,86 @@ static void test_run_windows_arguments_and_stdin(void)
 }
 #endif /* _WIN32 */
 
+/*
+ * The point of confinement: the same script, run twice. Confined, it can
+ * work inside the sandbox but leaves the world outside alone.
+ */
+static void test_run_confinement(void)
+{
+	printf("  Test: run - a confined script cannot write (or, on Linux, read) outside\n");
+
+	bool reads = false;
+	if (!tool_run_confinement_available(&reads)) {
+		printf("  (skipped: this system cannot confine scripts)\n");
+		return;
+	}
+
+	char outside[PATH_MAX], secret[PATH_MAX], inside[PATH_MAX];
+	snprintf(outside, sizeof(outside), "%s/escaped.txt", g_home);
+	snprintf(secret, sizeof(secret), "%s/secret.txt", g_home);
+	snprintf(inside, sizeof(inside), "%s/conf/made.txt", g_sandbox);
+	FILE *f = fopen(secret, "w");
+	if (f) {
+		fputs("TOP-SECRET-VALUE", f);
+		fclose(f);
+	}
+
+	/* Writes argv[1] (outside) and made.txt (inside); prints argv[2]'s contents */
+	put_file("conf/probe.py",
+		 "import sys, tempfile\n"
+		 "for target in (sys.argv[1], 'made.txt'):\n"
+		 "    try:\n"
+		 "        open(target, 'w').write('x')\n"
+		 "        print('wrote', target)\n"
+		 "    except OSError as e:\n"
+		 "        print('write refused:', type(e).__name__)\n"
+		 "try:\n"
+		 "    print('read:', open(sys.argv[2]).read())\n"
+		 "except OSError as e:\n"
+		 "    print('read refused:', type(e).__name__)\n"
+		 "with tempfile.NamedTemporaryFile() as t:\n"
+		 "    t.write(b'scratch')\n"
+		 "    print('temp ok')\n");
+
+	cJSON *root = cJSON_CreateObject();
+	cJSON_AddStringToObject(root, "path", "conf/probe.py");
+	cJSON *list = cJSON_AddArrayToObject(root, "args");
+	cJSON_AddItemToArray(list, cJSON_CreateString(outside));
+	cJSON_AddItemToArray(list, cJSON_CreateString(secret));
+	char *json = cJSON_PrintUnformatted(root);
+	cJSON_Delete(root);
+
+	struct agent_configuration cfg = make_cfg();
+	struct stat st;
+
+	ASSERT(cfg.run_confine == true); /* the default */
+	struct tool_result r = tool_run_fn(json, &cfg, g_scratch);
+	if (!contains(&r, "Exit code: 0"))
+		printf("    %s\n", r.content ? r.content : "(no output)");
+	ASSERT(contains(&r, "Exit code: 0"));
+	ASSERT(contains(&r, "write refused"));
+	ASSERT(stat(outside, &st) != 0);	/* nothing appeared outside */
+	ASSERT(stat(inside, &st) == 0);		/* the sandbox still works */
+	ASSERT(contains(&r, "temp ok"));	/* and so do temporary files */
+	if (reads) {
+		ASSERT(contains(&r, "read refused"));
+		ASSERT(!contains(&r, "TOP-SECRET-VALUE"));
+	}
+	tool_result_free(&r);
+
+	/* Switched off, the same script does what scripts can do */
+	cfg.run_confine = false;
+	r = tool_run_fn(json, &cfg, g_scratch);
+	ASSERT(stat(outside, &st) == 0);
+	ASSERT(contains(&r, "TOP-SECRET-VALUE"));
+	tool_result_free(&r);
+
+	cJSON_free(json);
+	unlink(outside);
+	unlink(secret);
+	configuration_destroy(&cfg);
+}
+
 static void test_run_output_truncation(void)
 {
 	printf("  Test: run - output truncated at 65536 bytes\n");
@@ -2165,6 +2245,7 @@ int main(void)
 	test_run_environment_allowlist();
 	test_run_timeout_after_stdout_closed();
 	test_run_timeout_keeps_python_output();
+	test_run_confinement();
 #ifdef _WIN32
 	test_run_windows_interpreters();
 	test_run_windows_arguments_and_stdin();

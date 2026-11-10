@@ -14,6 +14,13 @@
 # =============================================================================
 
 cmake_minimum_required(VERSION 3.20)
+
+# With a static vcpkg triplet (x64-windows-static) link the C runtime
+# statically too: boris.exe then needs no DLLs at all.
+if(DEFINED VCPKG_TARGET_TRIPLET AND VCPKG_TARGET_TRIPLET MATCHES "-static$")
+  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+
 project(boris C)
 
 set(CMAKE_C_STANDARD 11)
@@ -33,6 +40,7 @@ if(MSVC)
     /wd4100   # unused parameter (callbacks have fixed signatures)
     /wd4200   # flexible array member: standard since C99
     /wd4204   # non-constant aggregate initialiser: standard since C99
+    /wd4206   # empty translation unit: the POSIX-only files, on Windows
     /wd4221   # initialiser takes the address of a local: likewise
     /wd4244   # int conversions that -Wall -Wextra do not flag either
     /wd4267   # size_t -> int, as above

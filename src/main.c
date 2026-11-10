@@ -18,6 +18,7 @@
 #include "repl.h"
 #include "init.h"
 #include "tools.h"
+#include "tool_builtins.h"
 #include "http_client.h"
 #include "metrics.h"
 #include "json.h"
@@ -614,6 +615,15 @@ static int cmd_status(int argc, char *argv[])
 	printf("  Tools enabled   : %s\n", tools_buf);
 	printf("  Confirm writes  : %s\n", config.confirm_writes ? "yes" : "no");
 	printf("  Confirm run     : %s\n", config.confirm_bash ? "yes" : "no");
+	if (config.tools_enabled & TOOL_RUN) {
+		bool reads = false;
+		bool can = tool_run_confinement_available(&reads);
+		printf("  Run confinement : %s\n",
+		       !config.run_confine ? "off (tools.run_confine)"
+		       : !can	    ? "NOT AVAILABLE on this system"
+		       : reads	    ? "on (reads and writes limited to the sandbox)"
+				    : "on (writes limited to the sandbox)");
+	}
 	if (config.tools_enabled & TOOL_FETCH)
 		printf("  Confirm fetch   : %s\n", config.confirm_fetch ? "yes" : "no");
 	printf("  Memory persist  : %s\n", config.memory_persist ? "yes" : "no");

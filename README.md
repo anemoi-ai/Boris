@@ -184,6 +184,7 @@ src/
     ├── memory.c      Key-value store with file locking
     ├── run.c         Script execution via fork/exec with timeout
     ├── run_win32.c   The same on Windows: CreateProcess in a job object
+    ├── run_confine.c Landlock rules that confine a script to the sandbox
     ├── plan.c        The model's own checklist
     └── fetch.c       HTTP(S) GET, HTML to text (off by default)
 ```
@@ -204,13 +205,17 @@ Dependency direction is strict: `main` → `repl/init` → `agent` → `llm/tool
 | `move` | Rename or move | Refuses to overwrite unless asked; moves a symlink, not its target |
 | `delete` | Delete files or trees | Directories need `recursive`; never follows symlinks; never the sandbox root |
 | `memory` | Persistent key-value store | JSON on disk, file-locked; get / set / delete / list |
-| `run` | Execute a script in the sandbox | Shebang or extension; fork/exec, never `system()`; SIGKILL timeout; allowlisted environment |
+| `run` | Execute a script in the sandbox | Asks first; confined by Landlock / low integrity; fork/exec, never `system()`; SIGKILL timeout; allowlisted environment |
 | `plan` | The model's checklist | Kept outside the history, so it survives truncation |
 | `fetch` | Fetch a web page as text | **Off by default**; asks first; http(s) only; private and loopback addresses refused |
 
 `tools.enabled = default` turns on everything except `fetch`; `all` includes it. Every result is capped at `tools.max_result_bytes` (132 KB by default) with a note saying how much was cut.
 
-Scripts started by `run` see only an allowlisted environment (`PATH`, `HOME`, locale and a few others), never `BORIS_API_KEY`. They still run with your permissions and can read files such as `~/.boris/config.ini`, so Boris also redacts its own API key from every tool result before the model sees it. `behaviour.confirm_run = true` is the safeguard if you need more.
+Scripts started by `run` are code the model wrote, so three things stand between them and your machine:
+
+- **Confirmation.** `behaviour.confirm_run` is on by default: `boris chat` asks before each script, and `boris exec`, with nobody to ask, refuses until you turn it off.
+- **Confinement** (`tools.run_confine`, on by default). On Linux, Landlock limits a script to reading the system, its interpreter and the sandbox, and to writing the sandbox and a private temp directory; the rest of your home directory, `~/.boris/config.ini` and `~/.ssh` included, does not exist for it. On Windows the script runs at low integrity and can write only the sandbox and a temp directory, though it can still read your files. On macOS and kernels before 5.13 there is no confinement, and Boris says so. `boris status` shows which applies. Network access is not restricted anywhere.
+- **Environment.** Scripts see only an allowlisted environment (`PATH`, `HOME`, locale and a few others), never `BORIS_API_KEY`, and Boris redacts its own API key from every tool result before the model sees it.
 
 ---
 
