@@ -3,7 +3,8 @@
  *
  * Resolves the script path inside the sandbox, detects the interpreter via
  * shebang or file extension, then fork/exec's the child with combined
- * stdout+stderr captured and returned to the model.
+ * stdout+stderr captured and returned to the model. (On Windows the last
+ * two steps are in run_win32.c: CreateProcess in a job object.)
  *
  * Security properties:
  *   - Script path is validated by sandbox_resolve() before any exec
@@ -28,24 +29,25 @@
 #include "json.h"
 #include "logger.h"
 #include "fs.h"
+#include "run_internal.h"
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 #include <limits.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
-#include <fcntl.h>
+#include "platform.h"
+#ifndef _WIN32
 #include <sys/wait.h>
 #include <poll.h>
+#endif
 #include <signal.h>
 #include <time.h>
 
+#ifndef _WIN32
 extern char **environ;
+#endif
 
-#define RUN_MAX_OUTPUT	    65536
 #define RUN_MAX_ARGV	    40	 /* interpreter parts + script + user args + NULL */
 #define RUN_DEFAULT_TIMEOUT 30	 /* seconds */
 #define RUN_MAX_TIMEOUT	    120	 /* hard cap regardless of config */
@@ -60,18 +62,33 @@ extern char **environ;
 
 /* Variables passed through to scripts. Everything else, including every
  * BORIS_* variable, is dropped. tools.run_env adds names to this list. */
+#ifdef _WIN32
+/* Windows programs expect rather more to be there: without SystemRoot,
+ * for one, most runtimes cannot even open a socket. Names are matched
+ * without regard to case, as the system does. */
+static const char *const RUN_ENV_ALLOW[] = {
+	"PATH", "PATHEXT", "SystemRoot", "SystemDrive", "windir", "ComSpec",
+	"TEMP", "TMP", "USERPROFILE", "USERNAME", "HOMEDRIVE", "HOMEPATH", "HOME",
+	"APPDATA", "LOCALAPPDATA", "ProgramData", "ProgramFiles", "ProgramFiles(x86)",
+	"CommonProgramFiles", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE", "OS",
+	"LANG", "LC_ALL", "TZ",
+};
+#define env_name_equal(a, b, len) (strncasecmp(a, b, len) == 0)
+#else
 static const char *const RUN_ENV_ALLOW[] = {
 	"PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE",
 	"TERM", "TMPDIR", "TZ",
 };
+#define env_name_equal(a, b, len) (strncmp(a, b, len) == 0)
 
 #define RUN_DEFAULT_PATH "/usr/local/bin:/usr/bin:/bin"
+#endif
 
 static bool env_has(char *const *envp, size_t count, const char *name)
 {
 	size_t len = strlen(name);
 	for (size_t i = 0; i < count; i++)
-		if (strncmp(envp[i], name, len) == 0 && envp[i][len] == '=')
+		if (env_name_equal(envp[i], name, len) && envp[i][len] == '=')
 			return true;
 	return false;
 }
@@ -114,7 +131,7 @@ static void build_child_env(const struct agent_configuration *cfg,
 		char *save = NULL;
 		for (char *tok = strtok_r(names, ", \t", &save); tok;
 		     tok = strtok_r(NULL, ", \t", &save)) {
-			if (strncmp(tok, "BORIS_", 6) == 0) {
+			if (env_name_equal(tok, "BORIS_", 6)) {
 				log_warning("run: tools.run_env: refusing to pass %s "
 					    "to scripts", tok);
 				continue;
@@ -123,8 +140,15 @@ static void build_child_env(const struct agent_configuration *cfg,
 		}
 	}
 
+#ifdef _WIN32
+	/* Python would otherwise encode its output in the legacy code page,
+	 * and fail outright on characters that page lacks. Everything Boris
+	 * reads and writes is UTF-8. */
+	env_add(envp, &count, "PYTHONUTF8", "1", scratch);
+#else
 	if (!env_has(envp, count, "PATH"))
 		env_add(envp, &count, "PATH", RUN_DEFAULT_PATH, scratch);
+#endif
 	/* Python block-buffers stdout when it is a pipe, so a script killed at
 	 * the timeout would report no output at all, hiding where it hung. */
 	env_add(envp, &count, "PYTHONUNBUFFERED", "1", scratch);
@@ -134,6 +158,8 @@ static void build_child_env(const struct agent_configuration *cfg,
 /* -------------------------------------------------------------------------
  * Interpreter resolution
  * ---------------------------------------------------------------------- */
+
+#ifndef _WIN32
 
 static const struct {
 	const char *ext;
@@ -217,6 +243,7 @@ static int build_argv_shebang(const char *script_path,
 	return argc;
 }
 
+#endif /* !_WIN32 */
 
 /* -------------------------------------------------------------------------
  * Argument parsing
@@ -280,6 +307,44 @@ static int parse_run_args(const char *json_str, struct run_args *out,
 	return 0;
 }
 
+/* -------------------------------------------------------------------------
+ * Result
+ * ---------------------------------------------------------------------- */
+
+char *run_format_result(const struct child_output *out, bool finished, bool cancelled,
+			int exit_code, int timeout_seconds)
+{
+	size_t result_cap = out->len + 256;
+	char *result = malloc(result_cap);
+	if (!result)
+		return NULL;
+
+	int hlen;
+	if (cancelled)
+		hlen = snprintf(result, result_cap,
+				"Cancelled by the user (process killed)\n"
+				"--- output (partial) ---\n");
+	else if (!finished)
+		hlen = snprintf(result, result_cap,
+				"Timed out after %d seconds (process killed)\n"
+				"--- output (partial) ---\n",
+				timeout_seconds);
+	else
+		hlen = snprintf(result, result_cap,
+				"Exit code: %d\n--- output ---\n", exit_code);
+
+	memcpy(result + hlen, out->buf, out->len);
+	size_t pos = (size_t)hlen + out->len;
+	if (out->truncated)
+		snprintf(result + pos, result_cap - pos,
+			 "\n[Output truncated at %d bytes]", RUN_MAX_OUTPUT);
+	else
+		result[pos] = '\0';
+	return result;
+}
+
+#ifndef _WIN32
+
 static long elapsed_ms(const struct timespec *start)
 {
 	struct timespec now;
@@ -338,12 +403,6 @@ static void feed_stdin(int fd, const char *data, size_t len)
 	sigaction(SIGPIPE, &old, NULL);
 	close(fd);
 }
-
-struct child_output {
-	char *buf; /* RUN_MAX_OUTPUT + 1 bytes */
-	size_t len;
-	bool truncated;
-};
 
 /* Read combined output until EOF, the deadline, or cancellation.
  * Returns false if the child must be killed (timeout or Ctrl+C). */
@@ -473,38 +532,13 @@ static char *exec_child(char *const argv[], char **envp, const char *cwd,
 					      : 0;
 
 	/* Format result: header + captured output + optional note */
-	size_t result_cap = out.len + 256;
-	char *result = malloc(result_cap);
-	if (!result) {
-		free(out.buf);
-		return NULL;
-	}
-
-	int hlen;
-	if (cancelled)
-		hlen = snprintf(result, result_cap,
-				"Cancelled by the user (process killed)\n"
-				"--- output (partial) ---\n");
-	else if (!finished)
-		hlen = snprintf(result, result_cap,
-				"Timed out after %d seconds (process killed)\n"
-				"--- output (partial) ---\n",
-				timeout_seconds);
-	else
-		hlen = snprintf(result, result_cap,
-				"Exit code: %d\n--- output ---\n", exit_code);
-
-	memcpy(result + hlen, out.buf, out.len);
-	size_t pos = (size_t)hlen + out.len;
-	if (out.truncated)
-		snprintf(result + pos, result_cap - pos,
-			 "\n[Output truncated at %d bytes]", RUN_MAX_OUTPUT);
-	else
-		result[pos] = '\0';
-
+	char *result = run_format_result(&out, finished, cancelled, exit_code,
+					 timeout_seconds);
 	free(out.buf);
 	return result;
 }
+
+#endif /* !_WIN32 */
 
 /* -------------------------------------------------------------------------
  * Public tool function
@@ -539,6 +573,7 @@ struct tool_result tool_run_fn(const char *arguments_json,
 	for (int i = 0; i < args.user_argc; i++)
 		user_argv[i] = args.user_args[i];
 
+#ifndef _WIN32
 	char *exec_argv[RUN_MAX_ARGV];
 	char shebang_buf[512];
 	int argc = build_argv_shebang(resolved,
@@ -562,6 +597,7 @@ struct tool_result tool_run_fn(const char *arguments_json,
 			exec_argv[argc++] = user_argv[i];
 		exec_argv[argc] = NULL;
 	}
+#endif
 
 	/* Clamp timeout: per-call request cannot exceed the config ceiling */
 	int timeout = args.timeout_seconds;
@@ -577,16 +613,25 @@ struct tool_result tool_run_fn(const char *arguments_json,
 	else
 		snprintf(dir_buf, sizeof(dir_buf), "%s", cfg->sandbox_root);
 
-	log_info("run: %s (interpreter=%s, timeout=%ds)",
-		 resolved, exec_argv[0], timeout);
-
 	char *envp[RUN_ENV_MAX];
 	build_child_env(cfg, envp, scratch);
+
+#ifdef _WIN32
+	char problem[512];
+	char *output = run_win32_script(resolved, (char *const *)user_argv, args.user_argc,
+					envp, dir_buf, args.stdin_data, args.stdin_len,
+					timeout, problem, sizeof(problem));
+	if (!output)
+		return tool_result_errorf("run", "%s", problem);
+#else
+	log_info("run: %s (interpreter=%s, timeout=%ds)",
+		 resolved, exec_argv[0], timeout);
 
 	char *output = exec_child((char *const *)exec_argv, envp, dir_buf,
 				  args.stdin_data, args.stdin_len, timeout);
 	if (!output)
 		return tool_result_errorf("run", "Failed to launch process");
+#endif
 
 	return tool_result_ok("run", output);
 }
@@ -648,7 +693,11 @@ const struct tool_definition tool_run_definition = {
 	.name = "run",
 	.description = "Execute a script file within the sandbox and return its output. "
 		       "The interpreter is detected from the shebang line or file extension "
+#ifdef _WIN32
+		       "(.py, .js, .ps1, .bat, .cmd, .sh, .rb, .lua, .pl, .php). "
+#else
 		       "(.py, .js, .sh, .rb, .lua, .pl, .php). "
+#endif
 		       "Returns the exit code and combined stdout/stderr.",
 	.parameters_schema = SCHEMA_RUN,
 	.fn = tool_run_fn,

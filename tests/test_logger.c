@@ -12,6 +12,7 @@
 #include "logger.h"
 #include <stdio.h>
 #include <string.h>
+#include "support.h"
 
 static int tests_passed = 0;
 static int tests_failed = 0;
@@ -49,7 +50,7 @@ static void test_logger_file_output(void)
 {
 	printf("  Test: file output\n");
 
-	const char *test_file = "/tmp/boris_logger_test.log";
+	const char *test_file = test_tmp_path("boris_logger_test.log");
 
 	/* Remove any previous test file */
 	remove(test_file);
@@ -94,7 +95,7 @@ static void test_logger_level_filtering(void)
 {
 	printf("  Test: log level filtering\n");
 
-	const char *test_file = "/tmp/boris_logger_level_test.log";
+	const char *test_file = test_tmp_path("boris_logger_level_test.log");
 
 	remove(test_file);
 

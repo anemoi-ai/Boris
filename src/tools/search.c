@@ -19,16 +19,18 @@
 #include "json.h"
 #include "logger.h"
 #include <ctype.h>
-#include <dirent.h>
+#include "platform.h"
 #include <errno.h>
+#ifndef _WIN32
 #include <fnmatch.h>
+#endif
 #include <limits.h>
+#ifndef _WIN32
 #include <regex.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
-#include <sys/stat.h>
 
 #define SEARCH_DEFAULT_RESULTS 100
 #define SEARCH_MAX_RESULTS     500
@@ -224,7 +226,7 @@ static bool limit_reached(struct search_state *s)
 	return s->stopped;
 }
 
-static void search_file(struct search_state *s, const char *abs, off_t size)
+static void search_file(struct search_state *s, const char *abs, long long size)
 {
 	const char *rel = relative_path(s, abs);
 	s->files_examined++;

@@ -10,7 +10,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
-#include <sys/types.h>
+#include "platform.h"
 
 /* Create dir and any missing parents (like mkdir -p). Returns 0 or -1. */
 int fs_mkdirp(const char *dir, mode_t mode);
@@ -38,7 +38,8 @@ int fs_write_atomic(const char *path, const char *data, size_t len,
 /*
  * Return "$HOME/.boris/<relative>" (or "$HOME/.boris" when relative is
  * NULL or empty) as a heap string. Falls back to the passwd entry when
- * HOME is unset. Returns NULL if no home directory can be found.
+ * HOME is unset (on Windows, to %USERPROFILE%). Returns NULL if no home
+ * directory can be found.
  */
 char *fs_boris_path(const char *relative);
 

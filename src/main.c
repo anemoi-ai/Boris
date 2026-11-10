@@ -7,7 +7,7 @@
  */
 #define _GNU_SOURCE
 
-#include <unistd.h>
+#include "platform.h"
 
 #include "boris_errors.h"
 #include "boris_types.h"
@@ -31,12 +31,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
 #include <getopt.h>
+#endif
 #include <signal.h>
 #include <stdbool.h>
 #include <ctype.h>
 #include <limits.h>
-#include <unistd.h>
 
 static bool g_quiet = false;
 
@@ -392,7 +393,9 @@ static int cmd_chat(int argc, char *argv[])
 
 	/* A script that exits without reading its stdin, or a server that
 	 * drops the connection, must not kill the process with SIGPIPE. */
+#ifdef SIGPIPE
 	signal(SIGPIPE, SIG_IGN);
+#endif
 
 	if (http_global_init() != 0)
 		fprintf(stderr, "  Warning: HTTP initialisation failed.\n");
@@ -515,7 +518,9 @@ static int cmd_exec(int argc, char *argv[])
 	if (!conv)
 		goto done;
 
+#ifdef SIGPIPE
 	signal(SIGPIPE, SIG_IGN);
+#endif
 	if (http_global_init() != 0)
 		fprintf(stderr, "boris exec: warning: HTTP initialisation failed\n");
 	tools_register_builtins();
@@ -631,6 +636,8 @@ static int cmd_status(int argc, char *argv[])
 
 int main(int argc, char *argv[])
 {
+	platform_init();
+
 	if (argc < 2) {
 		print_usage();
 		return 0;

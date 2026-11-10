@@ -122,6 +122,29 @@ brew install curl
 
 That's the entire dependency list.
 
+### On Windows
+
+Boris builds natively with Visual Studio 2022 (MSVC or clang-cl) and CMake; no
+WSL, MSYS or Cygwin. Windows 10 version 1903 or later.
+
+```powershell
+vcpkg install curl:x64-windows
+
+git clone https://github.com/anemoi-ai/Boris
+cd Boris
+cmake -B build -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake
+cmake --build build --config Release
+ctest --test-dir build -C Release --output-on-failure
+
+build\Release\boris.exe init
+build\Release\boris.exe chat
+```
+
+Everything works as on Linux, with the differences you would expect: paths may
+use either slash, `~` is `%USERPROFILE%`, and the `run` tool also runs `.ps1`,
+`.bat` and `.cmd` scripts. See [docs/windows.md](docs/windows.md) for how the
+port is put together.
+
 ---
 
 ## Architecture
@@ -138,6 +161,8 @@ src/
 ├── tools.c           Registry, dispatch, confirmation, result cap
 ├── sandbox.c         Path validation via realpath()
 ├── fs.c              mkdir -p, atomic file replacement, ~/.boris paths
+├── platform_win32.c  Windows only: the POSIX calls Boris uses, over Win32
+├── platform_regex.c  Windows only: fnmatch and extended regex for search
 ├── configuration.c   INI + env + flags, layered overrides
 ├── arena.c           Per-request bump allocator
 ├── repl.c            Interactive loop, slash commands, session restore
@@ -158,6 +183,7 @@ src/
     ├── delete.c      Delete files and trees, never through symlinks
     ├── memory.c      Key-value store with file locking
     ├── run.c         Script execution via fork/exec with timeout
+    ├── run_win32.c   The same on Windows: CreateProcess in a job object
     ├── plan.c        The model's own checklist
     └── fetch.c       HTTP(S) GET, HTML to text (off by default)
 ```

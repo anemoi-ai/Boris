@@ -27,6 +27,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include "platform.h"
 #include <errno.h>
 #include <limits.h>
 
@@ -39,11 +40,12 @@
 /* Expand a leading "~/" (or a bare "~") to $HOME. Caller frees. */
 static char *expand_tilde(const char *path)
 {
-	if (path[0] != '~' || (path[1] != '\0' && path[1] != '/'))
+	bool separator = path[1] == '/' || (PLATFORM_WINDOWS && path[1] == '\\');
+	if (path[0] != '~' || (path[1] != '\0' && !separator))
 		return strdup(path);
 
-	const char *home = getenv("HOME");
-	if (!home || !home[0])
+	const char *home = platform_home_dir();
+	if (!home)
 		return strdup(path);
 
 	size_t home_len = strlen(home);

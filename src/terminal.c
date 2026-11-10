@@ -12,7 +12,7 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
+#include "platform.h"
 
 /* -------------------------------------------------------------------------
  * Cached detection
@@ -23,8 +23,15 @@ static int g_color_cached = -1;
 
 bool term_is_tty(void)
 {
-	if (g_tty_cached < 0)
+	if (g_tty_cached < 0) {
+#ifdef _WIN32
+		/* A console that cannot be switched to ANSI escape sequences
+		 * (before Windows 10) is treated like a pipe: plain text. */
+		g_tty_cached = platform_console_vt() ? 1 : 0;
+#else
 		g_tty_cached = isatty(STDOUT_FILENO) ? 1 : 0;
+#endif
+	}
 	return g_tty_cached == 1;
 }
 
@@ -48,6 +55,11 @@ bool term_supports_color(void)
 		return true;
 	}
 
+#ifdef _WIN32
+	/* Every console that passed term_is_tty() does colour; TERM is unset. */
+	g_color_cached = 1;
+	return true;
+#else
 	const char *term = getenv("TERM");
 	if (!term)
 		return false;
@@ -59,6 +71,7 @@ bool term_supports_color(void)
 	}
 
 	return false;
+#endif
 }
 
 /* -------------------------------------------------------------------------

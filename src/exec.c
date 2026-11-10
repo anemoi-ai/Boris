@@ -14,7 +14,7 @@
 #include "conversation.h"
 #include "tools.h"
 #include <string.h>
-#include <unistd.h>
+#include "platform.h"
 
 struct exec_state {
 	const struct exec_options *opts;

@@ -17,17 +17,18 @@
 #include <limits.h>
 #include <stdio.h>
 #include <string.h>
-#include <sys/stat.h>
+#include "platform.h"
 
 /* "dir/" as a destination means "into dir, keeping the name". */
 static const char *destination_path(const char *from, const char *to,
 				    char *buf, size_t size)
 {
 	size_t tl = strlen(to);
-	if (tl == 0 || to[tl - 1] != '/')
+	if (tl == 0 || (to[tl - 1] != '/' && !(PLATFORM_WINDOWS && to[tl - 1] == '\\')))
 		return to;
 	char name[PATH_MAX];
 	snprintf(name, sizeof(name), "%s", from);
+	platform_path_normalize(name);
 	size_t nl = strlen(name);
 	while (nl > 1 && name[nl - 1] == '/')
 		name[--nl] = '\0';
@@ -53,6 +54,9 @@ static struct tool_result do_move(const char *from, const char *to, bool overwri
 		return tool_result_errorf("move", "Not found: %s", from);
 	if (strcmp(src, dst) == 0)
 		return tool_result_errorf("move", "Source and destination are the same");
+	size_t src_len = strlen(src);
+	if (S_ISDIR(st.st_mode) && strncmp(dst, src, src_len) == 0 && dst[src_len] == '/')
+		return tool_result_errorf("move", "Cannot move a directory into itself");
 	if (!overwrite && lstat(dst, &st) == 0)
 		return tool_result_errorf("move", "Destination exists: %s. Set "
 						  "overwrite=true to replace it.", to);

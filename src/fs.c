@@ -7,14 +7,14 @@
 #include "fs.h"
 #include "logger.h"
 #include <errno.h>
-#include <fcntl.h>
+#include "platform.h"
 #include <limits.h>
+#ifndef _WIN32
 #include <pwd.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 int fs_mkdirp(const char *dir, mode_t mode)
 {
@@ -27,8 +27,13 @@ int fs_mkdirp(const char *dir, mode_t mode)
 		return -1;
 	memcpy(work, dir, len + 1);
 
-	/* Create each ancestor in turn, then the directory itself. */
-	for (char *p = work + 1;; p++) {
+	platform_path_normalize(work);
+
+	/* Create each ancestor in turn, then the directory itself. The root
+	 * ("/", "C:/", "//server/share/") exists and cannot be created. */
+	size_t root = platform_path_root_length(work);
+	bool is_root = root > 0 && work[root] == '\0';
+	for (char *p = work + (root ? root : 1); !is_root; p++) {
 		if (*p != '/' && *p != '\0')
 			continue;
 		char saved = *p;
@@ -51,18 +56,18 @@ int fs_mkdirp_parent(const char *file_path, mode_t mode)
 {
 	if (!file_path)
 		return -1;
-	const char *slash = strrchr(file_path, '/');
+	char parent[PATH_MAX];
+	if (strlen(file_path) >= sizeof(parent))
+		return -1;
+	strcpy(parent, file_path);
+	platform_path_normalize(parent);
+
+	char *slash = strrchr(parent, '/');
 	if (!slash)
 		return 0; /* relative file in the current directory */
-	if (slash == file_path)
-		return 0; /* parent is "/" */
-
-	char parent[PATH_MAX];
-	size_t len = (size_t)(slash - file_path);
-	if (len >= sizeof(parent))
-		return -1;
-	memcpy(parent, file_path, len);
-	parent[len] = '\0';
+	if ((size_t)(slash - parent) < platform_path_root_length(parent))
+		return 0; /* parent is the root */
+	*slash = '\0';
 	return fs_mkdirp(parent, mode);
 }
 
@@ -112,7 +117,13 @@ int fs_write_atomic(const char *path, const char *data, size_t len,
 
 	if (!saved_errno) {
 		/* link() fails with EEXIST instead of replacing; rename() replaces. */
+#ifdef _WIN32
+		/* A move that refuses to replace does the same job as link(),
+		 * and unlike hard links it works on every Windows filesystem. */
+		int rc = no_replace ? plat_rename_noreplace(tmp, path) : rename(tmp, path);
+#else
 		int rc = no_replace ? link(tmp, path) : rename(tmp, path);
+#endif
 		if (rc != 0)
 			saved_errno = errno;
 	}
@@ -126,13 +137,90 @@ int fs_write_atomic(const char *path, const char *data, size_t len,
 	return 0;
 }
 
-char *fs_boris_path(const char *relative)
+/* -------------------------------------------------------------------------
+ * Paths that differ between systems (declared in platform.h)
+ * ---------------------------------------------------------------------- */
+
+#ifdef _WIN32
+
+static bool is_separator(char c)
+{
+	return c == '/' || c == '\\';
+}
+
+size_t platform_path_root_length(const char *path)
+{
+	if (!path)
+		return 0;
+	if (((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) &&
+	    path[1] == ':' && is_separator(path[2]))
+		return 3; /* "C:/" */
+	if (is_separator(path[0]) && is_separator(path[1])) {
+		/* "//server/share/": the root ends after the share name */
+		size_t i = 2;
+		while (path[i] && !is_separator(path[i]))
+			i++;
+		if (path[i])
+			i++;
+		while (path[i] && !is_separator(path[i]))
+			i++;
+		return path[i] ? i + 1 : i;
+	}
+	return is_separator(path[0]) ? 1 : 0; /* "/x": root of the current drive */
+}
+
+void platform_path_normalize(char *path)
+{
+	for (; path && *path; path++)
+		if (*path == '\\')
+			*path = '/';
+}
+
+const char *platform_home_dir(void)
+{
+	/* HOME first: it is what Git Bash and other Unix-style shells set, and
+	 * it lets a caller point Boris at a different home. */
+	static char home[PATH_MAX];
+	const char *dir = getenv("HOME");
+	if (!dir || !dir[0])
+		dir = getenv("USERPROFILE");
+	if (!dir || !dir[0] || strlen(dir) >= sizeof(home))
+		return NULL;
+	strcpy(home, dir);
+	platform_path_normalize(home);
+	size_t len = strlen(home);
+	if (len > platform_path_root_length(home) && home[len - 1] == '/')
+		home[len - 1] = '\0';
+	return home;
+}
+
+#else /* POSIX */
+
+size_t platform_path_root_length(const char *path)
+{
+	return path && path[0] == '/' ? 1 : 0;
+}
+
+void platform_path_normalize(char *path)
+{
+	(void)path;
+}
+
+const char *platform_home_dir(void)
 {
 	const char *home = getenv("HOME");
 	if (!home || !home[0]) {
 		struct passwd *pw = getpwuid(getuid());
 		home = (pw && pw->pw_dir && pw->pw_dir[0]) ? pw->pw_dir : NULL;
 	}
+	return home;
+}
+
+#endif
+
+char *fs_boris_path(const char *relative)
+{
+	const char *home = platform_home_dir();
 	if (!home)
 		return NULL;
 

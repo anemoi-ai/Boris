@@ -21,7 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
+#include "platform.h"
 
 #define FETCH_DEFAULT_LENGTH 32768
 #define FETCH_MAX_LENGTH     131072

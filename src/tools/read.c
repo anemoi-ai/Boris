@@ -19,9 +19,7 @@
 #include <string.h>
 #include <errno.h>
 #include <limits.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <sys/stat.h>
+#include "platform.h"
 
 #ifndef O_NOFOLLOW
 #define O_NOFOLLOW 0

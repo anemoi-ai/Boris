@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include "support.h"
 
 static int tests_passed = 0;
 static int tests_failed = 0;
@@ -67,7 +68,7 @@ static void test_configuration_load_from_file(void)
 	printf("  Test: load from file\n");
 
 	/* Create a temporary config file */
-	const char *test_file = "/tmp/boris_config_test.ini";
+	const char *test_file = test_tmp_path("boris_config_test.ini");
 	FILE *file = fopen(test_file, "w");
 	ASSERT(file != NULL);
 
@@ -114,7 +115,7 @@ static void test_configuration_missing_file(void)
 	struct agent_configuration config;
 	configuration_set_defaults(&config);
 
-	enum boris_error result = configuration_load_from_file(&config, "/tmp/boris_does_not_exist.ini");
+	enum boris_error result = configuration_load_from_file(&config, test_tmp_path("boris_does_not_exist.ini"));
 	ASSERT(result == BORIS_OK); /* Missing file is not an error */
 
 	/* Values should still be defaults */
@@ -240,7 +241,7 @@ static void test_configuration_comments_and_blanks(void)
 {
 	printf("  Test: comments and blank lines in config\n");
 
-	const char *test_file = "/tmp/boris_config_comments.ini";
+	const char *test_file = test_tmp_path("boris_config_comments.ini");
 	FILE *file = fopen(test_file, "w");
 	ASSERT(file != NULL);
 
@@ -276,7 +277,7 @@ static void test_layer_priority_env_beats_ini(void)
 {
 	printf("  Test: env var overrides INI file value for same key\n");
 
-	const char *test_file = "/tmp/boris_priority_test.ini";
+	const char *test_file = test_tmp_path("boris_priority_test.ini");
 	FILE *file = fopen(test_file, "w");
 	ASSERT(file != NULL);
 	if (file) {

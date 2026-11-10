@@ -17,12 +17,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <sys/types.h>
+#include "platform.h"
 #include <errno.h>
 #include <time.h>
-#include <unistd.h>
+#ifndef _WIN32
 #include <termios.h>
+#endif
 
 #define MAX_USER_INPUT 1024
 
@@ -40,6 +40,13 @@ static char *ask(const char *prompt, char *buffer, size_t size)
 	printf("  %s", prompt);
 	fflush(stdout);
 
+#ifdef _WIN32
+	/* Read the console as Unicode, whatever its code page. */
+	if (isatty(STDIN_FILENO)) {
+		if (!platform_console_read_line(buffer, size, true))
+			return NULL;
+	} else
+#endif
 	if (!fgets(buffer, (int)size, stdin))
 		return NULL;
 
@@ -67,6 +74,14 @@ static char *ask_hidden(const char *prompt, char *buffer, size_t size)
 	printf("  %s", prompt);
 	fflush(stdout);
 
+#ifdef _WIN32
+	if (isatty(STDIN_FILENO)) {
+		bool ok = platform_console_read_line(buffer, size, false);
+		printf("\n");
+		return ok ? buffer : NULL;
+	}
+	char *result = fgets(buffer, (int)size, stdin);
+#else
 	struct termios old, noecho;
 	int tty = isatty(STDIN_FILENO);
 	if (tty) {
@@ -82,6 +97,7 @@ static char *ask_hidden(const char *prompt, char *buffer, size_t size)
 		tcsetattr(STDIN_FILENO, TCSAFLUSH, &old);
 		printf("\n");
 	}
+#endif
 
 	if (!result)
 		return NULL;
@@ -377,7 +393,7 @@ int init_run(void)
 	printf("\n");
 	printf("  %s, your companion %s is ready.\n", user_name, companion_name);
 	printf("\n");
-	printf("  Run './boris chat' to start chatting.\n");
+	printf("  Run '%s chat' to start chatting.\n", PLATFORM_WINDOWS ? "boris" : "./boris");
 	printf("\n");
 	printf("  See you there.\n");
 	printf("\n");

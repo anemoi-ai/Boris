@@ -23,7 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
+#include "platform.h"
 
 #define EDIT_MAX_FILE	(4 * 1024 * 1024)
 #define EDIT_MAX_STRING 131072

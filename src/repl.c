@@ -23,8 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
-#include <sys/time.h>
-#include <unistd.h>
+#include "platform.h"
 
 #define CONTEXT_WARN_PCT 75.0
 
@@ -59,7 +58,11 @@ static void sigint_handler(int sig)
 
 static volatile sig_atomic_t g_spinner_active = 0;
 static volatile sig_atomic_t g_spinner_frame = 0;
+#ifdef _WIN32
+static bool g_spinner_plain = false; /* the console font has no braille */
+#else
 static struct sigaction g_old_sigalrm;
+#endif
 
 /* Braille spinner characters (3 bytes each in UTF-8) */
 static const char g_spinner_chars[] =
@@ -83,11 +86,26 @@ static void spinner_handler(int sig)
 		return;
 	ssize_t r;
 	r = write(STDOUT_FILENO, "\r\033[K  Boris is thinking ", 25);
+#ifdef _WIN32
+	if (g_spinner_plain) {
+		r = write(STDOUT_FILENO, &"|/-\\"[g_spinner_frame % 4], 1);
+		g_spinner_frame = (g_spinner_frame + 1) % SPIN_FRAMES;
+		return;
+	}
+#endif
 	r = write(STDOUT_FILENO,
 		  &g_spinner_chars[g_spinner_frame * SPIN_BYTES], SPIN_BYTES);
 	(void)r;
 	g_spinner_frame = (g_spinner_frame + 1) % SPIN_FRAMES;
 }
+
+#ifdef _WIN32
+/* Windows has no SIGALRM; a background thread draws the frames instead. */
+static void spinner_tick(void)
+{
+	spinner_handler(0);
+}
+#endif
 
 static void spinner_start(void)
 {
@@ -100,6 +118,10 @@ static void spinner_start(void)
 	g_spinner_frame = 0;
 	term_cursor_hide();
 	fflush(stdout);
+#ifdef _WIN32
+	g_spinner_plain = !platform_console_rich_glyphs();
+	platform_ticker_start(80, spinner_tick);
+#else
 	struct sigaction sa;
 	memset(&sa, 0, sizeof(sa));
 	sa.sa_handler = spinner_handler;
@@ -112,16 +134,21 @@ static void spinner_start(void)
 	it.it_value.tv_sec = 0;
 	it.it_value.tv_usec = 80000;
 	setitimer(ITIMER_REAL, &it, NULL);
+#endif
 }
 
 static void spinner_stop(void)
 {
 	if (!g_spinner_active)
 		return;
+#ifdef _WIN32
+	platform_ticker_stop();
+#else
 	struct itimerval it;
 	memset(&it, 0, sizeof(it));
 	setitimer(ITIMER_REAL, &it, NULL);
 	sigaction(SIGALRM, &g_old_sigalrm, NULL);
+#endif
 	g_spinner_active = 0;
 	printf("\r\033[K");
 	term_cursor_show();

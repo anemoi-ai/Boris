@@ -23,3 +23,23 @@ jobs:
 
       - name: Eval harness self-test
         run: python3 evals/run_evals.py selftest
+
+  build-and-test-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: vcpkg install curl:x64-windows
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Eval harness self-test
+        run: python evals/run_evals.py selftest

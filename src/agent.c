@@ -21,6 +21,7 @@
 #include "logger.h"
 #include "arena.h"
 #include "cJSON.h"
+#include "platform.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -518,11 +519,19 @@ static void sleep_ms(int ms)
 {
 	if (ms <= 0)
 		return;
+#ifdef _WIN32
+	/* Nothing interrupts a sleep here, so take it in short steps. */
+	for (int step; ms > 0 && !g_interrupted; ms -= step) {
+		step = ms < 50 ? ms : 50;
+		platform_sleep_ms((unsigned)step);
+	}
+#else
 	struct timespec ts, rem;
 	ts.tv_sec = ms / 1000;
 	ts.tv_nsec = (ms % 1000) * 1000000L;
 	while (nanosleep(&ts, &rem) != 0 && !g_interrupted)
 		ts = rem;
+#endif
 }
 
 /*
