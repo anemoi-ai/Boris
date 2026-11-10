@@ -289,12 +289,71 @@ enum boris_error conversation_add_tool_result(
 
 
 /* Rough token estimate: chars/4 + 4 per message (API role/separator overhead). */
-size_t conversation_estimate_tokens(const struct conversation_history *conv)
+size_t conversation_estimate_tokens_raw(const struct conversation_history *conv)
 {
 	if (!conv)
 		return 0;
 
 	return (conv->total_characters / 4) + (conv->count * 4);
+}
+
+/*
+ * Calibration. The rough estimate is wrong in two ways the server can
+ * correct: by a constant (the tool schemas and chat template are part of
+ * every prompt but not of the history) and by a ratio (code and non-English
+ * text run well under four characters per token). Each response reports the
+ * true prompt size, so:
+ *
+ *     tokens ~= raw * g_scale + g_offset
+ *
+ * The first report fixes the offset. After that, how much the true count
+ * grew between two requests, against how much the raw estimate grew, gives
+ * the ratio. Until a server reports usage, scale 1 and offset 0 leave the
+ * rough estimate as it is.
+ */
+#define CALIBRATE_MIN_GROWTH 200 /* raw tokens between samples worth a ratio */
+
+static double g_scale = 1.0;
+static double g_offset = 0.0;
+static size_t g_last_raw = 0;
+static int g_last_actual = 0;
+
+void conversation_calibrate(size_t raw_estimate, int prompt_tokens)
+{
+	if (prompt_tokens <= 0 || raw_estimate == 0)
+		return;
+
+	if (g_last_actual > 0 && raw_estimate >= g_last_raw + CALIBRATE_MIN_GROWTH &&
+	    prompt_tokens > g_last_actual) {
+		double ratio = (double)(prompt_tokens - g_last_actual) /
+			       (double)(raw_estimate - g_last_raw);
+		ratio = ratio < 0.6 ? 0.6 : ratio > 2.5 ? 2.5 : ratio;
+		g_scale = 0.5 * g_scale + 0.5 * ratio; /* smooth out one odd turn */
+	}
+	if (g_last_actual == 0 || raw_estimate >= g_last_raw + CALIBRATE_MIN_GROWTH ||
+	    raw_estimate < g_last_raw) {
+		g_last_raw = raw_estimate;
+		g_last_actual = prompt_tokens;
+	}
+
+	g_offset = (double)prompt_tokens - (double)raw_estimate * g_scale;
+	if (g_offset < 0)
+		g_offset = 0;
+}
+
+void conversation_calibration_reset(void)
+{
+	g_scale = 1.0;
+	g_offset = 0.0;
+	g_last_raw = 0;
+	g_last_actual = 0;
+}
+
+size_t conversation_estimate_tokens(const struct conversation_history *conv)
+{
+	if (!conv)
+		return 0;
+	return (size_t)((double)conversation_estimate_tokens_raw(conv) * g_scale + g_offset);
 }
 
 /*

@@ -20,10 +20,10 @@
 #include <string.h>
 #include <errno.h>
 #include <limits.h>
-#include <unistd.h>
-#include <sys/stat.h>
-#include <sys/types.h>
+#include "platform.h"
+#ifndef _WIN32
 #include <libgen.h>
+#endif
 
 /* -------------------------------------------------------------------------
  * Internal helpers
@@ -148,14 +148,16 @@ static int safe_realpath(const char *path, char *out, int *exists_out)
 		memcpy(suffix + 1, component, comp_len);
 		suffix_len += 1 + comp_len;
 
-		*last_sep = '\0';
-
-		if (work[0] == '\0') {
-			resolved_prefix[0] = '/';
-			resolved_prefix[1] = '\0';
-			found = 1;
+		/* Nothing left but the root: "/", or "C:/" on Windows. */
+		size_t root_len = platform_path_root_length(work);
+		if ((size_t)(last_sep - work) < root_len) {
+			work[root_len] = '\0';
+			if (realpath(work, resolved_prefix) != NULL)
+				found = 1;
 			break;
 		}
+
+		*last_sep = '\0';
 
 		if (realpath(work, resolved_prefix) != NULL) {
 			found = 1;
@@ -175,6 +177,8 @@ static int safe_realpath(const char *path, char *out, int *exists_out)
 	}
 
 	size_t prefix_len = strlen(resolved_prefix);
+	if (prefix_len > 0 && resolved_prefix[prefix_len - 1] == '/')
+		prefix_len--; /* a root ends in '/', and the suffix starts with one */
 	size_t total = prefix_len + suffix_len + 1;
 	if (total > PATH_MAX) {
 		log_warning("sandbox: reconstructed path too long");
@@ -189,6 +193,68 @@ static int safe_realpath(const char *path, char *out, int *exists_out)
 		*exists_out = 0;
 	return 0;
 }
+
+#ifdef _WIN32
+/*
+ * Win32 rewrites some names before the filesystem sees them, so a path
+ * that looks harmless as a string can mean something else entirely. Refuse
+ * the ones that cannot be reasoned about (path already uses '/'):
+ *
+ *   C:file, file:stream   drive-relative paths and alternate data streams
+ *   //./x, //?/x          the device namespace
+ *   NUL, CON, COM1.txt    device names, which exist in every directory
+ *   "name." and "name "   trailing dots and spaces are stripped - so ".. "
+ *                         is "..", which the checks below would not notice
+ */
+static int windows_name_is_device(const char *name, size_t len)
+{
+	static const char *const devices[] = {"CON", "PRN", "AUX", "NUL", "CONIN$",
+					      "CONOUT$", "COM#", "LPT#"};
+	/* The device is chosen by the part before the first dot or colon,
+	 * ignoring trailing spaces: "nul.txt" and "NUL " are both NUL. */
+	size_t base = 0;
+	while (base < len && name[base] != '.' && name[base] != ':')
+		base++;
+	while (base > 0 && name[base - 1] == ' ')
+		base--;
+
+	for (size_t i = 0; i < sizeof(devices) / sizeof(devices[0]); i++) {
+		const char *d = devices[i];
+		if (strlen(d) != base)
+			continue;
+		size_t k = 0;
+		while (k < base && (d[k] == '#' ? (name[k] >= '0' && name[k] <= '9')
+						: (d[k] == (name[k] & ~0x20) || d[k] == name[k])))
+			k++;
+		if (k == base)
+			return 1;
+	}
+	return 0;
+}
+
+static int windows_path_is_unsafe(const char *path)
+{
+	size_t root_len = platform_path_root_length(path);
+	if (strncmp(path, "//./", 4) == 0 || strncmp(path, "//?/", 4) == 0)
+		return 1;
+	if (strchr(path + (root_len == 3 ? 2 : 0), ':'))
+		return 1;
+
+	for (const char *p = path + root_len; *p;) {
+		size_t len = strcspn(p, "/");
+		int dots_only = (len == 1 && p[0] == '.') ||
+				(len == 2 && p[0] == '.' && p[1] == '.');
+		if (len > 0 && !dots_only &&
+		    (p[len - 1] == '.' || p[len - 1] == ' ' ||
+		     windows_name_is_device(p, len)))
+			return 1;
+		p += len;
+		while (*p == '/')
+			p++;
+	}
+	return 0;
+}
+#endif
 
 /* -------------------------------------------------------------------------
  * Public API
@@ -214,6 +280,18 @@ int sandbox_resolve(const char *root, const char *path,
 		log_warning("sandbox_resolve: path too long");
 		return -1;
 	}
+
+#ifdef _WIN32
+	/* Work on a copy with one kind of separator. */
+	char normalized[PATH_MAX];
+	strcpy(normalized, path);
+	platform_path_normalize(normalized);
+	path = normalized;
+	if (windows_path_is_unsafe(path)) {
+		log_warning("sandbox_resolve: refusing special Windows path '%s'", path);
+		return -1;
+	}
+#endif
 
 	/* Sandboxing disabled */
 	if (!root || root[0] == '\0') {
@@ -262,7 +340,7 @@ int sandbox_resolve(const char *root, const char *path,
 	char candidate[PATH_MAX];
 	int path_was_relative = 0;
 
-	if (path[0] == '/') {
+	if (platform_path_root_length(path) > 0) {
 		/*
 		 * Absolute path: use as-is.
 		 * The prefix check below will catch any escape.
@@ -307,8 +385,13 @@ int sandbox_resolve(const char *root, const char *path,
 	memcpy(required_prefix, abs_root, root_len);
 	required_prefix[root_len] = '/';
 	required_prefix[root_len + 1] = '\0';
+	/* A filesystem root ("/", "C:/") already ends in its separator; adding
+	 * another would make a prefix ("//") that no path has. */
+	if (root_len > 0 && abs_root[root_len - 1] == '/')
+		required_prefix[root_len] = '\0';
+	size_t prefix_len = strlen(required_prefix);
 
-	if (strlen(abs_candidate) < root_len + 1 || strncmp(abs_candidate, required_prefix, root_len + 1) != 0) {
+	if (strlen(abs_candidate) < prefix_len || strncmp(abs_candidate, required_prefix, prefix_len) != 0) {
 		/*
 		 * Special case: if the path was relative (e.g. ".") and resolved
 		 * to the sandbox root itself, allow it. This is safe because a

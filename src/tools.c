@@ -20,6 +20,7 @@
 #include "logger.h"
 #include "json.h"
 #include "terminal.h"
+#include "platform.h"
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -124,6 +125,7 @@ int tools_sandbox_resolve_entry(const struct agent_configuration *cfg,
 		return -1;
 	}
 	snprintf(buf, sizeof(buf), "%s", path);
+	platform_path_normalize(buf);
 	size_t len = strlen(buf);
 	while (len > 1 && buf[len - 1] == '/')
 		buf[--len] = '\0';

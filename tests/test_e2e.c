@@ -25,8 +25,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <unistd.h>
+#include "support.h"
 
 #define PASS() printf("    PASS\n")
 #define FAIL(msg)                              \
@@ -482,7 +481,7 @@ static void test_sandbox_escape(void)
 
 	/* Create a temp sandbox directory */
 	char sandbox[256];
-	snprintf(sandbox, sizeof(sandbox), "/tmp/boris_test_sandbox_%d", getpid());
+	snprintf(sandbox, sizeof(sandbox), "%s/boris_test_sandbox_%d", test_tmp_dir(), getpid());
 	mkdir(sandbox, 0755);
 
 	/* Create a file inside sandbox */
@@ -495,7 +494,7 @@ static void test_sandbox_escape(void)
 	}
 
 	/* Create a file outside sandbox */
-	FILE *f2 = fopen("/tmp/boris_outside.txt", "w");
+	FILE *f2 = fopen(test_tmp_path("boris_outside.txt"), "w");
 	if (f2) {
 		fprintf(f2, "outside content\n");
 		fclose(f2);
@@ -516,14 +515,14 @@ static void test_sandbox_escape(void)
 	/* Test: read file outside sandbox via path traversal - should fail */
 	char args_escape[512];
 	snprintf(args_escape, sizeof(args_escape),
-		 "{\"path\":\"../../tmp/boris_outside.txt\"}");
+		 "{\"path\":\"../boris_outside.txt\"}");
 	struct tool_result r2 = tool_read_fn(args_escape, &cfg, NULL);
 	ASSERT(r2.is_error == true, "path traversal should be blocked");
 	tool_result_free(&r2);
 
 	/* Cleanup */
 	unlink(safe_file);
-	unlink("/tmp/boris_outside.txt");
+	unlink(test_tmp_path("boris_outside.txt"));
 	rmdir(sandbox);
 
 	configuration_destroy(&cfg);
@@ -568,7 +567,7 @@ static void test_conversation_save_load(void)
 	printf("  Test: Conversation save and load\n");
 
 	char path[256];
-	snprintf(path, sizeof(path), "/tmp/boris_test_session_%d.json", getpid());
+	snprintf(path, sizeof(path), "%s/boris_test_session_%d.json", test_tmp_dir(), getpid());
 
 	/* Create a conversation with various message types */
 	struct conversation_history *conv = conversation_create();
@@ -618,7 +617,7 @@ static void test_load_nonexistent(void)
 	printf("  Test: Load non-existent file returns NULL\n");
 
 	struct conversation_history *loaded = conversation_load(
-		"/tmp/boris_nonexistent_session_99999.json");
+		test_tmp_path("boris_nonexistent_session_99999.json"));
 	ASSERT(loaded == NULL, "loading non-existent file should return NULL");
 }
 
@@ -1271,7 +1270,7 @@ static void test_repeat_detection_duplicate_calls(void)
 
 	struct agent_configuration cfg = make_test_config();
 	char sandbox[64];
-	snprintf(sandbox, sizeof(sandbox), "/tmp/boris_e2e_repeat_%d", (int)getpid());
+	snprintf(sandbox, sizeof(sandbox), "%s/boris_e2e_repeat_%d", test_tmp_dir(), (int)getpid());
 	mkdir(sandbox, 0755);
 	cfg.sandbox_root = strdup(sandbox);
 	cfg.tools_enabled = TOOL_LIST_DIR;
@@ -1380,7 +1379,7 @@ static void test_exec_refuses_confirmation(void)
 	struct agent_configuration cfg = make_test_config();
 	cfg.tools_enabled = TOOL_WRITE;
 	cfg.confirm_writes = true;
-	cfg.sandbox_root = strdup("/tmp");
+	cfg.sandbox_root = strdup(test_tmp_dir());
 	tools_register_builtins();
 	struct conversation_history *conv = task_conversation("Write x.txt");
 
@@ -1486,7 +1485,7 @@ static void test_stall_is_reminded(void)
 	/* Alternate two lookups: never the same as the previous turn (so no
 	 * repeat reminder), but nothing new after the first two turns. */
 	char sandbox[64];
-	snprintf(sandbox, sizeof(sandbox), "/tmp/boris_e2e_stall_%d", (int)getpid());
+	snprintf(sandbox, sizeof(sandbox), "%s/boris_e2e_stall_%d", test_tmp_dir(), (int)getpid());
 	mkdir(sandbox, 0755);
 	for (int i = 0; i < 6; i++) {
 		char id[32];
@@ -1661,7 +1660,7 @@ static void test_exec_session_round_trip(void)
 {
 	printf("  Test: exec --session restores a conversation and replaces its system prompt\n");
 	char path[128];
-	snprintf(path, sizeof(path), "/tmp/boris_session_test_%d.json", (int)getpid());
+	snprintf(path, sizeof(path), "%s/boris_session_test_%d.json", test_tmp_dir(), (int)getpid());
 	unlink(path);
 	FILE *err = tmpfile();
 
@@ -1696,7 +1695,7 @@ static void test_trace_file(void)
 {
 	printf("  Test: --trace records request and response, never the API key\n");
 	char path[128];
-	snprintf(path, sizeof(path), "/tmp/boris_trace_test_%d.jsonl", (int)getpid());
+	snprintf(path, sizeof(path), "%s/boris_trace_test_%d.jsonl", test_tmp_dir(), (int)getpid());
 	unlink(path);
 
 	mock_http_reset();
@@ -1731,7 +1730,11 @@ static void test_trace_file(void)
 		*nl = '\n';
 	ASSERT(text && strstr(text, "sk-test-secret-key") == NULL, "API key never written");
 	struct stat st;
+#ifdef _WIN32
+	ASSERT(stat(path, &st) == 0, "trace file exists"); /* private by its directory's ACL */
+#else
 	ASSERT(stat(path, &st) == 0 && (st.st_mode & 0777) == 0600, "trace file is mode 0600");
+#endif
 
 	cJSON_Delete(req);
 	cJSON_Delete(resp);

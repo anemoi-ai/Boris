@@ -12,13 +12,11 @@
 #include "cJSON.h"
 #include "logger.h"
 #include <errno.h>
-#include <fcntl.h>
+#include "platform.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/time.h>
 #include <time.h>
-#include <unistd.h>
 
 static FILE *g_trace = NULL;
 static int g_seq = 0;
@@ -63,14 +61,24 @@ static cJSON *trace_line(int seq, const char *kind)
 	if (!line)
 		return NULL;
 
+	time_t secs;
+	long millis;
+#ifdef _WIN32
+	struct timespec now;
+	timespec_get(&now, TIME_UTC);
+	secs = now.tv_sec;
+	millis = now.tv_nsec / 1000000;
+#else
 	struct timeval tv;
 	gettimeofday(&tv, NULL);
+	secs = tv.tv_sec;
+	millis = (long)(tv.tv_usec / 1000);
+#endif
 	struct tm tm;
 	char ts[40] = "";
-	time_t secs = tv.tv_sec;
 	if (gmtime_r(&secs, &tm)) {
 		size_t n = strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S", &tm);
-		snprintf(ts + n, sizeof(ts) - n, ".%03ldZ", (long)(tv.tv_usec / 1000));
+		snprintf(ts + n, sizeof(ts) - n, ".%03ldZ", millis);
 	}
 	cJSON_AddStringToObject(line, "ts", ts);
 	cJSON_AddNumberToObject(line, "seq", seq);

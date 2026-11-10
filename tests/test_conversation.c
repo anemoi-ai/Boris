@@ -14,7 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
+#include "support.h"
 
 static int tests_passed = 0;
 static int tests_failed = 0;
@@ -384,7 +384,7 @@ static void test_conversation_load_saved_at(void)
 
 	char path[256];
 	snprintf(path, sizeof(path),
-		 "/tmp/boris_test_saved_at_%d.json", (int)getpid());
+		 "%s/boris_test_saved_at_%d.json", test_tmp_dir(), (int)getpid());
 
 	struct conversation_history *conv = conversation_create();
 	conversation_add_system(conv, "System");
@@ -403,7 +403,7 @@ static void test_conversation_load_saved_at(void)
 
 	/* Non-existent file returns NULL */
 	char *missing = conversation_load_saved_at(
-		"/tmp/boris_no_such_session_99999.json");
+		test_tmp_path("boris_no_such_session_99999.json"));
 	ASSERT(missing == NULL);
 
 	conversation_destroy(conv);

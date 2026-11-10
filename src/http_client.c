@@ -10,13 +10,20 @@
 #include "http_client.h"
 #include "logger.h"
 #include <curl/curl.h>
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#endif
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
+#include "platform.h"
+#ifndef _WIN32
 #include <sys/socket.h>
+#endif
 
 /* -------------------------------------------------------------------------
  * The buffer we use to collect response data.

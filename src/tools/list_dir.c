@@ -18,10 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
-#include <dirent.h>
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <sys/types.h>
+#include "platform.h"
 #include <time.h>
 
 #define LIST_DIR_MAX_ENTRIES 1000
@@ -98,8 +95,15 @@ static int list_one_dir(const char *dir_path, int show_hidden,
 
 		struct stat st;
 
+#ifdef _WIN32
+		char child[PATH_MAX];
+		int w = snprintf(child, sizeof(child), "%s/%s", dir_path, entry->d_name);
+		if (w < 0 || (size_t)w >= sizeof(child) || lstat(child, &st) != 0)
+			continue;
+#else
 		if (fstatat(dirfd(dir), entry->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0)
 			continue;
+#endif
 
 		char size_buf[32], time_buf[32];
 		format_size((size_t)st.st_size, size_buf, sizeof(size_buf));

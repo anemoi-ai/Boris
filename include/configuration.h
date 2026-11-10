@@ -66,4 +66,10 @@ void configuration_destroy(struct agent_configuration *config);
  */
 unsigned int configuration_parse_tools_mask(const char *value);
 
+/*
+ * Warn (through the logger) about settings that are valid one by one but
+ * do not make sense together, such as max_tokens >= context_window.
+ */
+void configuration_check(const struct agent_configuration *config);
+
 #endif /* CONFIGURATION_H */

@@ -20,11 +20,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
-#include <fcntl.h>
+#include "platform.h"
 #include <time.h>
-#include <sys/stat.h>
+#ifndef _WIN32
 #include <sys/file.h>
-#include <unistd.h>
+#endif
 
 #define MEMORY_LIST_DEFAULT 50
 #define MEMORY_LIST_MAX	    500

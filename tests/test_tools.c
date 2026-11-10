@@ -15,9 +15,15 @@
 #include "fs.h"
 #include "json.h"
 #include "http_client.h"
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN /* keeps <windows.h> from defining "small" */
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#endif
 #include "arena.h"
 #include "configuration.h"
 #include "boris_types.h"
@@ -25,8 +31,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <unistd.h>
+#include "support.h"
 #include <limits.h>
 #include <time.h>
 
@@ -53,13 +58,13 @@ static char g_saved_home[1024];
 static void setup(void)
 {
 	snprintf(g_sandbox, sizeof(g_sandbox),
-		 "/tmp/boris_tools_test_%d", (int)getpid());
+		 "%s/boris_tools_test_%d", test_tmp_dir(), (int)getpid());
 	mkdir(g_sandbox, 0755);
 
 	/* The memory tool stores under $HOME/.boris: use a throwaway HOME */
 	const char *home = getenv("HOME");
 	snprintf(g_saved_home, sizeof(g_saved_home), "%s", home ? home : "");
-	snprintf(g_home, sizeof(g_home), "/tmp/boris_tools_home_%d", (int)getpid());
+	snprintf(g_home, sizeof(g_home), "%s/boris_tools_home_%d", test_tmp_dir(), (int)getpid());
 	mkdir(g_home, 0755);
 	setenv("HOME", g_home, 1);
 
@@ -68,9 +73,8 @@ static void setup(void)
 
 static void teardown(void)
 {
-	char cmd[PATH_MAX * 2 + 16];
-	snprintf(cmd, sizeof(cmd), "rm -rf %s %s", g_sandbox, g_home);
-	system(cmd);
+	test_remove_tree(g_sandbox);
+	test_remove_tree(g_home);
 	if (g_saved_home[0])
 		setenv("HOME", g_saved_home, 1);
 	arena_destroy(g_scratch);
@@ -396,7 +400,7 @@ static void test_write_traversal_blocked(void)
 
 	struct agent_configuration cfg = make_cfg();
 	struct tool_result r = tool_write_fn(
-		"{\"path\":\"../../tmp/evil.txt\",\"content\":\"evil\"}",
+		"{\"path\":\"../evil.txt\",\"content\":\"evil\"}",
 		&cfg, g_scratch);
 
 	ASSERT(r.is_error == true);
@@ -449,7 +453,7 @@ static void test_write_create_dirs_escape_blocked(void)
 	snprintf(json, sizeof(json),
 		 "{\"path\":\"x/../../boris_escape_%d.txt\",\"content\":\"evil\","
 		 "\"create_dirs\":true}", (int)getpid());
-	snprintf(outside, sizeof(outside), "/tmp/boris_escape_%d.txt", (int)getpid());
+	snprintf(outside, sizeof(outside), "%s/boris_escape_%d.txt", test_tmp_dir(), (int)getpid());
 	snprintf(created, sizeof(created), "%s/x", g_sandbox);
 
 	struct tool_result r = tool_write_fn(json, &cfg, g_scratch);
@@ -1013,7 +1017,11 @@ static void test_write_preserves_mode_and_validates(void)
 		&cfg, g_scratch);
 	struct stat st;
 	ASSERT(r.is_error == false);
+#ifdef _WIN32
+	ASSERT(stat(path, &st) == 0); /* no permission bits to preserve */
+#else
 	ASSERT(stat(path, &st) == 0 && (st.st_mode & 0777) == 0755);
+#endif
 	tool_result_free(&r);
 
 	r = tool_write_fn("{\"path\":\"x.txt\",\"content\":\"x\",\"mode\":\"bogus\"}",
@@ -1025,6 +1033,10 @@ static void test_write_preserves_mode_and_validates(void)
 	configuration_destroy(&cfg);
 }
 
+/*
+ * The run tests need scripts, and each system has its own native kind:
+ * sh on POSIX; batch files, PowerShell and Python on Windows.
+ */
 static void write_script(const char *name, const char *body)
 {
 	char path[512];
@@ -1040,11 +1052,17 @@ static void test_run_script_ignores_stdin(void)
 {
 	printf("  Test: run - script that exits without reading stdin\n");
 
-	write_script("nostdin.sh", "#!/bin/sh\nexit 0\n");
+#ifdef _WIN32
+	const char *script = "nostdin.bat";
+	write_script(script, "@exit /b 0\r\n");
+#else
+	const char *script = "nostdin.sh";
+	write_script(script, "#!/bin/sh\nexit 0\n");
+#endif
 	struct agent_configuration cfg = make_cfg();
 
 	char json[9000];
-	int p = snprintf(json, sizeof(json), "{\"path\":\"nostdin.sh\",\"stdin\":\"");
+	int p = snprintf(json, sizeof(json), "{\"path\":\"%s\",\"stdin\":\"", script);
 	memset(json + p, 'x', 8000);
 	snprintf(json + p + 8000, sizeof(json) - (size_t)p - 8000, "\"}");
 
@@ -1063,10 +1081,16 @@ static void test_run_environment_allowlist(void)
 	setenv("BORIS_EXTRA", "also-secret", 1);
 	setenv("RUN_ENV_TEST_VAR", "passed-through", 1);
 	setenv("RUN_ENV_HIDDEN_VAR", "not-listed", 1);
+#ifdef _WIN32
+	const char *env_json = "{\"path\":\"env.bat\"}";
+	write_script("env.bat", "@set\r\n");
+#else
+	const char *env_json = "{\"path\":\"env.sh\"}";
 	write_script("env.sh", "#!/bin/sh\nenv\n");
+#endif
 
 	struct agent_configuration cfg = make_cfg();
-	struct tool_result r = tool_run_fn("{\"path\":\"env.sh\"}", &cfg, g_scratch);
+	struct tool_result r = tool_run_fn(env_json, &cfg, g_scratch);
 	ASSERT(r.content && strstr(r.content, "Exit code: 0"));
 	ASSERT(r.content && !strstr(r.content, "sk-secret-test-key"));
 	ASSERT(r.content && !strstr(r.content, "RUN_ENV_TEST_VAR"));
@@ -1076,11 +1100,22 @@ static void test_run_environment_allowlist(void)
 
 	/* tools.run_env adds names, but never BORIS_* ones */
 	cfg.run_env = strdup("RUN_ENV_TEST_VAR, BORIS_EXTRA");
-	r = tool_run_fn("{\"path\":\"env.sh\"}", &cfg, g_scratch);
+	r = tool_run_fn(env_json, &cfg, g_scratch);
 	ASSERT(r.content && strstr(r.content, "RUN_ENV_TEST_VAR=passed-through"));
 	ASSERT(r.content && !strstr(r.content, "also-secret"));
 	ASSERT(r.content && !strstr(r.content, "RUN_ENV_HIDDEN_VAR"));
 	tool_result_free(&r);
+
+#ifdef _WIN32
+	/* Windows ignores case in variable names; so must the BORIS_ rule */
+	free(cfg.run_env);
+	cfg.run_env = strdup("boris_extra, Boris_Api_Key, run_env_test_var");
+	r = tool_run_fn(env_json, &cfg, g_scratch);
+	ASSERT(r.content && strstr(r.content, "passed-through"));
+	ASSERT(r.content && !strstr(r.content, "also-secret"));
+	ASSERT(r.content && !strstr(r.content, "sk-secret-test-key"));
+	tool_result_free(&r);
+#endif
 	configuration_destroy(&cfg);
 
 	unsetenv("BORIS_API_KEY");
@@ -1093,13 +1128,28 @@ static void test_run_timeout_after_stdout_closed(void)
 {
 	printf("  Test: run - timeout applies after the script closes stdout\n");
 
+#ifdef _WIN32
+	const char *json = "{\"path\":\"detach.py\",\"timeout_seconds\":1}";
+	write_script("detach.py",
+		     "import os, subprocess, sys, time\n"
+		     "for fd in (1, 2):\n"
+		     "    try:\n"
+		     "        os.close(fd)\n"
+		     "    except OSError:\n"
+		     "        pass\n"
+		     "quiet = subprocess.DEVNULL\n"
+		     "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'],\n"
+		     "                 stdin=quiet, stdout=quiet, stderr=quiet)\n"
+		     "time.sleep(30)\n");
+#else
+	const char *json = "{\"path\":\"detach.sh\",\"timeout_seconds\":1}";
 	write_script("detach.sh",
 		     "#!/bin/sh\nexec >/dev/null 2>&1\nsleep 30 &\nsleep 30\n");
+#endif
 	struct agent_configuration cfg = make_cfg();
 
 	time_t start = time(NULL);
-	struct tool_result r = tool_run_fn(
-		"{\"path\":\"detach.sh\",\"timeout_seconds\":1}", &cfg, g_scratch);
+	struct tool_result r = tool_run_fn(json, &cfg, g_scratch);
 	ASSERT(time(NULL) - start < 5);
 	ASSERT(r.content && strstr(r.content, "Timed out"));
 	tool_result_free(&r);
@@ -1409,7 +1459,11 @@ static void test_edit_crlf_hint_and_mode(void)
 	ASSERT(!r.is_error);
 	tool_result_free(&r);
 	struct stat st;
+#ifdef _WIN32
+	ASSERT(stat(path, &st) == 0); /* no permission bits to keep */
+#else
 	ASSERT(stat(path, &st) == 0 && (st.st_mode & 0777) == 0600);
+#endif
 	configuration_destroy(&cfg);
 }
 
@@ -1444,7 +1498,7 @@ static void make_search_tree(void)
 		fclose(f);
 	}
 	snprintf(path, sizeof(path), "%s/srch/link", g_sandbox);
-	symlink(outside, path);
+	test_link(outside, path);
 }
 
 static void test_search_contents(void)
@@ -1574,11 +1628,14 @@ static void test_move(void)
 	/* A symlink is moved itself; its target stays where it is */
 	char link_path[PATH_MAX];
 	snprintf(link_path, sizeof(link_path), "%s/mv/link", g_sandbox);
-	symlink("dir/keep.txt", link_path);
-	r = tool_move_fn("{\"from\":\"mv/link\",\"to\":\"mv/link2\"}", &cfg, g_scratch);
-	ASSERT(!r.is_error && exists_in_sandbox("mv/link2") &&
-	       exists_in_sandbox("mv/dir/keep.txt"));
-	tool_result_free(&r);
+	if (test_file_links_work()) {
+		test_link("dir/keep.txt", link_path);
+		r = tool_move_fn("{\"from\":\"mv/link\",\"to\":\"mv/link2\"}", &cfg,
+				 g_scratch);
+		ASSERT(!r.is_error && exists_in_sandbox("mv/link2") &&
+		       exists_in_sandbox("mv/dir/keep.txt"));
+		tool_result_free(&r);
+	}
 
 	r = tool_move_fn("{\"from\":\"mv/dir/keep.txt\",\"to\":\"../escaped.txt\"}", &cfg,
 			 g_scratch);
@@ -1617,9 +1674,9 @@ static void test_delete(void)
 		fclose(f);
 	}
 	snprintf(path, sizeof(path), "%s/del/tree/escape", g_sandbox);
-	symlink(outside, path);
+	ASSERT(test_link(outside, path) == 0);
 	snprintf(path, sizeof(path), "%s/del/dirlink", g_sandbox);
-	symlink(outside, path);
+	ASSERT(test_link(outside, path) == 0);
 
 	struct agent_configuration cfg = make_cfg();
 	struct stat st;
@@ -1862,20 +1919,256 @@ static void test_mask_to_string_single(void)
  * Run tool
  * ---------------------------------------------------------------------- */
 
+#ifdef _WIN32
+/* -------------------------------------------------------------------------
+ * Run tool: what is specific to Windows
+ * ---------------------------------------------------------------------- */
+
+/* Run sandbox-relative script with args (NULL terminated) and stdin. */
+static struct tool_result run_script(const char *script, const char *const *args,
+				     const char *stdin_text)
+{
+	cJSON *root = cJSON_CreateObject();
+	cJSON_AddStringToObject(root, "path", script);
+	cJSON *list = cJSON_AddArrayToObject(root, "args");
+	for (; args && *args; args++)
+		cJSON_AddItemToArray(list, cJSON_CreateString(*args));
+	if (stdin_text)
+		cJSON_AddStringToObject(root, "stdin", stdin_text);
+	char *json = cJSON_PrintUnformatted(root);
+
+	struct agent_configuration cfg = make_cfg();
+	struct tool_result r = tool_run_fn(json, &cfg, g_scratch);
+	configuration_destroy(&cfg);
+	cJSON_free(json);
+	cJSON_Delete(root);
+	return r;
+}
+
+static void test_run_windows_interpreters(void)
+{
+	printf("  Test: run - Windows: .bat, .ps1, shebang by name, unknown type\n");
+
+	/* Batch file: arguments, exit code, and the script's directory as cwd */
+	put_file("winrun/marker.txt", "found the marker\r\n");
+	put_file("winrun/args.bat", "@echo [%~1] [%~2]\r\n@type marker.txt\r\n@exit /b 3\r\n");
+	const char *two[] = {"one two", "three", NULL};
+	struct tool_result r = run_script("winrun/args.bat", two, NULL);
+	ASSERT(contains(&r, "Exit code: 3"));
+	ASSERT(contains(&r, "[one two] [three]"));
+	ASSERT(contains(&r, "found the marker"));
+	tool_result_free(&r);
+
+	/* The same script named the native way */
+	r = run_script("winrun\\args.bat", two, NULL);
+	ASSERT(contains(&r, "[one two] [three]"));
+	tool_result_free(&r);
+
+	/* cmd.exe would run what follows an ampersand, and expand %NAME%;
+	 * arguments it could misread are refused before anything starts */
+	static const char *const dangerous[] = {
+		"x & echo INJECTED", "x\" & echo INJECTED & \"", "%BORIS_API_KEY%",
+		"a|b",		     "a>b",			 "line\nbreak",
+		"caret^",	     "bang!",
+	};
+	for (size_t i = 0; i < sizeof(dangerous) / sizeof(dangerous[0]); i++) {
+		const char *args[] = {dangerous[i], NULL};
+		r = run_script("winrun/args.bat", args, NULL);
+		ASSERT(r.is_error && contains(&r, "Batch files cannot"));
+		ASSERT(!contains(&r, "INJECTED"));
+		tool_result_free(&r);
+	}
+
+	/* PowerShell: arguments arrive as plain strings, whatever they contain */
+	put_file("winrun/args.ps1", "param($a, $b)\r\nWrite-Output \"ps:$a|$b\"\r\nexit 4\r\n");
+	const char *ps_args[] = {"x y; Write-Output INJECTED", "$(1+1) & z", NULL};
+	r = run_script("winrun/args.ps1", ps_args, NULL);
+	ASSERT(contains(&r, "Exit code: 4"));
+	ASSERT(contains(&r, "ps:x y; Write-Output INJECTED|$(1+1) & z"));
+	tool_result_free(&r);
+
+	/* A shebang names the interpreter; its Unix path is not taken literally */
+	put_file("winrun/tool", "#!/usr/bin/env python3\nprint('shebang ' + 'ok')\n");
+	r = run_script("winrun/tool", NULL, NULL);
+	ASSERT(contains(&r, "Exit code: 0") && contains(&r, "shebang ok"));
+	tool_result_free(&r);
+
+	/* Neither a shebang nor a known extension */
+	put_file("winrun/data.xyz", "just data\n");
+	r = run_script("winrun/data.xyz", NULL, NULL);
+	ASSERT(r.is_error && contains(&r, "Cannot determine interpreter"));
+	tool_result_free(&r);
+}
+
+static void test_run_windows_arguments_and_stdin(void)
+{
+	printf("  Test: run - Windows: argument quoting round trip, stdin, UTF-8\n");
+
+	/* Every argument must reach the script byte for byte. The script
+	 * prints each one in hex so nothing can be lost in the comparison. */
+	put_file("winrun/argv.py", "import sys\n"
+				   "for a in sys.argv[1:]:\n"
+				   "    print('<' + a.encode('utf-8').hex() + '>')\n");
+	static const char *const args[] = {
+		"plain",
+		"two words",
+		"say \"hi\"",
+		"C:\\dir\\",
+		"C:\\dir with space\\",
+		"back\\\"quote",
+		"\\\\server\\share",
+		"",
+		"100% & more | <x> ^ !",
+		"tab\there",
+		"caf\xc3\xa9 \xe2\x9c\x93 \xf0\x9f\x99\x82",
+		NULL,
+	};
+	struct tool_result r = run_script("winrun/argv.py", args, NULL);
+	ASSERT(contains(&r, "Exit code: 0"));
+	for (size_t i = 0; args[i]; i++) {
+		char expected[256] = "<";
+		size_t n = 1;
+		for (const unsigned char *p = (const unsigned char *)args[i]; *p; p++)
+			n += (size_t)snprintf(expected + n, sizeof(expected) - n, "%02x", *p);
+		snprintf(expected + n, sizeof(expected) - n, ">");
+		if (!contains(&r, expected))
+			printf("    argument %zu did not survive: %s\n", i, args[i]);
+		ASSERT(contains(&r, expected));
+	}
+	tool_result_free(&r);
+
+	/* stdin reaches the script, and its UTF-8 output comes back intact */
+	put_file("winrun/upper.py", "import sys\nsys.stdout.write(sys.stdin.read().upper())\n");
+	r = run_script("winrun/upper.py", NULL, "h\xc3\xa9llo w\xc3\xb6rld");
+	ASSERT(contains(&r, "H\xc3\x89LLO W\xc3\x96RLD"));
+	tool_result_free(&r);
+
+	/* A script's own children die with it at the timeout */
+	put_file("winrun/spawn.py",
+		 "import subprocess, sys, time\n"
+		 "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+		 "print('child', child.pid, flush=True)\n"
+		 "time.sleep(60)\n");
+	struct agent_configuration cfg = make_cfg();
+	r = tool_run_fn("{\"path\":\"winrun/spawn.py\",\"timeout_seconds\":2}", &cfg, g_scratch);
+	configuration_destroy(&cfg);
+	ASSERT(contains(&r, "Timed out"));
+	const char *pid_text = r.content ? strstr(r.content, "child ") : NULL;
+	ASSERT(pid_text != NULL);
+	if (pid_text) {
+		char cmd[128];
+		snprintf(cmd, sizeof(cmd), "tasklist /FI \"PID eq %d\" 2>NUL | findstr /C:\"%d\" >NUL",
+			 atoi(pid_text + 6), atoi(pid_text + 6));
+		ASSERT(system(cmd) != 0); /* findstr finds nothing: the child is gone */
+	}
+	tool_result_free(&r);
+}
+#endif /* _WIN32 */
+
+/*
+ * The point of confinement: the same script, run twice. Confined, it can
+ * work inside the sandbox but leaves the world outside alone.
+ */
+static void test_run_confinement(void)
+{
+	printf("  Test: run - a confined script cannot write (or, on Linux, read) outside\n");
+
+	bool reads = false;
+	if (!tool_run_confinement_available(&reads)) {
+		printf("  (skipped: this system cannot confine scripts)\n");
+		return;
+	}
+
+	char outside[PATH_MAX], secret[PATH_MAX], inside[PATH_MAX];
+	snprintf(outside, sizeof(outside), "%s/escaped.txt", g_home);
+	snprintf(secret, sizeof(secret), "%s/secret.txt", g_home);
+	snprintf(inside, sizeof(inside), "%s/conf/made.txt", g_sandbox);
+	FILE *f = fopen(secret, "w");
+	if (f) {
+		fputs("TOP-SECRET-VALUE", f);
+		fclose(f);
+	}
+
+	/* Writes argv[1] (outside) and made.txt (inside); prints argv[2]'s contents */
+	put_file("conf/probe.py",
+		 "import sys, tempfile\n"
+		 "for target in (sys.argv[1], 'made.txt'):\n"
+		 "    try:\n"
+		 "        open(target, 'w').write('x')\n"
+		 "        print('wrote', target)\n"
+		 "    except OSError as e:\n"
+		 "        print('write refused:', type(e).__name__)\n"
+		 "try:\n"
+		 "    print('read:', open(sys.argv[2]).read())\n"
+		 "except OSError as e:\n"
+		 "    print('read refused:', type(e).__name__)\n"
+		 "with tempfile.NamedTemporaryFile() as t:\n"
+		 "    t.write(b'scratch')\n"
+		 "    print('temp ok')\n");
+
+	cJSON *root = cJSON_CreateObject();
+	cJSON_AddStringToObject(root, "path", "conf/probe.py");
+	cJSON *list = cJSON_AddArrayToObject(root, "args");
+	cJSON_AddItemToArray(list, cJSON_CreateString(outside));
+	cJSON_AddItemToArray(list, cJSON_CreateString(secret));
+	char *json = cJSON_PrintUnformatted(root);
+	cJSON_Delete(root);
+
+	struct agent_configuration cfg = make_cfg();
+	struct stat st;
+
+	ASSERT(cfg.run_confine == true); /* the default */
+	struct tool_result r = tool_run_fn(json, &cfg, g_scratch);
+	if (!contains(&r, "Exit code: 0"))
+		printf("    %s\n", r.content ? r.content : "(no output)");
+	ASSERT(contains(&r, "Exit code: 0"));
+	ASSERT(contains(&r, "write refused"));
+	ASSERT(stat(outside, &st) != 0);	/* nothing appeared outside */
+	ASSERT(stat(inside, &st) == 0);		/* the sandbox still works */
+	ASSERT(contains(&r, "temp ok"));	/* and so do temporary files */
+	if (reads) {
+		ASSERT(contains(&r, "read refused"));
+		ASSERT(!contains(&r, "TOP-SECRET-VALUE"));
+	}
+	tool_result_free(&r);
+
+	/* Switched off, the same script does what scripts can do */
+	cfg.run_confine = false;
+	r = tool_run_fn(json, &cfg, g_scratch);
+	ASSERT(stat(outside, &st) == 0);
+	ASSERT(contains(&r, "TOP-SECRET-VALUE"));
+	tool_result_free(&r);
+
+	cJSON_free(json);
+	unlink(outside);
+	unlink(secret);
+	configuration_destroy(&cfg);
+}
+
 static void test_run_output_truncation(void)
 {
 	printf("  Test: run - output truncated at 65536 bytes\n");
 
 	char script_path[512];
+#ifdef _WIN32
+	const char *json = "{\"path\":\"big_output.ps1\"}";
+	snprintf(script_path, sizeof(script_path), "%s/big_output.ps1", g_sandbox);
+#else
+	const char *json = "{\"path\":\"big_output.sh\"}";
 	snprintf(script_path, sizeof(script_path), "%s/big_output.sh", g_sandbox);
+#endif
 	FILE *f = fopen(script_path, "w");
 	ASSERT(f != NULL);
 	if (!f)
 		return;
-	/* awk outputs 70000 'A' chars - exceeds the 65536-byte cap */
+	/* 70000 'A' chars - exceeds the 65536-byte cap */
+#ifdef _WIN32
+	fputs("[Console]::Out.Write('A' * 70000)\r\n", f);
+#else
 	fputs("#!/bin/sh\n"
 	      "awk 'BEGIN{for(i=0;i<70000;i++) printf \"A\"; print \"\"}'\n",
 	      f);
+#endif
 	fclose(f);
 	chmod(script_path, 0755);
 
@@ -1883,8 +2176,7 @@ static void test_run_output_truncation(void)
 	cfg.run_timeout_seconds = 10;
 	cfg.tools_enabled = TOOL_RUN;
 
-	struct tool_result r = tool_run_fn(
-		"{\"path\":\"big_output.sh\"}", &cfg, g_scratch);
+	struct tool_result r = tool_run_fn(json, &cfg, g_scratch);
 
 	ASSERT(r.is_error == false);
 	ASSERT(r.content != NULL);
@@ -1953,6 +2245,11 @@ int main(void)
 	test_run_environment_allowlist();
 	test_run_timeout_after_stdout_closed();
 	test_run_timeout_keeps_python_output();
+	test_run_confinement();
+#ifdef _WIN32
+	test_run_windows_interpreters();
+	test_run_windows_arguments_and_stdin();
+#endif
 
 	printf("\n--- Run ---\n");
 	test_run_output_truncation();

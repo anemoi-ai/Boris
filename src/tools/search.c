@@ -19,16 +19,18 @@
 #include "json.h"
 #include "logger.h"
 #include <ctype.h>
-#include <dirent.h>
+#include "platform.h"
 #include <errno.h>
+#ifndef _WIN32
 #include <fnmatch.h>
+#endif
 #include <limits.h>
+#ifndef _WIN32
 #include <regex.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
-#include <sys/stat.h>
 
 #define SEARCH_DEFAULT_RESULTS 100
 #define SEARCH_MAX_RESULTS     500
@@ -224,7 +226,7 @@ static bool limit_reached(struct search_state *s)
 	return s->stopped;
 }
 
-static void search_file(struct search_state *s, const char *abs, off_t size)
+static void search_file(struct search_state *s, const char *abs, long long size)
 {
 	const char *rel = relative_path(s, abs);
 	s->files_examined++;
@@ -347,6 +349,20 @@ static void append_summary(struct search_state *s)
 		out_str(&s->out, line);
 	}
 	out_str(&s->out, ")");
+
+	/* Models often write grep's basic syntax, where the backslashed forms
+	 * are the operators. Here they are the literal characters, so such a
+	 * pattern quietly matches nothing; say so rather than cost a turn. */
+	if (s->results == 0 && s->have_regex) {
+		const char *p = s->args->pattern;
+		if (strstr(p, "\\|") || strstr(p, "\\(") || strstr(p, "\\)") ||
+		    strstr(p, "\\{") || strstr(p, "\\}") || strstr(p, "\\+") || strstr(p, "\\?"))
+			out_str(&s->out, "\n[Hint: in this syntax | ( ) { } + ? are operators "
+					 "when written plain, e.g. TODO|FIXME or (a|b)+. "
+					 "With a backslash they match the literal character.]");
+		else if (strstr(p, "\\d"))
+			out_str(&s->out, "\n[Hint: \\d is not supported; use [0-9].]");
+	}
 	if (s->stopped) {
 		if (tools_cancelled())
 			out_str(&s->out, "\n[Cancelled by the user.]");

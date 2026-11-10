@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include "support.h"
 
 static int tests_passed = 0;
 static int tests_failed = 0;
@@ -67,7 +68,7 @@ static void test_configuration_load_from_file(void)
 	printf("  Test: load from file\n");
 
 	/* Create a temporary config file */
-	const char *test_file = "/tmp/boris_config_test.ini";
+	const char *test_file = test_tmp_path("boris_config_test.ini");
 	FILE *file = fopen(test_file, "w");
 	ASSERT(file != NULL);
 
@@ -114,7 +115,7 @@ static void test_configuration_missing_file(void)
 	struct agent_configuration config;
 	configuration_set_defaults(&config);
 
-	enum boris_error result = configuration_load_from_file(&config, "/tmp/boris_does_not_exist.ini");
+	enum boris_error result = configuration_load_from_file(&config, test_tmp_path("boris_does_not_exist.ini"));
 	ASSERT(result == BORIS_OK); /* Missing file is not an error */
 
 	/* Values should still be defaults */
@@ -240,7 +241,7 @@ static void test_configuration_comments_and_blanks(void)
 {
 	printf("  Test: comments and blank lines in config\n");
 
-	const char *test_file = "/tmp/boris_config_comments.ini";
+	const char *test_file = test_tmp_path("boris_config_comments.ini");
 	FILE *file = fopen(test_file, "w");
 	ASSERT(file != NULL);
 
@@ -276,7 +277,7 @@ static void test_layer_priority_env_beats_ini(void)
 {
 	printf("  Test: env var overrides INI file value for same key\n");
 
-	const char *test_file = "/tmp/boris_priority_test.ini";
+	const char *test_file = test_tmp_path("boris_priority_test.ini");
 	FILE *file = fopen(test_file, "w");
 	ASSERT(file != NULL);
 	if (file) {
@@ -301,9 +302,72 @@ static void test_layer_priority_env_beats_ini(void)
 	remove(test_file);
 }
 
+static void test_safer_defaults_and_new_keys(void)
+{
+	printf("  Test: run asks first and is confined by default; stream is tri-state\n");
+
+	struct agent_configuration config;
+	configuration_set_defaults(&config);
+	ASSERT(config.confirm_bash == true);
+	ASSERT(config.run_confine == true);
+	ASSERT(config.stream_set == false);
+
+	ASSERT(configuration_set_key(&config, "behaviour.confirm_run", "false") == BORIS_OK);
+	ASSERT(config.confirm_bash == false);
+	ASSERT(configuration_set_key(&config, "tools.run_confine", "off") == BORIS_OK);
+	ASSERT(config.run_confine == false);
+	ASSERT(configuration_set_key(&config, "tools.run_read_paths", "/opt/x, /srv/y") ==
+	       BORIS_OK);
+	ASSERT(config.run_read_paths && strcmp(config.run_read_paths, "/opt/x, /srv/y") == 0);
+
+	/* An explicit "false" is still a choice, and chat must respect it */
+	ASSERT(configuration_set_key(&config, "model.stream", "false") == BORIS_OK);
+	ASSERT(config.stream_set == true && config.stream_responses == false);
+	configuration_destroy(&config);
+}
+
+static void test_api_key_storage(void)
+{
+	printf("  Test: API key - plain, and encrypted for the Windows user\n");
+
+	struct agent_configuration config;
+	configuration_set_defaults(&config);
+	ASSERT(configuration_set_key(&config, "model.api_key", "sk-plain") == BORIS_OK);
+	ASSERT(config.api_key && strcmp(config.api_key, "sk-plain") == 0);
+
+#ifdef _WIN32
+	const char *secret = "sk-s\xc3\xa9" "cret/with+odd=chars 123";
+	char *sealed = platform_secret_protect(secret);
+	ASSERT(sealed != NULL);
+	if (sealed) {
+		ASSERT(strstr(sealed, "sk-") == NULL); /* not merely encoded */
+		char value[4096];
+		snprintf(value, sizeof(value), "dpapi:%s", sealed);
+		ASSERT(configuration_set_key(&config, "model.api_key", value) == BORIS_OK);
+		ASSERT(config.api_key && strcmp(config.api_key, secret) == 0);
+
+		/* A damaged value is refused and the previous key kept */
+		size_t last = strlen(value) - 5;
+		value[last] = value[last] == '0' ? '1' : '0';
+		ASSERT(configuration_set_key(&config, "model.api_key", value) != BORIS_OK);
+		ASSERT(config.api_key && strcmp(config.api_key, secret) == 0);
+		free(sealed);
+	}
+	ASSERT(configuration_set_key(&config, "model.api_key", "dpapi:zz") != BORIS_OK);
+#else
+	/* Meaningless off Windows: refused, not taken literally as a key */
+	ASSERT(configuration_set_key(&config, "model.api_key", "dpapi:00ff") != BORIS_OK);
+	ASSERT(config.api_key && strcmp(config.api_key, "sk-plain") == 0);
+#endif
+	configuration_destroy(&config);
+}
+
 int main(void)
 {
 	printf("\n=== Configuration Tests ===\n\n");
+
+	test_safer_defaults_and_new_keys();
+	test_api_key_storage();
 
 	test_configuration_defaults();
 	test_configuration_load_from_file();

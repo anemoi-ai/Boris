@@ -1,20 +1,25 @@
 /*
  * editor.c - Minimal line editor with history and tab completion.
  *
- * Uses POSIX termios for raw mode.  When stdin is not a TTY the public
- * API falls back to fgets so piped input still works.
+ * Uses POSIX termios for raw mode (on Windows, the console's raw mode with
+ * keys delivered as the same ANSI sequences).  When stdin is not a TTY the
+ * public API falls back to fgets so piped input still works.
  */
 #define _POSIX_C_SOURCE 200809L
 
 #include "editor.h"
 #include "terminal.h"
 
+#ifndef _WIN32
 #include <termios.h>
-#include <unistd.h>
+#endif
+#include "platform.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
 #include <sys/ioctl.h>
+#endif
 
 #define BUF_INIT_CAP 256
 #define HISTORY_MAX  500
@@ -23,7 +28,9 @@
  * Global editor state
  * ---------------------------------------------------------------------- */
 
+#ifndef _WIN32
 static struct termios g_orig_termios;
+#endif
 static int g_raw_active = 0;
 static int g_atexit_done = 0;
 
@@ -49,7 +56,11 @@ static int g_prev_lines = 1;
 static void disable_raw_mode(void)
 {
 	if (g_raw_active) {
+#ifdef _WIN32
+		platform_console_raw(false);
+#else
 		tcsetattr(STDIN_FILENO, TCSAFLUSH, &g_orig_termios);
+#endif
 		g_raw_active = 0;
 	}
 }
@@ -63,6 +74,10 @@ static void enable_raw_mode(void)
 {
 	if (g_raw_active)
 		return;
+#ifdef _WIN32
+	if (!platform_console_raw(true))
+		return; /* stay in line mode: editor_process_char uses fgets */
+#else
 	struct termios raw;
 	tcgetattr(STDIN_FILENO, &g_orig_termios);
 	raw = g_orig_termios;
@@ -70,6 +85,7 @@ static void enable_raw_mode(void)
 	raw.c_cc[VMIN] = 1;
 	raw.c_cc[VTIME] = 0;
 	tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+#endif
 	g_raw_active = 1;
 	if (!g_atexit_done) {
 		atexit(atexit_restore);
@@ -80,6 +96,20 @@ static void enable_raw_mode(void)
 /* -------------------------------------------------------------------------
  * Low-level I/O
  * ---------------------------------------------------------------------- */
+
+#ifdef _WIN32
+
+static int read_byte(void)
+{
+	return platform_console_read_byte();
+}
+
+static int terminal_width(void)
+{
+	return platform_console_width();
+}
+
+#else
 
 static int read_byte(void)
 {
@@ -97,6 +127,8 @@ static int terminal_width(void)
 		return (int)ws.ws_col;
 	return 80;
 }
+
+#endif
 
 /* -------------------------------------------------------------------------
  * UTF-8 helpers
@@ -620,8 +652,10 @@ void editor_begin(struct editor_state *ed, const char *prompt)
 
 	if (isatty(STDIN_FILENO) && term_is_tty()) {
 		enable_raw_mode();
-		printf("%s", prompt);
-		fflush(stdout);
+		if (g_raw_active) {
+			printf("%s", prompt);
+			fflush(stdout);
+		}
 	}
 }
 

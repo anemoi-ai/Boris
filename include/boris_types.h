@@ -55,6 +55,8 @@ struct agent_configuration {
 	char *sandbox_root;
 	int run_timeout_seconds;
 	char *run_env; /* extra environment variable names passed to run scripts */
+	bool run_confine; /* confine run scripts with the OS's own sandbox (default on) */
+	char *run_read_paths; /* extra directories confined scripts may read (comma list) */
 	int max_result_bytes; /* cap on any tool result; <= 0 means the default */
 
 	bool verify_ssl;
@@ -70,6 +72,7 @@ struct agent_configuration {
 	int retry_backoff_ms;
 
 	bool stream_responses;
+	bool stream_set; /* model.stream was given somewhere; else chat streams, exec does not */
 	bool confirm_writes;
 	bool confirm_bash;
 	bool confirm_fetch;	  /* ask before each fetch (default on) */

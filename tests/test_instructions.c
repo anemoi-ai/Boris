@@ -10,8 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <unistd.h>
+#include "support.h"
 
 static int tests_passed = 0;
 static int tests_failed = 0;
@@ -93,7 +92,9 @@ static void test_symlink_out_of_sandbox_refused(void)
 	char target[PATH_MAX], link_path[PATH_MAX];
 	snprintf(target, sizeof(target), "%s/private.txt", g_outside);
 	snprintf(link_path, sizeof(link_path), "%s/BORIS.md", g_sandbox);
-	symlink(target, link_path);
+	if (!test_file_links_work())
+		return;
+	test_link(target, link_path);
 	put(g_sandbox, "AGENTS.md", "Fallback rules.\n");
 
 	struct agent_configuration cfg = make_cfg();
@@ -113,7 +114,9 @@ static void test_symlink_inside_sandbox_ok(void)
 	put(g_sandbox, "docs_rules.md", "Inside rules.\n");
 	char link_path[PATH_MAX];
 	snprintf(link_path, sizeof(link_path), "%s/BORIS.md", g_sandbox);
-	symlink("docs_rules.md", link_path);
+	if (!test_file_links_work())
+		return;
+	test_link("docs_rules.md", link_path);
 	struct agent_configuration cfg = make_cfg();
 	char src[256];
 	char *t = instructions_load(&cfg, src, sizeof(src));
@@ -210,7 +213,7 @@ static void test_compose(void)
 int main(void)
 {
 	printf("\n=== Instructions Tests ===\n\n");
-	snprintf(g_root, sizeof(g_root), "/tmp/boris_instructions_test_%d", (int)getpid());
+	snprintf(g_root, sizeof(g_root), "%s/boris_instructions_test_%d", test_tmp_dir(), (int)getpid());
 	snprintf(g_sandbox, sizeof(g_sandbox), "%s/sandbox", g_root);
 	snprintf(g_outside, sizeof(g_outside), "%s/outside", g_root);
 	mkdir(g_root, 0755);
@@ -226,10 +229,7 @@ int main(void)
 	test_none_and_explicit_path();
 	test_compose();
 
-	char cmd[PATH_MAX];
-	snprintf(cmd, sizeof(cmd), "rm -rf %s", g_root);
-	if (system(cmd) != 0)
-		printf("  (could not remove %s)\n", g_root);
+	test_remove_tree(g_root);
 
 	printf("\n--- Instructions Results ---\n");
 	printf("  Passed: %d\n", tests_passed);

@@ -6,6 +6,9 @@
 [model]
 endpoint = http://localhost:8080
 name = llama3
+# Better kept out of this file: set BORIS_API_KEY instead. If it is here,
+# keep the file private (chmod 600). 'boris init' on Windows stores it
+# encrypted for your account, as dpapi:...
 api_key = your-api-key-here
 temperature = 0.7
 # context_window must match your model's context length; max_tokens well below it
@@ -36,6 +39,15 @@ memory_persist = true
 # Scripts get only PATH, HOME, USER, LOGNAME, LANG, LC_*, TERM, TMPDIR, TZ
 # otherwise; BORIS_* variables are never passed.
 # run_env = VIRTUAL_ENV
+# Confine scripts started by run with the operating system's own sandbox
+# (default true). Linux (Landlock): a script can read the system, its
+# interpreter and the sandbox, and write only the sandbox and a temporary
+# directory of its own - not the rest of your home directory. Windows (low
+# integrity): a script can write only the sandbox and a temporary directory.
+# Elsewhere scripts are not confined, and a warning says so.
+# run_confine = true
+# Extra directories a confined script may read (comma list; Linux).
+# run_read_paths = ~/datasets, /srv/models
 # Longest tool result returned to the model, in bytes (default 135168)
 # max_result_bytes = 135168
 # Let fetch reach loopback, private and link-local addresses (default false)
@@ -44,7 +56,9 @@ memory_persist = true
 [behaviour]
 # Ask before each write / script run (needs an interactive terminal)
 confirm_writes = false
-confirm_run = false
+# run executes code the model wrote, so it asks by default. 'boris exec' has
+# nobody to ask and refuses instead; set this to false to allow it there.
+confirm_run = true
 # Ask before each fetch (only applies when fetch is enabled)
 confirm_fetch = true
 

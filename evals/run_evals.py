@@ -238,12 +238,22 @@ def cmd_calibrate(args):
     return 0 if res["accuracy"] >= 0.8 else 1
 
 
+def default_boris():
+    """The binary `make` builds; on Windows, the one the CMake build produces."""
+    if os.name == "nt":
+        for config in ("Release", "RelWithDebInfo", "Debug", ""):
+            exe = os.path.join(REPO, "build", config, "boris.exe")
+            if os.path.exists(exe):
+                return exe
+    return os.path.join(REPO, "boris")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("command", nargs="?", default="run",
                     choices=["run", "list", "compare", "selftest", "calibrate-judge"])
     ap.add_argument("paths", nargs="*", help="compare: two result directories")
-    ap.add_argument("--boris", default=os.path.join(REPO, "boris"))
+    ap.add_argument("--boris", default=default_boris())
     ap.add_argument("--endpoint")
     ap.add_argument("--model")
     ap.add_argument("--models", help="comma list: run the suite once per model")

@@ -139,7 +139,9 @@ def missing_requirements(case: EvalCase) -> list:
 def _run_turn(case, turn, index, ws, opts, extra_flags, proxy):
     session = ws.next_session(turn.new_session or index == 0)
     message = ws.expand(turn.message)
+    # Nobody is there to confirm a script run; a case can still override this.
     cmd = [opts.boris, "exec", "--json", "--session", session, "--trace", ws.trace,
+           "--set", "behaviour.confirm_run=false",
            *case.flags, *turn.flags, *extra_flags, "-"]
     before = len(_trace_requests(ws.trace))
     limit = turn.timeout or case.timeout or opts.timeout

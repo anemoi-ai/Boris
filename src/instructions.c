@@ -14,7 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
+#include "platform.h"
 
 static const char TRUNCATED_NOTE[] =
 	"\n\n[The instructions file is longer than 32 KB; the rest was not loaded.]";

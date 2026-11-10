@@ -45,4 +45,10 @@ char *tool_fetch_html_to_text(const char *html, size_t len);
 /* The built-in definitions in registration order, and how many there are. */
 const struct tool_definition *const *tools_builtins(size_t *out_count);
 
+/*
+ * Can this system confine scripts started by run (tools.run_confine)?
+ * *reads is set if reading is confined too, not only writing.
+ */
+bool tool_run_confinement_available(bool *reads);
+
 #endif /* TOOL_BUILTINS_H */

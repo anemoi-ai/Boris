@@ -7,7 +7,7 @@
  */
 #define _GNU_SOURCE
 
-#include <unistd.h>
+#include "platform.h"
 
 #include "boris_errors.h"
 #include "boris_types.h"
@@ -18,6 +18,7 @@
 #include "repl.h"
 #include "init.h"
 #include "tools.h"
+#include "tool_builtins.h"
 #include "http_client.h"
 #include "metrics.h"
 #include "json.h"
@@ -27,16 +28,18 @@
 #include "exec.h"
 #include "trace.h"
 #include "instructions.h"
+#include "llm.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
 #include <getopt.h>
+#endif
 #include <signal.h>
 #include <stdbool.h>
 #include <ctype.h>
 #include <limits.h>
-#include <unistd.h>
 
 static bool g_quiet = false;
 
@@ -158,6 +161,8 @@ static void configuration_load_layers(struct agent_configuration *config,
 		if (configuration_set_key(config, cli->keys[i], cli->values[i]) != BORIS_OK)
 			fprintf(stderr, "  Invalid option: %s = %s\n",
 				cli->keys[i], cli->values[i]);
+
+	configuration_check(config);
 }
 
 /* Replace the inline system prompt with the contents of system_prompt_file. */
@@ -350,6 +355,11 @@ static int cmd_chat(int argc, char *argv[])
 	configuration_load_layers(&config, &cli);
 	logger_initialize((enum log_level)config.log_level, config.log_file);
 
+	/* Someone is watching: show the reply as it is written, unless they
+	 * said otherwise. (exec keeps the plain request/response default.) */
+	if (!config.stream_set)
+		config.stream_responses = true;
+
 	load_system_prompt_file(&config);
 	const char *instructions = apply_project_instructions(&config);
 
@@ -392,7 +402,9 @@ static int cmd_chat(int argc, char *argv[])
 
 	/* A script that exits without reading its stdin, or a server that
 	 * drops the connection, must not kill the process with SIGPIPE. */
+#ifdef SIGPIPE
 	signal(SIGPIPE, SIG_IGN);
+#endif
 
 	if (http_global_init() != 0)
 		fprintf(stderr, "  Warning: HTTP initialisation failed.\n");
@@ -515,7 +527,9 @@ static int cmd_exec(int argc, char *argv[])
 	if (!conv)
 		goto done;
 
+#ifdef SIGPIPE
 	signal(SIGPIPE, SIG_IGN);
+#endif
 	if (http_global_init() != 0)
 		fprintf(stderr, "boris exec: warning: HTTP initialisation failed\n");
 	tools_register_builtins();
@@ -592,13 +606,24 @@ static int cmd_status(int argc, char *argv[])
 	printf("  Max iterations  : %d\n", config.max_iterations);
 	printf("  Max retries     : %d\n", config.max_retries);
 	printf("  Timeout         : %ds\n", config.request_timeout_seconds);
-	printf("  Stream          : %s\n", config.stream_responses ? "yes" : "no");
+	printf("  Stream          : %s\n",
+	       config.stream_set ? (config.stream_responses ? "yes" : "no")
+				 : "in chat (default)");
 	printf("\n");
 	printf("  Sandbox root    : %s\n",
 	       config.sandbox_root ? config.sandbox_root : "(not set)");
 	printf("  Tools enabled   : %s\n", tools_buf);
 	printf("  Confirm writes  : %s\n", config.confirm_writes ? "yes" : "no");
 	printf("  Confirm run     : %s\n", config.confirm_bash ? "yes" : "no");
+	if (config.tools_enabled & TOOL_RUN) {
+		bool reads = false;
+		bool can = tool_run_confinement_available(&reads);
+		printf("  Run confinement : %s\n",
+		       !config.run_confine ? "off (tools.run_confine)"
+		       : !can	    ? "NOT AVAILABLE on this system"
+		       : reads	    ? "on (reads and writes limited to the sandbox)"
+				    : "on (writes limited to the sandbox)");
+	}
 	if (config.tools_enabled & TOOL_FETCH)
 		printf("  Confirm fetch   : %s\n", config.confirm_fetch ? "yes" : "no");
 	printf("  Memory persist  : %s\n", config.memory_persist ? "yes" : "no");
@@ -609,6 +634,25 @@ static int cmd_status(int argc, char *argv[])
 	if (config.trace_file)
 		printf("  Trace file      : %s\n", config.trace_file);
 	printf("  Show metrics    : %s\n", config.show_metrics ? "yes" : "no");
+
+	if (config.model_endpoint && http_global_init() == 0) {
+		struct llm_server_context sc;
+		if (llm_query_server_context(&config, &sc)) {
+			if (sc.loaded)
+				printf("  Server context  : %d (as loaded by Ollama)\n", sc.loaded);
+			else if (sc.num_ctx)
+				printf("  Server context  : %d (num_ctx; model not loaded)\n",
+				       sc.num_ctx);
+			else if (sc.model_max)
+				printf("  Server context  : Ollama's default until loaded "
+				       "(model maximum %d)\n", sc.model_max);
+			int effective = sc.loaded ? sc.loaded : sc.num_ctx;
+			if (effective > 0 && config.context_window > effective)
+				printf("                    ! smaller than Context window above; "
+				       "longer prompts are silently cut\n");
+		}
+		http_global_cleanup();
+	}
 
 	{
 		char source[PATH_MAX];
@@ -631,6 +675,8 @@ static int cmd_status(int argc, char *argv[])
 
 int main(int argc, char *argv[])
 {
+	platform_init();
+
 	if (argc < 2) {
 		print_usage();
 		return 0;

@@ -3,7 +3,8 @@
  *
  * Resolves the script path inside the sandbox, detects the interpreter via
  * shebang or file extension, then fork/exec's the child with combined
- * stdout+stderr captured and returned to the model.
+ * stdout+stderr captured and returned to the model. (On Windows the last
+ * two steps are in run_win32.c: CreateProcess in a job object.)
  *
  * Security properties:
  *   - Script path is validated by sandbox_resolve() before any exec
@@ -28,24 +29,25 @@
 #include "json.h"
 #include "logger.h"
 #include "fs.h"
+#include "run_internal.h"
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 #include <limits.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
-#include <fcntl.h>
+#include "platform.h"
+#ifndef _WIN32
 #include <sys/wait.h>
 #include <poll.h>
+#endif
 #include <signal.h>
 #include <time.h>
 
+#ifndef _WIN32
 extern char **environ;
+#endif
 
-#define RUN_MAX_OUTPUT	    65536
 #define RUN_MAX_ARGV	    40	 /* interpreter parts + script + user args + NULL */
 #define RUN_DEFAULT_TIMEOUT 30	 /* seconds */
 #define RUN_MAX_TIMEOUT	    120	 /* hard cap regardless of config */
@@ -60,18 +62,33 @@ extern char **environ;
 
 /* Variables passed through to scripts. Everything else, including every
  * BORIS_* variable, is dropped. tools.run_env adds names to this list. */
+#ifdef _WIN32
+/* Windows programs expect rather more to be there: without SystemRoot,
+ * for one, most runtimes cannot even open a socket. Names are matched
+ * without regard to case, as the system does. */
+static const char *const RUN_ENV_ALLOW[] = {
+	"PATH", "PATHEXT", "SystemRoot", "SystemDrive", "windir", "ComSpec",
+	"TEMP", "TMP", "USERPROFILE", "USERNAME", "HOMEDRIVE", "HOMEPATH", "HOME",
+	"APPDATA", "LOCALAPPDATA", "ProgramData", "ProgramFiles", "ProgramFiles(x86)",
+	"CommonProgramFiles", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE", "OS",
+	"LANG", "LC_ALL", "TZ",
+};
+#define env_name_equal(a, b, len) (strncasecmp(a, b, len) == 0)
+#else
 static const char *const RUN_ENV_ALLOW[] = {
 	"PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE",
 	"TERM", "TMPDIR", "TZ",
 };
+#define env_name_equal(a, b, len) (strncmp(a, b, len) == 0)
 
 #define RUN_DEFAULT_PATH "/usr/local/bin:/usr/bin:/bin"
+#endif
 
 static bool env_has(char *const *envp, size_t count, const char *name)
 {
 	size_t len = strlen(name);
 	for (size_t i = 0; i < count; i++)
-		if (strncmp(envp[i], name, len) == 0 && envp[i][len] == '=')
+		if (env_name_equal(envp[i], name, len) && envp[i][len] == '=')
 			return true;
 	return false;
 }
@@ -97,6 +114,38 @@ static void env_pass(char **envp, size_t *count, const char *name,
 		env_add(envp, count, name, value, scratch);
 }
 
+static const char *env_get(char *const *envp, const char *name)
+{
+	size_t len = strlen(name);
+	for (; *envp; envp++)
+		if (env_name_equal(*envp, name, len) && (*envp)[len] == '=')
+			return *envp + len + 1;
+	return NULL;
+}
+
+/* Set name in a finished (NULL terminated) envp, replacing any old value. */
+static void env_set(char **envp, const char *name, const char *value,
+		    struct memory_arena *scratch)
+{
+	size_t len = strlen(name) + 1 + strlen(value) + 1;
+	char *entry = arena_allocate(scratch, len);
+	if (!entry)
+		return;
+	snprintf(entry, len, "%s=%s", name, value);
+
+	size_t name_len = strlen(name), count = 0;
+	for (; envp[count]; count++) {
+		if (env_name_equal(envp[count], name, name_len) && envp[count][name_len] == '=') {
+			envp[count] = entry;
+			return;
+		}
+	}
+	if (count < RUN_ENV_MAX - 1) {
+		envp[count] = entry;
+		envp[count + 1] = NULL;
+	}
+}
+
 /*
  * Fill envp (RUN_ENV_MAX entries) with the child's environment, NULL
  * terminated. Built in the parent so the child does no allocation.
@@ -114,7 +163,7 @@ static void build_child_env(const struct agent_configuration *cfg,
 		char *save = NULL;
 		for (char *tok = strtok_r(names, ", \t", &save); tok;
 		     tok = strtok_r(NULL, ", \t", &save)) {
-			if (strncmp(tok, "BORIS_", 6) == 0) {
+			if (env_name_equal(tok, "BORIS_", 6)) {
 				log_warning("run: tools.run_env: refusing to pass %s "
 					    "to scripts", tok);
 				continue;
@@ -123,8 +172,15 @@ static void build_child_env(const struct agent_configuration *cfg,
 		}
 	}
 
+#ifdef _WIN32
+	/* Python would otherwise encode its output in the legacy code page,
+	 * and fail outright on characters that page lacks. Everything Boris
+	 * reads and writes is UTF-8. */
+	env_add(envp, &count, "PYTHONUTF8", "1", scratch);
+#else
 	if (!env_has(envp, count, "PATH"))
 		env_add(envp, &count, "PATH", RUN_DEFAULT_PATH, scratch);
+#endif
 	/* Python block-buffers stdout when it is a pipe, so a script killed at
 	 * the timeout would report no output at all, hiding where it hung. */
 	env_add(envp, &count, "PYTHONUNBUFFERED", "1", scratch);
@@ -134,6 +190,8 @@ static void build_child_env(const struct agent_configuration *cfg,
 /* -------------------------------------------------------------------------
  * Interpreter resolution
  * ---------------------------------------------------------------------- */
+
+#ifndef _WIN32
 
 static const struct {
 	const char *ext;
@@ -217,6 +275,7 @@ static int build_argv_shebang(const char *script_path,
 	return argc;
 }
 
+#endif /* !_WIN32 */
 
 /* -------------------------------------------------------------------------
  * Argument parsing
@@ -280,6 +339,44 @@ static int parse_run_args(const char *json_str, struct run_args *out,
 	return 0;
 }
 
+/* -------------------------------------------------------------------------
+ * Result
+ * ---------------------------------------------------------------------- */
+
+char *run_format_result(const struct child_output *out, bool finished, bool cancelled,
+			int exit_code, int timeout_seconds)
+{
+	size_t result_cap = out->len + 256;
+	char *result = malloc(result_cap);
+	if (!result)
+		return NULL;
+
+	int hlen;
+	if (cancelled)
+		hlen = snprintf(result, result_cap,
+				"Cancelled by the user (process killed)\n"
+				"--- output (partial) ---\n");
+	else if (!finished)
+		hlen = snprintf(result, result_cap,
+				"Timed out after %d seconds (process killed)\n"
+				"--- output (partial) ---\n",
+				timeout_seconds);
+	else
+		hlen = snprintf(result, result_cap,
+				"Exit code: %d\n--- output ---\n", exit_code);
+
+	memcpy(result + hlen, out->buf, out->len);
+	size_t pos = (size_t)hlen + out->len;
+	if (out->truncated)
+		snprintf(result + pos, result_cap - pos,
+			 "\n[Output truncated at %d bytes]", RUN_MAX_OUTPUT);
+	else
+		result[pos] = '\0';
+	return result;
+}
+
+#ifndef _WIN32
+
 static long elapsed_ms(const struct timespec *start)
 {
 	struct timespec now;
@@ -295,7 +392,8 @@ static long elapsed_ms(const struct timespec *start)
 #define RUN_POLL_SLICE_MS 200
 
 static _Noreturn void exec_in_child(char *const argv[], char **envp,
-				    const char *cwd, int out_fd, int in_fd)
+				    const char *cwd, int out_fd, int in_fd,
+				    const struct run_confinement *confinement)
 {
 	/* Own process group, so a timeout can kill everything the script
 	 * started, not just the script itself. */
@@ -318,6 +416,13 @@ static _Noreturn void exec_in_child(char *const argv[], char **envp,
 		_exit(127);
 	}
 
+	/* From here on the process, and whatever it starts, can only touch
+	 * what the confinement allows. Never start the script without it. */
+	if (run_confine_child(confinement) != 0) {
+		fprintf(stderr, "run: cannot confine the script: %s\n", strerror(errno));
+		_exit(126);
+	}
+
 	/* execvp searches the PATH of the new environment. */
 	environ = envp;
 	execvp(argv[0], argv);
@@ -338,12 +443,6 @@ static void feed_stdin(int fd, const char *data, size_t len)
 	sigaction(SIGPIPE, &old, NULL);
 	close(fd);
 }
-
-struct child_output {
-	char *buf; /* RUN_MAX_OUTPUT + 1 bytes */
-	size_t len;
-	bool truncated;
-};
 
 /* Read combined output until EOF, the deadline, or cancellation.
  * Returns false if the child must be killed (timeout or Ctrl+C). */
@@ -408,7 +507,7 @@ static bool wait_for_exit(pid_t pid, const struct timespec *start,
  */
 static char *exec_child(char *const argv[], char **envp, const char *cwd,
 			const char *stdin_data, size_t stdin_len,
-			int timeout_seconds)
+			int timeout_seconds, const struct run_confinement *confinement)
 {
 	int out_pipe[2]; /* parent reads [0], child writes [1] */
 	int in_pipe[2] = {-1, -1}; /* parent writes [1], child reads [0] */
@@ -434,7 +533,7 @@ static char *exec_child(char *const argv[], char **envp, const char *cwd,
 		close(out_pipe[0]);
 		if (has_stdin)
 			close(in_pipe[1]);
-		exec_in_child(argv, envp, cwd, out_pipe[1], in_pipe[0]);
+		exec_in_child(argv, envp, cwd, out_pipe[1], in_pipe[0], confinement);
 	}
 
 	close(out_pipe[1]);
@@ -473,38 +572,13 @@ static char *exec_child(char *const argv[], char **envp, const char *cwd,
 					      : 0;
 
 	/* Format result: header + captured output + optional note */
-	size_t result_cap = out.len + 256;
-	char *result = malloc(result_cap);
-	if (!result) {
-		free(out.buf);
-		return NULL;
-	}
-
-	int hlen;
-	if (cancelled)
-		hlen = snprintf(result, result_cap,
-				"Cancelled by the user (process killed)\n"
-				"--- output (partial) ---\n");
-	else if (!finished)
-		hlen = snprintf(result, result_cap,
-				"Timed out after %d seconds (process killed)\n"
-				"--- output (partial) ---\n",
-				timeout_seconds);
-	else
-		hlen = snprintf(result, result_cap,
-				"Exit code: %d\n--- output ---\n", exit_code);
-
-	memcpy(result + hlen, out.buf, out.len);
-	size_t pos = (size_t)hlen + out.len;
-	if (out.truncated)
-		snprintf(result + pos, result_cap - pos,
-			 "\n[Output truncated at %d bytes]", RUN_MAX_OUTPUT);
-	else
-		result[pos] = '\0';
-
+	char *result = run_format_result(&out, finished, cancelled, exit_code,
+					 timeout_seconds);
 	free(out.buf);
 	return result;
 }
+
+#endif /* !_WIN32 */
 
 /* -------------------------------------------------------------------------
  * Public tool function
@@ -539,6 +613,7 @@ struct tool_result tool_run_fn(const char *arguments_json,
 	for (int i = 0; i < args.user_argc; i++)
 		user_argv[i] = args.user_args[i];
 
+#ifndef _WIN32
 	char *exec_argv[RUN_MAX_ARGV];
 	char shebang_buf[512];
 	int argc = build_argv_shebang(resolved,
@@ -562,6 +637,7 @@ struct tool_result tool_run_fn(const char *arguments_json,
 			exec_argv[argc++] = user_argv[i];
 		exec_argv[argc] = NULL;
 	}
+#endif
 
 	/* Clamp timeout: per-call request cannot exceed the config ceiling */
 	int timeout = args.timeout_seconds;
@@ -577,18 +653,69 @@ struct tool_result tool_run_fn(const char *arguments_json,
 	else
 		snprintf(dir_buf, sizeof(dir_buf), "%s", cfg->sandbox_root);
 
-	log_info("run: %s (interpreter=%s, timeout=%ds)",
-		 resolved, exec_argv[0], timeout);
-
 	char *envp[RUN_ENV_MAX];
 	build_child_env(cfg, envp, scratch);
 
+	/* The sandbox root as the system names it, for the confinement rules */
+	char sandbox_root[PATH_MAX];
+	if (tools_sandbox_resolve(cfg, ".", sandbox_root, sizeof(sandbox_root),
+				  &sandbox_err) != 0)
+		return sandbox_err;
+
+#ifdef _WIN32
+	char tmp_dir[PATH_MAX];
+	bool confined = cfg->run_confine &&
+			run_win32_confine_prepare(sandbox_root, tmp_dir, sizeof(tmp_dir));
+	if (confined) {
+		env_set(envp, "TEMP", tmp_dir, scratch);
+		env_set(envp, "TMP", tmp_dir, scratch);
+	}
+	(void)env_get;
+
+	char problem[512];
+	char *output = run_win32_script(resolved, (char *const *)user_argv, args.user_argc,
+					envp, dir_buf, args.stdin_data, args.stdin_len,
+					timeout, confined, problem, sizeof(problem));
+	if (!output)
+		return tool_result_errorf("run", "%s", problem);
+#else
+	struct run_confinement confinement;
+	run_confine_prepare(cfg, sandbox_root, exec_argv[0], env_get(envp, "PATH"),
+			    &confinement);
+	if (confinement.active)
+		env_set(envp, "TMPDIR", confinement.tmp_dir, scratch);
+
+	log_info("run: %s (interpreter=%s, timeout=%ds%s)",
+		 resolved, exec_argv[0], timeout, confinement.active ? ", confined" : "");
+
 	char *output = exec_child((char *const *)exec_argv, envp, dir_buf,
-				  args.stdin_data, args.stdin_len, timeout);
+				  args.stdin_data, args.stdin_len, timeout, &confinement);
+	run_confine_release(&confinement);
 	if (!output)
 		return tool_result_errorf("run", "Failed to launch process");
+#endif
 
 	return tool_result_ok("run", output);
+}
+
+bool tool_run_confinement_available(bool *reads)
+{
+#ifdef _WIN32
+	if (reads)
+		*reads = false; /* low integrity stops writes, not reads */
+	return true;
+#else
+	struct agent_configuration probe;
+	memset(&probe, 0, sizeof(probe));
+	probe.run_confine = true;
+	struct run_confinement c;
+	run_confine_prepare(&probe, "/", "sh", NULL, &c);
+	bool available = c.active;
+	run_confine_release(&c);
+	if (reads)
+		*reads = available;
+	return available;
+#endif
 }
 
 /* "build.sh --fast (stdin: 120 bytes)". */
@@ -648,7 +775,11 @@ const struct tool_definition tool_run_definition = {
 	.name = "run",
 	.description = "Execute a script file within the sandbox and return its output. "
 		       "The interpreter is detected from the shebang line or file extension "
+#ifdef _WIN32
+		       "(.py, .js, .ps1, .bat, .cmd, .sh, .rb, .lua, .pl, .php). "
+#else
 		       "(.py, .js, .sh, .rb, .lua, .pl, .php). "
+#endif
 		       "Returns the exit code and combined stdout/stderr.",
 	.parameters_schema = SCHEMA_RUN,
 	.fn = tool_run_fn,

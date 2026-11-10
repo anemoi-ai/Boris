@@ -12,17 +12,18 @@
 #include "init.h"
 #include "configuration.h"
 #include "fs.h"
+#include "cJSON.h"
 #include <curl/curl.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <sys/types.h>
+#include "platform.h"
 #include <errno.h>
 #include <time.h>
-#include <unistd.h>
+#ifndef _WIN32
 #include <termios.h>
+#endif
 
 #define MAX_USER_INPUT 1024
 
@@ -40,6 +41,13 @@ static char *ask(const char *prompt, char *buffer, size_t size)
 	printf("  %s", prompt);
 	fflush(stdout);
 
+#ifdef _WIN32
+	/* Read the console as Unicode, whatever its code page. */
+	if (isatty(STDIN_FILENO)) {
+		if (!platform_console_read_line(buffer, size, true))
+			return NULL;
+	} else
+#endif
 	if (!fgets(buffer, (int)size, stdin))
 		return NULL;
 
@@ -67,6 +75,14 @@ static char *ask_hidden(const char *prompt, char *buffer, size_t size)
 	printf("  %s", prompt);
 	fflush(stdout);
 
+#ifdef _WIN32
+	if (isatty(STDIN_FILENO)) {
+		bool ok = platform_console_read_line(buffer, size, false);
+		printf("\n");
+		return ok ? buffer : NULL;
+	}
+	char *result = fgets(buffer, (int)size, stdin);
+#else
 	struct termios old, noecho;
 	int tty = isatty(STDIN_FILENO);
 	if (tty) {
@@ -82,6 +98,7 @@ static char *ask_hidden(const char *prompt, char *buffer, size_t size)
 		tcsetattr(STDIN_FILENO, TCSAFLUSH, &old);
 		printf("\n");
 	}
+#endif
 
 	if (!result)
 		return NULL;
@@ -99,6 +116,82 @@ static size_t discard_write_cb(void *ptr, size_t size, size_t nmemb,
 	(void)ptr;
 	(void)userdata;
 	return size * nmemb;
+}
+
+#define MAX_LISTED_MODELS 40
+
+struct model_list {
+	char names[MAX_LISTED_MODELS][128];
+	int count;
+	char *body; /* response being collected */
+	size_t len;
+};
+
+static size_t collect_write_cb(void *ptr, size_t size, size_t nmemb, void *userdata)
+{
+	struct model_list *list = userdata;
+	size_t n = size * nmemb;
+	if (list->len + n > 1024 * 1024)
+		return 0; /* not a model list */
+	char *grown = realloc(list->body, list->len + n + 1);
+	if (!grown)
+		return 0;
+	list->body = grown;
+	memcpy(list->body + list->len, ptr, n);
+	list->len += n;
+	list->body[list->len] = '\0';
+	return n;
+}
+
+/*
+ * Ask the server which models it has: OpenAI-compatible servers answer
+ * GET .../models next to .../chat/completions. Any failure just leaves the
+ * list empty, and the wizard asks for a name as before.
+ */
+static void fetch_models(const char *endpoint, const char *api_key, struct model_list *list)
+{
+	static const char suffix[] = "/chat/completions";
+	memset(list, 0, sizeof(*list));
+
+	char url[MAX_USER_INPUT + 16];
+	size_t len = strlen(endpoint);
+	size_t sl = sizeof(suffix) - 1;
+	if (len <= sl || strcmp(endpoint + len - sl, suffix) != 0)
+		return;
+	snprintf(url, sizeof(url), "%.*s/models", (int)(len - sl), endpoint);
+
+	CURL *curl = curl_easy_init();
+	if (!curl)
+		return;
+	struct curl_slist *headers = NULL;
+	if (api_key && api_key[0]) {
+		char auth[MAX_USER_INPUT + 32];
+		snprintf(auth, sizeof(auth), "Authorization: Bearer %s", api_key);
+		headers = curl_slist_append(headers, auth);
+	}
+	curl_easy_setopt(curl, CURLOPT_URL, url);
+	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
+	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 3L);
+	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, collect_write_cb);
+	curl_easy_setopt(curl, CURLOPT_WRITEDATA, list);
+	CURLcode res = curl_easy_perform(curl);
+	curl_slist_free_all(headers);
+	curl_easy_cleanup(curl);
+
+	cJSON *root = (res == CURLE_OK && list->body) ? cJSON_Parse(list->body) : NULL;
+	const cJSON *data = cJSON_GetObjectItemCaseSensitive(root, "data");
+	const cJSON *item = NULL;
+	cJSON_ArrayForEach(item, data)
+	{
+		const cJSON *id = cJSON_GetObjectItemCaseSensitive(item, "id");
+		if (list->count < MAX_LISTED_MODELS && cJSON_IsString(id) && id->valuestring[0])
+			snprintf(list->names[list->count++], sizeof(list->names[0]), "%s",
+				 id->valuestring);
+	}
+	cJSON_Delete(root);
+	free(list->body);
+	list->body = NULL;
 }
 
 /*
@@ -149,9 +242,22 @@ static int format_config(char *buf, size_t size, const char *companion_name,
 	localtime_r(&now, &tm);
 	strftime(date_str, sizeof(date_str), "%Y-%m-%d %H:%M:%S", &tm);
 
-	char api_key_line[MAX_USER_INPUT + 16] = "";
-	if (api_key[0])
+	char api_key_line[MAX_USER_INPUT * 8] = "";
+	if (api_key[0]) {
+#ifdef _WIN32
+		/* There are no permission bits to hide the file behind, so the
+		 * key itself is encrypted for this Windows account. */
+		char *sealed = platform_secret_protect(api_key);
+		if (sealed)
+			snprintf(api_key_line, sizeof(api_key_line),
+				 "# Encrypted for your Windows account. To change it, write\n"
+				 "# the new key here as plain text, or set BORIS_API_KEY.\n"
+				 "api_key = dpapi:%s\n", sealed);
+		free(sealed);
+		if (!api_key_line[0])
+#endif
 		snprintf(api_key_line, sizeof(api_key_line), "api_key = %s\n", api_key);
+	}
 
 	char prompt_line[MAX_USER_INPUT * 4 + 64];
 	if (prompt_path)
@@ -190,7 +296,7 @@ static int format_config(char *buf, size_t size, const char *companion_name,
 			 "[behaviour]\n"
 			 "# Ask before each write / script run\n"
 			 "confirm_writes = false\n"
-			 "confirm_run = false\n"
+			 "confirm_run = true\n"
 			 "\n"
 			 "[tools]\n"
 			 "# default = every tool except fetch; see boris.ini.example\n"
@@ -266,9 +372,35 @@ int init_run(void)
 
 	printf("  Got it. I'll talk to the model at %s\n\n", endpoint);
 
-	/* Question 4: Model name */
-	if (!ask("What model are you running? (e.g., llama3, mistral) ",
-		 model_name, sizeof(model_name))) {
+	/* Question 4: API key (optional). Asked before the model, because a
+	 * hosted server will not list its models without one. */
+	if (!ask_hidden("API key (optional, press Enter to skip): ",
+			api_key, sizeof(api_key))) {
+		printf("\n  Setup cancelled.\n\n");
+		return 1;
+	}
+	printf("\n");
+
+	/* Question 5: Model name, from the server's own list if it gives one */
+	static struct model_list models;
+	fetch_models(endpoint, api_key, &models);
+	if (models.count > 0) {
+		printf("  The server has these models:\n");
+		for (int i = 0; i < models.count; i++)
+			printf("    %2d. %s\n", i + 1, models.names[i]);
+		printf("\n");
+		if (!ask("Which one? (number or name) ", model_name, sizeof(model_name))) {
+			printf("\n  Setup cancelled.\n\n");
+			return 1;
+		}
+		char *end = NULL;
+		long pick = strtol(model_name, &end, 10);
+		if (end != model_name && *end == '\0' && pick >= 1 && pick <= models.count)
+			snprintf(model_name, sizeof(model_name), "%s", models.names[pick - 1]);
+		else if (model_name[0] == '\0' && models.count == 1)
+			snprintf(model_name, sizeof(model_name), "%s", models.names[0]);
+	} else if (!ask("What model are you running? (e.g., llama3, mistral) ",
+			model_name, sizeof(model_name))) {
 		printf("\n  Setup cancelled.\n\n");
 		return 1;
 	}
@@ -277,14 +409,7 @@ int init_run(void)
 		snprintf(model_name, sizeof(model_name), "default");
 	}
 
-	printf("  %s it is.\n\n", model_name);
-
-	/* Question 5: API key (optional) */
-	if (!ask_hidden("API key (optional, press Enter to skip): ",
-			api_key, sizeof(api_key))) {
-		printf("\n  Setup cancelled.\n\n");
-		return 1;
-	}
+	printf("  %s it is.\n", model_name);
 
 	/* Question 6: Personality */
 	printf("\n");
@@ -377,7 +502,7 @@ int init_run(void)
 	printf("\n");
 	printf("  %s, your companion %s is ready.\n", user_name, companion_name);
 	printf("\n");
-	printf("  Run './boris chat' to start chatting.\n");
+	printf("  Run '%s chat' to start chatting.\n", PLATFORM_WINDOWS ? "boris" : "./boris");
 	printf("\n");
 	printf("  See you there.\n");
 	printf("\n");
