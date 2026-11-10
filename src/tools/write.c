@@ -144,6 +144,12 @@ struct tool_result tool_write_fn(const char *arguments_json,
 		if (fd < 0)
 			return tool_result_errorf("write", "Cannot open file for append: %s",
 						  args.path);
+		if (fs_fd_is_inside(cfg->sandbox_root, fd) == 0) {
+			close(fd);
+			return tool_result_errorf("sandbox",
+						  "Access denied: '%s' is outside the sandbox",
+						  args.path);
+		}
 		int rc = fs_write_all(fd, args.content, content_len);
 		if (close(fd) != 0)
 			rc = -1;
@@ -154,7 +160,7 @@ struct tool_result tool_write_fn(const char *arguments_json,
 
 	/* Overwrite / create_new: temp file + rename (or link for create_new,
 	 * which refuses to replace a file created in the meantime). */
-	if (fs_write_atomic(resolved, args.content, content_len, 0644,
+	if (fs_write_atomic_in(cfg->sandbox_root, resolved, args.content, content_len, 0644,
 			    args.mode == WRITE_CREATE_NEW) != 0) {
 		if (errno == EEXIST)
 			return tool_result_errorf("write", "File already exists: %s", args.path);

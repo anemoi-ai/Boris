@@ -187,7 +187,7 @@ static struct tool_result do_edit(const struct edit_args *args,
 	if (!out)
 		return tool_result_errorf("edit", "Out of memory");
 
-	int rc = fs_write_atomic(resolved, out, out_len, 0644, false);
+	int rc = fs_write_atomic_in(cfg->sandbox_root, resolved, out, out_len, 0644, false);
 	int saved = errno;
 	free(out);
 	if (rc != 0)

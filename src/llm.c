@@ -939,6 +939,127 @@ struct llm_response *llm_complete(const struct conversation_history *conv,
 	return r;
 }
 
+/* -------------------------------------------------------------------------
+ * Server context window (Ollama)
+ * ---------------------------------------------------------------------- */
+
+/* "http://host:11434/v1/chat/completions" -> "http://host:11434". */
+static bool ollama_base_url(const char *endpoint, char *base, size_t size)
+{
+	static const char *const suffixes[] = {"/v1/chat/completions", "/v1/", "/v1"};
+	if (!endpoint)
+		return false;
+	size_t len = strlen(endpoint);
+	for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); i++) {
+		size_t sl = strlen(suffixes[i]);
+		if (len > sl && strcmp(endpoint + len - sl, suffixes[i]) == 0 &&
+		    len - sl < size) {
+			memcpy(base, endpoint, len - sl);
+			base[len - sl] = '\0';
+			return true;
+		}
+	}
+	return false;
+}
+
+bool llm_query_server_context(const struct agent_configuration *config,
+			      struct llm_server_context *out)
+{
+	memset(out, 0, sizeof(*out));
+	char base[512], url[600];
+	if (!config || !config->model_name ||
+	    !ollama_base_url(config->model_endpoint, base, sizeof(base)))
+		return false;
+
+	/* Loaded models, with the context each was actually given. */
+	struct http_get_options opts = {
+		.timeout_secs = 3,
+		.verify_ssl = config->verify_ssl,
+		.max_bytes = 1024 * 1024,
+		.allow_private = true, /* the user's own model server */
+	};
+	snprintf(url, sizeof(url), "%s/api/ps", base);
+	struct http_response ps = http_get(url, &opts);
+	cJSON *root = (!ps.error && ps.status_code == 200 && ps.body) ? json_parse(ps.body)
+								      : NULL;
+	http_response_free(&ps);
+	const cJSON *models = cJSON_GetObjectItemCaseSensitive(root, "models");
+	if (!cJSON_IsArray(models)) {
+		cJSON_Delete(root);
+		return false; /* not Ollama */
+	}
+	const cJSON *m = NULL;
+	cJSON_ArrayForEach(m, models)
+	{
+		const char *name = json_get_str(m, "name");
+		const char *model = json_get_str(m, "model");
+		if ((name && strcmp(name, config->model_name) == 0) ||
+		    (model && strcmp(model, config->model_name) == 0))
+			out->loaded = json_get_int(m, "context_length", 0);
+	}
+	cJSON_Delete(root);
+
+	/* The model's own settings and limits. */
+	cJSON *req = cJSON_CreateObject();
+	cJSON_AddStringToObject(req, "model", config->model_name);
+	char *body = cJSON_PrintUnformatted(req);
+	cJSON_Delete(req);
+	if (!body)
+		return true;
+	snprintf(url, sizeof(url), "%s/api/show", base);
+	struct http_response show = http_post(url, body, "application/json", config->api_key,
+					      5, config->verify_ssl);
+	cJSON_free(body);
+	root = (!show.error && show.status_code == 200 && show.body) ? json_parse(show.body)
+								     : NULL;
+	http_response_free(&show);
+
+	/* "parameters" is text: one "name   value" per line. */
+	const char *params = json_get_str(root, "parameters");
+	for (const char *line = params; line && *line;) {
+		if (strncmp(line, "num_ctx", 7) == 0 && (line[7] == ' ' || line[7] == '\t'))
+			out->num_ctx = atoi(line + 7);
+		line = strchr(line, '\n');
+		if (line)
+			line++;
+	}
+	/* "model_info" has "<architecture>.context_length". */
+	const cJSON *info = cJSON_GetObjectItemCaseSensitive(root, "model_info");
+	const cJSON *item = NULL;
+	cJSON_ArrayForEach(item, info)
+	{
+		static const char key[] = ".context_length";
+		size_t kl = item->string ? strlen(item->string) : 0;
+		if (kl >= sizeof(key) - 1 && cJSON_IsNumber(item) &&
+		    strcmp(item->string + kl - (sizeof(key) - 1), key) == 0)
+			out->model_max = (int)item->valuedouble;
+	}
+	cJSON_Delete(root);
+	return true;
+}
+
+bool llm_check_server_context(const struct agent_configuration *config)
+{
+	struct llm_server_context sc;
+	if (!llm_query_server_context(config, &sc))
+		return true; /* not Ollama: nothing to learn by asking again */
+
+	int window = config->context_window;
+	int effective = sc.loaded ? sc.loaded : sc.num_ctx;
+	if (effective > 0 && window > effective)
+		log_warning("Ollama %s %s with a context of %d tokens, but "
+			    "model.context_window is %d. Ollama silently drops the start "
+			    "of prompts that do not fit. Set context_window = %d, or give "
+			    "the model more (OLLAMA_CONTEXT_LENGTH on the server, or "
+			    "num_ctx in a Modelfile).",
+			    sc.loaded ? "has loaded" : "runs", config->model_name, effective,
+			    window, effective);
+	else if (sc.model_max > 0 && window > sc.model_max)
+		log_warning("model.context_window is %d, but %s supports at most %d tokens.",
+			    window, config->model_name, sc.model_max);
+	return effective > 0;
+}
+
 void llm_response_free(struct llm_response *reply)
 {
 	if (!reply)

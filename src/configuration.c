@@ -64,6 +64,8 @@ static enum boris_error set_string(char **field, const char *value, bool is_path
 	char *copy = is_path ? expand_tilde(value) : strdup(value);
 	if (!copy)
 		return BORIS_ERROR_OUT_OF_MEMORY;
+	if (is_path)
+		platform_path_normalize(copy); /* Windows: one kind of slash */
 	free(*field);
 	*field = copy;
 	return BORIS_OK;
@@ -118,6 +120,32 @@ static enum boris_error set_bool(bool *field, const char *key, const char *value
 	log_warning("configuration: %s: '%s' is not a boolean (keeping %s)",
 		    key, value, *field ? "true" : "false");
 	return BORIS_ERROR_BAD_ARGUMENT;
+}
+
+/*
+ * The API key, as written or - "dpapi:<hex>", which is how the setup wizard
+ * stores it on Windows - encrypted for the current Windows user.
+ */
+static enum boris_error set_api_key(struct agent_configuration *config, const char *value)
+{
+	if (strncmp(value, "dpapi:", 6) != 0)
+		return set_string(&config->api_key, value, false);
+#ifdef _WIN32
+	char *secret = platform_secret_unprotect(value + 6);
+	if (!secret) {
+		log_warning("configuration: model.api_key could not be decrypted. It can "
+			    "only be read by the Windows user who ran 'boris init', on "
+			    "that machine; run it again or set BORIS_API_KEY.");
+		return BORIS_ERROR_BAD_ARGUMENT;
+	}
+	free(config->api_key);
+	config->api_key = secret;
+	return BORIS_OK;
+#else
+	log_warning("configuration: model.api_key is encrypted for a Windows user and "
+		    "cannot be read here; set BORIS_API_KEY or replace it.");
+	return BORIS_ERROR_BAD_ARGUMENT;
+#endif
 }
 
 static char *trim_whitespace(char *string)
@@ -196,7 +224,8 @@ void configuration_set_defaults(struct agent_configuration *config)
 
 	config->stream_responses = false;
 	config->confirm_writes = false;
-	config->confirm_bash = false;
+	config->confirm_bash = true; /* run executes code: ask unless told otherwise */
+	config->run_confine = true;
 	config->confirm_fetch = true;
 	config->fetch_allow_private = false;
 	config->memory_persist = false;
@@ -218,7 +247,7 @@ enum boris_error configuration_set_key(struct agent_configuration *config,
 	if (strcmp(key, "model.name") == 0)
 		return set_string(&config->model_name, value, false);
 	if (strcmp(key, "model.api_key") == 0)
-		return set_string(&config->api_key, value, false);
+		return set_api_key(config, value);
 	if (strcmp(key, "model.temperature") == 0)
 		return set_float(&config->temperature, key, value);
 	if (strcmp(key, "model.max_tokens") == 0)
@@ -227,8 +256,10 @@ enum boris_error configuration_set_key(struct agent_configuration *config,
 		return set_int(&config->context_window, key, value);
 	if (strcmp(key, "model.timeout_seconds") == 0)
 		return set_int(&config->request_timeout_seconds, key, value);
-	if (strcmp(key, "model.stream") == 0)
+	if (strcmp(key, "model.stream") == 0) {
+		config->stream_set = true;
 		return set_bool(&config->stream_responses, key, value);
+	}
 	if (strcmp(key, "model.verify_ssl") == 0)
 		return set_bool(&config->verify_ssl, key, value);
 
@@ -263,6 +294,10 @@ enum boris_error configuration_set_key(struct agent_configuration *config,
 		return set_int(&config->run_timeout_seconds, key, value);
 	if (strcmp(key, "tools.run_env") == 0)
 		return set_string(&config->run_env, value, false);
+	if (strcmp(key, "tools.run_confine") == 0)
+		return set_bool(&config->run_confine, key, value);
+	if (strcmp(key, "tools.run_read_paths") == 0)
+		return set_string(&config->run_read_paths, value, false);
 	if (strcmp(key, "tools.max_result_bytes") == 0)
 		return set_int(&config->max_result_bytes, key, value);
 	if (strcmp(key, "tools.memory_persist") == 0)
@@ -330,6 +365,7 @@ enum boris_error configuration_load_from_file(struct agent_configuration *config
 	}
 
 	current_section[0] = '\0'; /* Start with no section */
+	const char *key_before = config->api_key;
 
 	while (fgets(line, sizeof(line), file)) {
 		char *trimmed;
@@ -395,9 +431,43 @@ enum boris_error configuration_load_from_file(struct agent_configuration *config
 	}
 
 	fclose(file);
+
+#ifndef _WIN32
+	/* A key in a file other users can read is not a secret. (ssh refuses
+	 * such a file outright; a warning is enough here.) */
+	struct stat st;
+	if (config->api_key && config->api_key != key_before && stat(file_path, &st) == 0 &&
+	    (st.st_mode & 077) != 0)
+		log_warning("%s holds an API key and is readable by other users "
+			    "(mode %03o). Run: chmod 600 %s",
+			    file_path, (unsigned)(st.st_mode & 0777), file_path);
+#else
+	(void)key_before;
+#endif
 	log_info("Configuration loaded from: %s", file_path);
 
 	return BORIS_OK;
+}
+
+void configuration_check(const struct agent_configuration *config)
+{
+	if (!config)
+		return;
+	/* The reply has to fit in the window together with the conversation.
+	 * A max_tokens at or above the window leaves no room for either: the
+	 * server truncates the prompt, or rejects the request outright. */
+	if (config->context_window > 0 && config->max_tokens >= config->context_window)
+		log_warning("configuration: model.max_tokens (%d) is not below "
+			    "model.context_window (%d); the reply alone could fill the "
+			    "window. Lower max_tokens, or raise context_window if the "
+			    "model really has more.",
+			    config->max_tokens, config->context_window);
+	else if (config->context_window > 0 &&
+		 config->max_tokens > config->context_window / 2)
+		log_warning("configuration: model.max_tokens (%d) is more than half of "
+			    "model.context_window (%d); little room is left for the "
+			    "conversation.",
+			    config->max_tokens, config->context_window);
 }
 
 /* Environment variable -> configuration key. */
@@ -446,6 +516,7 @@ void configuration_destroy(struct agent_configuration *config)
 	FREE_AND_NULL(config->instructions_file);
 	FREE_AND_NULL(config->sandbox_root);
 	FREE_AND_NULL(config->run_env);
+	FREE_AND_NULL(config->run_read_paths);
 	FREE_AND_NULL(config->log_file);
 	FREE_AND_NULL(config->trace_file);
 }

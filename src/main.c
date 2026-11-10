@@ -27,6 +27,7 @@
 #include "exec.h"
 #include "trace.h"
 #include "instructions.h"
+#include "llm.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -159,6 +160,8 @@ static void configuration_load_layers(struct agent_configuration *config,
 		if (configuration_set_key(config, cli->keys[i], cli->values[i]) != BORIS_OK)
 			fprintf(stderr, "  Invalid option: %s = %s\n",
 				cli->keys[i], cli->values[i]);
+
+	configuration_check(config);
 }
 
 /* Replace the inline system prompt with the contents of system_prompt_file. */
@@ -350,6 +353,11 @@ static int cmd_chat(int argc, char *argv[])
 	logger_initialize(LOG_LEVEL_WARNING, NULL);
 	configuration_load_layers(&config, &cli);
 	logger_initialize((enum log_level)config.log_level, config.log_file);
+
+	/* Someone is watching: show the reply as it is written, unless they
+	 * said otherwise. (exec keeps the plain request/response default.) */
+	if (!config.stream_set)
+		config.stream_responses = true;
 
 	load_system_prompt_file(&config);
 	const char *instructions = apply_project_instructions(&config);
@@ -597,7 +605,9 @@ static int cmd_status(int argc, char *argv[])
 	printf("  Max iterations  : %d\n", config.max_iterations);
 	printf("  Max retries     : %d\n", config.max_retries);
 	printf("  Timeout         : %ds\n", config.request_timeout_seconds);
-	printf("  Stream          : %s\n", config.stream_responses ? "yes" : "no");
+	printf("  Stream          : %s\n",
+	       config.stream_set ? (config.stream_responses ? "yes" : "no")
+				 : "in chat (default)");
 	printf("\n");
 	printf("  Sandbox root    : %s\n",
 	       config.sandbox_root ? config.sandbox_root : "(not set)");
@@ -614,6 +624,25 @@ static int cmd_status(int argc, char *argv[])
 	if (config.trace_file)
 		printf("  Trace file      : %s\n", config.trace_file);
 	printf("  Show metrics    : %s\n", config.show_metrics ? "yes" : "no");
+
+	if (config.model_endpoint && http_global_init() == 0) {
+		struct llm_server_context sc;
+		if (llm_query_server_context(&config, &sc)) {
+			if (sc.loaded)
+				printf("  Server context  : %d (as loaded by Ollama)\n", sc.loaded);
+			else if (sc.num_ctx)
+				printf("  Server context  : %d (num_ctx; model not loaded)\n",
+				       sc.num_ctx);
+			else if (sc.model_max)
+				printf("  Server context  : Ollama's default until loaded "
+				       "(model maximum %d)\n", sc.model_max);
+			int effective = sc.loaded ? sc.loaded : sc.num_ctx;
+			if (effective > 0 && config.context_window > effective)
+				printf("                    ! smaller than Context window above; "
+				       "longer prompts are silently cut\n");
+		}
+		http_global_cleanup();
+	}
 
 	{
 		char source[PATH_MAX];

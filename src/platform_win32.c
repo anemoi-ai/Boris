@@ -12,6 +12,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <wincrypt.h>
 
 #include "platform.h"
 
@@ -371,10 +372,43 @@ int plat_symlink(const char *target, const char *link_path)
 	return -1;
 }
 
+/* The path the system reports for an open handle, as "C:/dir/file" or
+ * "//server/share/file". Returns false with errno set. */
+static bool path_of_handle(HANDLE h, char *resolved)
+{
+	wchar_t final[WPATH_MAX];
+	DWORD n = GetFinalPathNameByHandleW(h, final, WPATH_MAX,
+					    FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+	if (n == 0 || n >= WPATH_MAX) {
+		/* Devices (NUL, CON, pipes) have no path on a volume. */
+		DWORD error = GetLastError();
+		errno = n ? ENAMETOOLONG : (error == ERROR_PATH_NOT_FOUND ? ENOENT : EINVAL);
+		return false;
+	}
+
+	/* "\\?\C:\dir" -> "C:\dir";  "\\?\UNC\server\share" -> "\\server\share" */
+	wchar_t *start = final;
+	if (wcsncmp(start, L"\\\\?\\UNC\\", 8) == 0) {
+		start += 6;
+		start[0] = L'\\';
+	} else if (wcsncmp(start, L"\\\\?\\", 4) == 0) {
+		start += 4;
+	}
+
+	if (!to_utf8(start, resolved, PATH_MAX))
+		return false;
+	platform_path_normalize(resolved);
+
+	size_t len = strlen(resolved);
+	if (len > platform_path_root_length(resolved) && resolved[len - 1] == '/')
+		resolved[len - 1] = '\0';
+	return true;
+}
+
 /*
  * realpath(): the name the system itself reports for the opened object, so
  * symbolic links, junctions, 8.3 short names, "." and ".." and letter case
- * are all resolved. Returned as "C:/dir/file" or "//server/share/file".
+ * are all resolved.
  */
 char *plat_realpath(const char *path, char *resolved)
 {
@@ -392,35 +426,19 @@ char *plat_realpath(const char *path, char *resolved)
 		fail_win32();
 		return NULL;
 	}
-
-	wchar_t final[WPATH_MAX];
-	DWORD n = GetFinalPathNameByHandleW(h, final, WPATH_MAX,
-					    FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
-	DWORD error = GetLastError();
+	bool ok = path_of_handle(h, resolved);
+	int saved = errno;
 	CloseHandle(h);
-	if (n == 0 || n >= WPATH_MAX) {
-		/* Devices (NUL, CON, pipes) have no path on a volume. */
-		errno = n ? ENAMETOOLONG : (error == ERROR_PATH_NOT_FOUND ? ENOENT : EINVAL);
-		return NULL;
-	}
+	errno = saved;
+	return ok ? resolved : NULL;
+}
 
-	/* "\\?\C:\dir" -> "C:\dir";  "\\?\UNC\server\share" -> "\\server\share" */
-	wchar_t *start = final;
-	if (wcsncmp(start, L"\\\\?\\UNC\\", 8) == 0) {
-		start += 6;
-		start[0] = L'\\';
-	} else if (wcsncmp(start, L"\\\\?\\", 4) == 0) {
-		start += 4;
-	}
-
-	if (!to_utf8(start, resolved, PATH_MAX))
-		return NULL;
-	platform_path_normalize(resolved);
-
-	size_t len = strlen(resolved);
-	if (len > platform_path_root_length(resolved) && resolved[len - 1] == '/')
-		resolved[len - 1] = '\0';
-	return resolved;
+int platform_fd_path(int fd, char *out, size_t size)
+{
+	HANDLE h = (HANDLE)_get_osfhandle(fd);
+	if (h == INVALID_HANDLE_VALUE || size < PATH_MAX)
+		return -1;
+	return path_of_handle(h, out) ? 0 : -1;
 }
 
 int plat_isatty(int fd)
@@ -719,6 +737,7 @@ int plat_sigaction(int sig, const struct plat_sigaction *act, struct plat_sigact
 
 char *optarg = NULL;
 int optind = 1;
+int opterr = 1;
 
 static int g_opt_offset = 0; /* position inside a group of short options */
 static int g_opt_next = 0;   /* argv index of that group's separate argument */
@@ -769,7 +788,8 @@ static int parse_long(int argc, char **argv, int next, const char *text,
 		match = i;
 	}
 	if (match < 0 || ambiguous) {
-		fprintf(stderr, "%s: %s option '--%.*s'\n", argv[0],
+		if (opterr)
+			fprintf(stderr, "%s: %s option '--%.*s'\n", argv[0],
 			ambiguous ? "ambiguous" : "unrecognized", (int)name_len, text);
 		return '?';
 	}
@@ -777,14 +797,16 @@ static int parse_long(int argc, char **argv, int next, const char *text,
 	const struct option *o = &longopts[match];
 	if (o->has_arg == no_argument) {
 		if (equals) {
-			fprintf(stderr, "%s: option '--%s' doesn't allow an argument\n",
+			if (opterr)
+				fprintf(stderr, "%s: option '--%s' doesn't allow an argument\n",
 				argv[0], o->name);
 			return '?';
 		}
 	} else if (equals) {
 		optarg = (char *)equals + 1;
 	} else if (!take_argument(argc, argv, next)) {
-		fprintf(stderr, "%s: option '--%s' requires an argument\n", argv[0], o->name);
+		if (opterr)
+			fprintf(stderr, "%s: option '--%s' requires an argument\n", argv[0], o->name);
 		return '?';
 	}
 
@@ -844,7 +866,8 @@ int getopt_long(int argc, char *const argv_const[], const char *optstring,
 	const char *spec = c == ':' ? NULL : strchr(optstring, c);
 
 	if (!spec) {
-		fprintf(stderr, "%s: invalid option -- '%c'\n", argv[0], c);
+		if (opterr)
+			fprintf(stderr, "%s: invalid option -- '%c'\n", argv[0], c);
 		if (last_in_group) {
 			optind++;
 			g_opt_offset = 0;
@@ -869,7 +892,8 @@ int getopt_long(int argc, char *const argv_const[], const char *optstring,
 		return c;
 	}
 	if (!take_argument(argc, argv, g_opt_next)) {
-		fprintf(stderr, "%s: option requires an argument -- '%c'\n", argv[0], c);
+		if (opterr)
+			fprintf(stderr, "%s: option requires an argument -- '%c'\n", argv[0], c);
 		return '?';
 	}
 	return c;
@@ -1050,6 +1074,61 @@ bool platform_console_read_line(char *buf, size_t size, bool echo)
 	memcpy(buf, utf8, len);
 	buf[len] = '\0';
 	return true;
+}
+
+/* ------------------------------------------------------------------------
+ * Secrets (DPAPI)
+ *
+ * The key that encrypts is derived from the user's logon credentials and
+ * never leaves the system, so the text is useless to another user or on
+ * another machine. Written as hex.
+ * --------------------------------------------------------------------- */
+
+char *platform_secret_protect(const char *secret)
+{
+	DATA_BLOB in = {(DWORD)strlen(secret), (BYTE *)secret}, out = {0, NULL};
+	if (!CryptProtectData(&in, L"Boris API key", NULL, NULL, NULL,
+			      CRYPTPROTECT_UI_FORBIDDEN, &out))
+		return NULL;
+	char *text = malloc((size_t)out.cbData * 2 + 1);
+	for (DWORD i = 0; text && i < out.cbData; i++)
+		snprintf(text + i * 2, 3, "%02x", out.pbData[i]);
+	if (text)
+		text[(size_t)out.cbData * 2] = '\0';
+	LocalFree(out.pbData);
+	return text;
+}
+
+char *platform_secret_unprotect(const char *text)
+{
+	size_t len = strlen(text);
+	if (len == 0 || len % 2 != 0)
+		return NULL;
+	BYTE *raw = malloc(len / 2);
+	if (!raw)
+		return NULL;
+	for (size_t i = 0; i < len / 2; i++) {
+		unsigned int byte;
+		if (sscanf(text + i * 2, "%2x", &byte) != 1) {
+			free(raw);
+			return NULL;
+		}
+		raw[i] = (BYTE)byte;
+	}
+	DATA_BLOB in = {(DWORD)(len / 2), raw}, out = {0, NULL};
+	BOOL ok = CryptUnprotectData(&in, NULL, NULL, NULL, NULL, CRYPTPROTECT_UI_FORBIDDEN,
+				     &out);
+	free(raw);
+	if (!ok)
+		return NULL;
+	char *secret = malloc((size_t)out.cbData + 1);
+	if (secret) {
+		memcpy(secret, out.pbData, out.cbData);
+		secret[out.cbData] = '\0';
+	}
+	SecureZeroMemory(out.pbData, out.cbData);
+	LocalFree(out.pbData);
+	return secret;
 }
 
 /* ------------------------------------------------------------------------

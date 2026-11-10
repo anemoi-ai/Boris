@@ -307,6 +307,93 @@ static void test_resolve_windows_special_names(void)
 }
 #endif
 
+/* Test: a file is judged by where it is once open, not by the name used */
+static void test_open_file_checked_against_root(void)
+{
+	printf("  Test: an opened file outside the sandbox is detected\n");
+
+	char inside[512], outside_dir[512], outside[600], link_path[512], via_link[600];
+	snprintf(inside, sizeof(inside), "%s/in.txt", g_sandbox);
+	snprintf(outside_dir, sizeof(outside_dir), "%s_elsewhere", g_sandbox);
+	snprintf(outside, sizeof(outside), "%s/out.txt", outside_dir);
+	snprintf(link_path, sizeof(link_path), "%s/swapped", g_sandbox);
+	snprintf(via_link, sizeof(via_link), "%s/swapped/out.txt", g_sandbox);
+	mkdir(outside_dir, 0755);
+	FILE *f = fopen(inside, "w");
+	if (f)
+		fclose(f);
+	f = fopen(outside, "w");
+	if (f)
+		fclose(f);
+
+	int fd = open(inside, O_RDONLY);
+	ASSERT(fd >= 0 && fs_fd_is_inside(g_sandbox, fd) == 1);
+	if (fd >= 0)
+		close(fd);
+	fd = open(outside, O_RDONLY);
+	ASSERT(fd >= 0 && fs_fd_is_inside(g_sandbox, fd) == 0);
+	if (fd >= 0)
+		close(fd);
+
+	/* The case it exists for: a name inside the sandbox whose directory
+	 * has become a link to somewhere else since the name was checked. */
+	if (test_link(outside_dir, link_path) == 0) {
+		fd = open(via_link, O_RDONLY);
+		ASSERT(fd >= 0 && fs_fd_is_inside(g_sandbox, fd) == 0);
+		if (fd >= 0)
+			close(fd);
+
+		char target[600], leaked[600];
+		snprintf(target, sizeof(target), "%s/swapped/new.txt", g_sandbox);
+		snprintf(leaked, sizeof(leaked), "%s/new.txt", outside_dir);
+		errno = 0;
+		ASSERT(fs_write_atomic_in(g_sandbox, target, "x", 1, 0644, false) != 0);
+		ASSERT(errno == EACCES);
+		struct stat st;
+		ASSERT(stat(leaked, &st) != 0); /* nothing was written out there */
+
+		/* ...and nothing is left behind, not even the temporary file */
+		int entries = 0;
+		DIR *dir = opendir(outside_dir);
+		struct dirent *e;
+		while (dir && (e = readdir(dir)) != NULL)
+			if (e->d_name[0] != '.')
+				entries++;
+		if (dir)
+			closedir(dir);
+		ASSERT(entries == 1); /* out.txt */
+		unlink(link_path);
+	} else {
+		printf("  (link part skipped: cannot create links here)\n");
+	}
+
+	/* The ordinary case still writes */
+	ASSERT(fs_write_atomic_in(g_sandbox, inside, "ok", 2, 0644, false) == 0);
+
+	unlink(inside);
+	test_remove_tree(outside_dir);
+}
+
+/* Test: the filesystem root itself can be the sandbox root */
+static void test_resolve_filesystem_root_as_sandbox(void)
+{
+	printf("  Test: a filesystem root works as the sandbox root\n");
+
+	/* "/" on POSIX, "C:/" on Windows; the temp dir is somewhere below it */
+	char root[16];
+	size_t root_len = platform_path_root_length(test_tmp_dir());
+	ASSERT(root_len > 0 && root_len < sizeof(root));
+	memcpy(root, test_tmp_dir(), root_len);
+	root[root_len] = '\0';
+
+	char out[PATH_MAX];
+	ASSERT(sandbox_resolve(root, test_tmp_dir() + root_len, out, sizeof(out)) == 0);
+	ASSERT(strcmp(out, test_tmp_dir()) == 0);
+	ASSERT(sandbox_resolve(root, test_tmp_dir(), out, sizeof(out)) == 0);
+	ASSERT(sandbox_resolve(root, "no_such_dir_here/file.txt", out, sizeof(out)) == 0);
+	ASSERT(strncmp(out, root, root_len) == 0);
+}
+
 /* Test: fs_mkdirp creates a nested directory tree */
 static void test_mkdirp_nested(void)
 {
@@ -364,6 +451,8 @@ int main(void)
 	test_resolve_dotdot_stays_inside();
 	test_resolve_dotdot_in_missing_tail_blocked();
 	test_resolve_link_escape_blocked();
+	test_resolve_filesystem_root_as_sandbox();
+	test_open_file_checked_against_root();
 #ifdef _WIN32
 	test_resolve_windows_paths();
 	test_resolve_windows_special_names();

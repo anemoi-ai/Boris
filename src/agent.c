@@ -630,6 +630,7 @@ static struct agent_result run_loop(struct conversation_history *conv,
 		log_debug("agent: iteration %d/%d", st.iterations, cfg->max_iterations);
 
 		char call_err[600] = "";
+		size_t raw_sent = conversation_estimate_tokens_raw(conv);
 		resp = llm_complete_with_retry(
 			conv, tools, num_tools, cfg, call_err, sizeof(call_err));
 
@@ -643,6 +644,7 @@ static struct agent_result run_loop(struct conversation_history *conv,
 		}
 		st.prompt_tokens += resp->prompt_tokens;
 		st.completion_tokens += resp->completion_tokens;
+		conversation_calibrate(raw_sent, resp->prompt_tokens);
 
 		if (resp->content && resp->content[0]) {
 			free(st.last_response);

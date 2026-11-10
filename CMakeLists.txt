@@ -54,6 +54,9 @@ target_include_directories(boris_core PUBLIC include vendor)
 target_compile_options(boris_core PRIVATE ${BORIS_WARNINGS} ${BORIS_OPTIONS})
 target_compile_definitions(boris_core PUBLIC ${BORIS_DEFINITIONS})
 target_link_libraries(boris_core PUBLIC CURL::libcurl)
+if(WIN32)
+  target_link_libraries(boris_core PUBLIC crypt32)   # DPAPI, for the stored API key
+endif()
 
 add_library(boris_http STATIC src/http_client.c)
 target_compile_options(boris_http PRIVATE ${BORIS_WARNINGS} ${BORIS_OPTIONS})

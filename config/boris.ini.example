@@ -44,7 +44,9 @@ memory_persist = true
 [behaviour]
 # Ask before each write / script run (needs an interactive terminal)
 confirm_writes = false
-confirm_run = false
+# run executes code the model wrote, so it asks by default. 'boris exec' has
+# nobody to ask and refuses instead; set this to false to allow it there.
+confirm_run = true
 # Ask before each fetch (only applies when fetch is enabled)
 confirm_fetch = true
 

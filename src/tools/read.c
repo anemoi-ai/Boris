@@ -9,6 +9,7 @@
 
 #include "tools.h"
 #include "tool_builtins.h"
+#include "fs.h"
 #include "arena.h"
 #include "configuration.h"
 #include "sandbox.h"
@@ -139,6 +140,13 @@ struct tool_result tool_read_fn(const char *arguments_json,
 	int fd = open(resolved, O_RDONLY | O_NOFOLLOW);
 	if (fd < 0) {
 		return tool_result_errorf("read", "Cannot open file");
+	}
+
+	/* Checked as a path above; now check the file that actually opened. */
+	if (fs_fd_is_inside(cfg->sandbox_root, fd) == 0) {
+		close(fd);
+		return tool_result_errorf("sandbox", "Access denied: '%s' is outside the sandbox",
+					  args.path);
 	}
 
 	if (lseek(fd, (off_t)args.offset, SEEK_SET) < 0) {

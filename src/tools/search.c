@@ -349,6 +349,20 @@ static void append_summary(struct search_state *s)
 		out_str(&s->out, line);
 	}
 	out_str(&s->out, ")");
+
+	/* Models often write grep's basic syntax, where the backslashed forms
+	 * are the operators. Here they are the literal characters, so such a
+	 * pattern quietly matches nothing; say so rather than cost a turn. */
+	if (s->results == 0 && s->have_regex) {
+		const char *p = s->args->pattern;
+		if (strstr(p, "\\|") || strstr(p, "\\(") || strstr(p, "\\)") ||
+		    strstr(p, "\\{") || strstr(p, "\\}") || strstr(p, "\\+") || strstr(p, "\\?"))
+			out_str(&s->out, "\n[Hint: in this syntax | ( ) { } + ? are operators "
+					 "when written plain, e.g. TODO|FIXME or (a|b)+. "
+					 "With a backslash they match the literal character.]");
+		else if (strstr(p, "\\d"))
+			out_str(&s->out, "\n[Hint: \\d is not supported; use [0-9].]");
+	}
 	if (s->stopped) {
 		if (tools_cancelled())
 			out_str(&s->out, "\n[Cancelled by the user.]");

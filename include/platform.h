@@ -248,6 +248,7 @@ struct option {
 
 extern char *optarg;
 extern int optind;
+extern int opterr; /* 0: do not print messages for bad options */
 int getopt_long(int argc, char *const argv[], const char *optstring,
 		const struct option *longopts, int *longindex);
 
@@ -297,6 +298,14 @@ int platform_console_read_byte(void);
  * false on EOF. With echo off the typed text is not shown. */
 bool platform_console_read_line(char *buf, size_t size, bool echo);
 
+/*
+ * Encrypt a secret so that only the current Windows user can read it back
+ * (DPAPI), as text safe to put in a config file. Both return a heap string
+ * or NULL.
+ */
+char *platform_secret_protect(const char *secret);
+char *platform_secret_unprotect(const char *text);
+
 /* Call fn every interval_ms from a background thread until stopped. */
 void platform_ticker_start(unsigned interval_ms, void (*fn)(void));
 void platform_ticker_stop(void);
@@ -319,6 +328,13 @@ size_t platform_path_root_length(const char *path);
 /* Rewrite backslashes as forward slashes on Windows; nothing on POSIX,
  * where a backslash is an ordinary file name character. */
 void platform_path_normalize(char *path);
+
+/*
+ * The canonical path of the file an open descriptor refers to - where it
+ * really is now, whatever name it was opened by. size must be >= PATH_MAX.
+ * Returns 0, or -1 where the system cannot say.
+ */
+int platform_fd_path(int fd, char *out, size_t size);
 
 /* The user's home directory with forward slashes, or NULL. */
 const char *platform_home_dir(void);

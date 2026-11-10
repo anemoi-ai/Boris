@@ -93,6 +93,20 @@ enum boris_error conversation_add_tool_result(struct conversation_history *conv,
  */
 size_t conversation_estimate_tokens(const struct conversation_history *conv);
 
+/* The uncalibrated estimate: characters / 4, plus 4 per message. */
+size_t conversation_estimate_tokens_raw(const struct conversation_history *conv);
+
+/*
+ * Correct later estimates with what the server measured: raw_estimate is
+ * conversation_estimate_tokens_raw() of the history as it was sent, and
+ * prompt_tokens the usage the response reported for it. Does nothing when
+ * the server reported no usage.
+ */
+void conversation_calibrate(size_t raw_estimate, int prompt_tokens);
+
+/* Forget the calibration (a different model or endpoint; tests). */
+void conversation_calibration_reset(void);
+
 /*
  * Remove oldest messages until the estimated token count is under max_tokens.
  * The system message at index 0 is always preserved.

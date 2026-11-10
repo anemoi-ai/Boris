@@ -385,8 +385,13 @@ int sandbox_resolve(const char *root, const char *path,
 	memcpy(required_prefix, abs_root, root_len);
 	required_prefix[root_len] = '/';
 	required_prefix[root_len + 1] = '\0';
+	/* A filesystem root ("/", "C:/") already ends in its separator; adding
+	 * another would make a prefix ("//") that no path has. */
+	if (root_len > 0 && abs_root[root_len - 1] == '/')
+		required_prefix[root_len] = '\0';
+	size_t prefix_len = strlen(required_prefix);
 
-	if (strlen(abs_candidate) < root_len + 1 || strncmp(abs_candidate, required_prefix, root_len + 1) != 0) {
+	if (strlen(abs_candidate) < prefix_len || strncmp(abs_candidate, required_prefix, prefix_len) != 0) {
 		/*
 		 * Special case: if the path was relative (e.g. ".") and resolved
 		 * to the sandbox root itself, allow it. This is safe because a

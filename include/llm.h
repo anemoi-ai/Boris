@@ -44,6 +44,34 @@ struct llm_response *llm_complete(const struct conversation_history *conv,
 				  const struct agent_configuration *config);
 
 /*
+ * What an Ollama server says about the configured model's context window.
+ * Every field is 0 when unknown.
+ */
+struct llm_server_context {
+	int loaded;    /* context of the model as currently loaded */
+	int num_ctx;   /* num_ctx set in the model's own parameters */
+	int model_max; /* the most the model supports */
+};
+
+/*
+ * Ask the server behind config->model_endpoint. Returns false if it is not
+ * Ollama (or does not answer); other servers have no such question to ask.
+ * Two short local requests; nothing is sent to the model.
+ */
+bool llm_query_server_context(const struct agent_configuration *config,
+			      struct llm_server_context *out);
+
+/*
+ * Compare model.context_window with the server's and log a warning if the
+ * server's is smaller: Ollama silently drops the start of a prompt that
+ * does not fit, which looks like the model forgetting its instructions.
+ * Returns true once the server's effective context is known. Call it again
+ * after the first reply if it returned false: only a loaded model reports
+ * the context it was really given.
+ */
+bool llm_check_server_context(const struct agent_configuration *config);
+
+/*
  * Free an llm_response and all its heap members.
  * Frees the struct itself. Safe to call with NULL.
  */

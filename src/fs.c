@@ -88,6 +88,26 @@ int fs_write_all(int fd, const char *data, size_t len)
 int fs_write_atomic(const char *path, const char *data, size_t len,
 		    mode_t mode, bool no_replace)
 {
+	return fs_write_atomic_in(NULL, path, data, len, mode, no_replace);
+}
+
+/* Is the open file fd inside directory root (both as the system sees them)?
+ * 1 yes, 0 no, -1 if the system cannot tell. */
+int fs_fd_is_inside(const char *root, int fd)
+{
+	char real_root[PATH_MAX], real_file[PATH_MAX];
+	if (!root || !realpath(root, real_root) ||
+	    platform_fd_path(fd, real_file, sizeof(real_file)) != 0)
+		return -1;
+	size_t n = strlen(real_root);
+	if (n > 0 && real_root[n - 1] == '/')
+		n--; /* a filesystem root */
+	return strncmp(real_file, real_root, n) == 0 && real_file[n] == '/';
+}
+
+int fs_write_atomic_in(const char *root, const char *path, const char *data, size_t len,
+		       mode_t mode, bool no_replace)
+{
 	char tmp[PATH_MAX];
 	if (!path || snprintf(tmp, sizeof(tmp), "%s.tmp.XXXXXX", path) >= (int)sizeof(tmp)) {
 		errno = ENAMETOOLONG;
@@ -107,6 +127,15 @@ int fs_write_atomic(const char *path, const char *data, size_t len,
 	int fd = mkstemp(tmp); /* O_CREAT|O_EXCL: never follows a planted symlink */
 	if (fd < 0)
 		return -1;
+
+	/* The directory was checked as a string; this checks where the file
+	 * actually landed, in case the directory was swapped in between. */
+	if (root && fs_fd_is_inside(root, fd) == 0) {
+		close(fd);
+		unlink(tmp);
+		errno = EACCES;
+		return -1;
+	}
 
 	int saved_errno = 0;
 	if (fchmod(fd, mode) != 0 || fs_write_all(fd, data, len) != 0 ||
@@ -195,6 +224,27 @@ const char *platform_home_dir(void)
 }
 
 #else /* POSIX */
+
+int platform_fd_path(int fd, char *out, size_t size)
+{
+	if (size < PATH_MAX)
+		return -1;
+#if defined(__linux__)
+	char link[64];
+	snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+	ssize_t n = readlink(link, out, size - 1);
+	if (n <= 0 || out[0] != '/')
+		return -1;
+	out[n] = '\0';
+	return 0;
+#elif defined(F_GETPATH)
+	return fcntl(fd, F_GETPATH, out) == 0 ? 0 : -1;
+#else
+	(void)fd;
+	(void)out;
+	return -1;
+#endif
+}
 
 size_t platform_path_root_length(const char *path)
 {

@@ -849,6 +849,10 @@ void repl_run(struct conversation_history *conv,
 	term_print_dim("  Type your message and press Enter to send, /help for commands.\n");
 	term_print_dim("  Press Ctrl+D to exit.\n\n");
 
+	/* Does the server's context window match ours? (Ollama only.) A model
+	 * that is not loaded yet cannot say; ask once more after its first reply. */
+	bool context_known = llm_check_server_context(config);
+
 	/* ----- Main loop ----- */
 	while (!state.should_exit && !g_sigint) {
 		check_context_warning(&state);
@@ -953,6 +957,11 @@ void repl_run(struct conversation_history *conv,
 		struct agent_result result = agent_run_conv(conv, config);
 
 		spinner_stop();
+
+		if (!context_known && result.finish_reason != FINISHED_ERROR) {
+			llm_check_server_context(config);
+			context_known = true;
+		}
 
 		if (g_sigint) {
 			agent_result_free(&result);
